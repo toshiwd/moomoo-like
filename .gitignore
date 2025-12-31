@@ -1,0 +1,9 @@
+﻿# ignore data and local env
+/data/txt/
+*.duckdb
+/app/backend/.venv/
+/app/frontend/node_modules/
+/app/frontend/dist/
+__pycache__/
+.pytest_cache/
+.DS_Store

@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent, TouchEvent as ReactTouchEvent } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import DetailChart from "../components/DetailChart";
+import DetailChart, { DetailChartHandle } from "../components/DetailChart";
+import { Box, MaSetting, useStore } from "../store";
 
-type Timeframe = "daily" | "monthly";
+type Timeframe = "daily" | "weekly" | "monthly";
 
 type Candle = {
   time: number;
@@ -13,62 +15,92 @@ type Candle = {
   close: number;
 };
 
-type MaSetting = {
-  key: string;
-  label: string;
-  period: number;
-  visible: boolean;
-  color: string;
+type VolumePoint = {
+  time: number;
+  value: number;
 };
 
-const MA_COLORS = ["#ef4444", "#22c55e", "#3b82f6", "#a855f7", "#f59e0b"];
-const DEFAULT_PERIODS: Record<Timeframe, number[]> = {
-  daily: [5, 10, 20, 50, 100],
-  monthly: [3, 6, 12, 24, 60]
+type ParseStats = {
+  total: number;
+  parsed: number;
+  invalidRow: number;
+  invalidTime: number;
+  invalidValue: number;
 };
 
-const DEFAULT_LIMITS: Record<Timeframe, number> = {
+type FetchState = {
+  status: "idle" | "loading" | "success" | "error";
+  responseCount: number;
+  errorMessage: string | null;
+};
+
+const DEFAULT_LIMITS = {
   daily: 2000,
   monthly: 240
 };
 
-const LIMIT_STEP: Record<Timeframe, number> = {
+const LIMIT_STEP = {
   daily: 1000,
   monthly: 120
 };
 
-const makeDefaultSettings = (timeframe: Timeframe): MaSetting[] =>
-  DEFAULT_PERIODS[timeframe].map((period, index) => ({
-    key: `ma${index + 1}`,
-    label: `MA${index + 1}`,
-    period,
-    visible: index < 3,
-    color: MA_COLORS[index]
-  }));
+const RANGE_PRESETS = [
+  { label: "3M", months: 3 },
+  { label: "6M", months: 6 },
+  { label: "1Y", months: 12 },
+  { label: "2Y", months: 24 }
+];
 
-const normalizeSettings = (timeframe: Timeframe, input: unknown): MaSetting[] => {
-  const defaults = makeDefaultSettings(timeframe);
-  if (!Array.isArray(input)) return defaults;
-  return defaults.map((item, index) => {
-    const candidate = input[index] as Partial<MaSetting> | undefined;
-    const period = Number(candidate?.period);
-    return {
-      ...item,
-      period: Number.isFinite(period) && period > 0 ? Math.floor(period) : item.period,
-      visible: typeof candidate?.visible === "boolean" ? candidate.visible : item.visible
-    };
-  });
+const DAILY_ROW_RATIO = 12 / 16;
+const DEFAULT_WEEKLY_RATIO = 3 / 4;
+const MIN_WEEKLY_RATIO = 0.2;
+const MIN_MONTHLY_RATIO = 0.1;
+
+const normalizeDateParts = (year: number, month: number, day: number) => {
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return Math.floor(Date.UTC(year, month - 1, day) / 1000);
 };
 
-const loadSettings = (timeframe: Timeframe): MaSetting[] => {
-  if (typeof window === "undefined") return makeDefaultSettings(timeframe);
-  const raw = window.localStorage.getItem(`maSettings:${timeframe}`);
-  if (!raw) return makeDefaultSettings(timeframe);
-  try {
-    return normalizeSettings(timeframe, JSON.parse(raw));
-  } catch {
-    return makeDefaultSettings(timeframe);
+const normalizeTime = (value: unknown) => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value > 10_000_000_000_000) return Math.floor(value / 1000);
+    if (value > 10_000_000_000) return Math.floor(value / 10);
+    if (value >= 10_000_000 && value < 100_000_000) {
+      const year = Math.floor(value / 10000);
+      const month = Math.floor((value % 10000) / 100);
+      const day = value % 100;
+      return normalizeDateParts(year, month, day);
+    }
+    if (value >= 100_000 && value < 1_000_000) {
+      const year = Math.floor(value / 100);
+      const month = value % 100;
+      return normalizeDateParts(year, month, 1);
+    }
+    return Math.floor(value);
   }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d{8}$/.test(trimmed)) {
+      const year = Number(trimmed.slice(0, 4));
+      const month = Number(trimmed.slice(4, 6));
+      const day = Number(trimmed.slice(6, 8));
+      return normalizeDateParts(year, month, day);
+    }
+    if (/^\d{6}$/.test(trimmed)) {
+      const year = Number(trimmed.slice(0, 4));
+      const month = Number(trimmed.slice(4, 6));
+      return normalizeDateParts(year, month, 1);
+    }
+    const match = trimmed.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+    if (match) {
+      const year = Number(match[1]);
+      const month = Number(match[2]);
+      const day = Number(match[3]);
+      return normalizeDateParts(year, month, day);
+    }
+  }
+  return null;
 };
 
 const computeMA = (candles: Candle[], period: number) => {
@@ -89,101 +121,421 @@ const computeMA = (candles: Candle[], period: number) => {
   return data;
 };
 
+const buildCandlesWithStats = (rows: number[][]) => {
+  const entries: Candle[] = [];
+  const stats: ParseStats = {
+    total: rows.length,
+    parsed: 0,
+    invalidRow: 0,
+    invalidTime: 0,
+    invalidValue: 0
+  };
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 5) {
+      stats.invalidRow += 1;
+      continue;
+    }
+    const time = normalizeTime(row[0]);
+    if (time == null) {
+      stats.invalidTime += 1;
+      continue;
+    }
+    const open = Number(row[1]);
+    const high = Number(row[2]);
+    const low = Number(row[3]);
+    const close = Number(row[4]);
+    if (![open, high, low, close].every((value) => Number.isFinite(value))) {
+      stats.invalidValue += 1;
+      continue;
+    }
+    entries.push({ time, open, high, low, close });
+  }
+  entries.sort((a, b) => a.time - b.time);
+  const deduped: Candle[] = [];
+  let lastTime = -1;
+  for (const item of entries) {
+    if (item.time === lastTime) continue;
+    deduped.push(item);
+    lastTime = item.time;
+  }
+  stats.parsed = deduped.length;
+  return { candles: deduped, stats };
+};
+
+const buildVolume = (rows: number[][]): VolumePoint[] => {
+  const entries: VolumePoint[] = [];
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 6) continue;
+    const time = normalizeTime(row[0]);
+    if (time == null) continue;
+    const value = Number(row[5]);
+    if (!Number.isFinite(value)) continue;
+    entries.push({ time, value });
+  }
+  entries.sort((a, b) => a.time - b.time);
+  const deduped: VolumePoint[] = [];
+  let lastTime = -1;
+  for (const item of entries) {
+    if (item.time === lastTime) continue;
+    deduped.push(item);
+    lastTime = item.time;
+  }
+  return deduped;
+};
+
+const buildWeekly = (candles: Candle[], volume: VolumePoint[]) => {
+  const volumeMap = new Map(volume.map((item) => [item.time, item.value]));
+  const groups = new Map<number, { candle: Candle; volume: number }>();
+
+  for (const candle of candles) {
+    const date = new Date(candle.time * 1000);
+    const day = date.getUTCDay();
+    const diff = (day + 6) % 7;
+    const weekStart = Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth(),
+      date.getUTCDate() - diff
+    );
+    const key = Math.floor(weekStart / 1000);
+    const vol = volumeMap.get(candle.time) ?? 0;
+    const existing = groups.get(key);
+    if (!existing) {
+      groups.set(key, {
+        candle: { ...candle, time: key },
+        volume: vol
+      });
+    } else {
+      existing.candle.high = Math.max(existing.candle.high, candle.high);
+      existing.candle.low = Math.min(existing.candle.low, candle.low);
+      existing.candle.close = candle.close;
+      existing.volume += vol;
+    }
+  }
+
+  const sorted = [...groups.entries()].sort((a, b) => a[0] - b[0]);
+  const weeklyCandles = sorted.map((item) => item[1].candle);
+  const weeklyVolume = sorted.map((item) => ({
+    time: item[1].candle.time,
+    value: item[1].volume
+  }));
+  return { candles: weeklyCandles, volume: weeklyVolume };
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const buildRange = (candles: Candle[], months: number) => {
+  if (!candles.length) return null;
+  const end = candles[candles.length - 1].time;
+  const endDate = new Date(end * 1000);
+  const startDate = new Date(endDate);
+  startDate.setMonth(endDate.getMonth() - months);
+  return { from: Math.floor(startDate.getTime() / 1000), to: end };
+};
+
+const countInRange = (candles: Candle[], months: number | null) => {
+  if (!months) return candles.length;
+  const range = buildRange(candles, months);
+  if (!range) return 0;
+  return candles.filter((c) => c.time >= range.from && c.time <= range.to).length;
+};
+
 export default function DetailView() {
   const { code } = useParams();
   const navigate = useNavigate();
-  const [timeframe, setTimeframe] = useState<Timeframe>("daily");
-  const [limits, setLimits] = useState(DEFAULT_LIMITS);
-  const [data, setData] = useState<number[][]>([]);
-  const [loading, setLoading] = useState(false);
-  const [hasMore, setHasMore] = useState(true);
+  const dailyChartRef = useRef<DetailChartHandle | null>(null);
+  const weeklyChartRef = useRef<DetailChartHandle | null>(null);
+  const monthlyChartRef = useRef<DetailChartHandle | null>(null);
+  const bottomRowRef = useRef<HTMLDivElement | null>(null);
+  const draggingRef = useRef(false);
+
+  const tickers = useStore((state) => state.tickers);
+  const loadList = useStore((state) => state.loadList);
+  const loadingList = useStore((state) => state.loadingList);
+  const showBoxes = useStore((state) => state.settings.showBoxes);
+  const setShowBoxes = useStore((state) => state.setShowBoxes);
+  const maSettings = useStore((state) => state.maSettings);
+  const updateMaSetting = useStore((state) => state.updateMaSetting);
+  const resetMaSettings = useStore((state) => state.resetMaSettings);
+
+  const [dailyLimit, setDailyLimit] = useState(DEFAULT_LIMITS.daily);
+  const [monthlyLimit, setMonthlyLimit] = useState(DEFAULT_LIMITS.monthly);
+  const [dailyData, setDailyData] = useState<number[][]>([]);
+  const [monthlyData, setMonthlyData] = useState<number[][]>([]);
+  const [boxes, setBoxes] = useState<Box[]>([]);
+  const [dailyFetch, setDailyFetch] = useState<FetchState>({
+    status: "idle",
+    responseCount: 0,
+    errorMessage: null
+  });
+  const [monthlyFetch, setMonthlyFetch] = useState<FetchState>({
+    status: "idle",
+    responseCount: 0,
+    errorMessage: null
+  });
+  const [loadingDaily, setLoadingDaily] = useState(false);
+  const [loadingMonthly, setLoadingMonthly] = useState(false);
+  const [hasMoreDaily, setHasMoreDaily] = useState(true);
+  const [hasMoreMonthly, setHasMoreMonthly] = useState(true);
   const [showIndicators, setShowIndicators] = useState(false);
-  const [maSettings, setMaSettings] = useState(() => ({
-    daily: loadSettings("daily"),
-    monthly: loadSettings("monthly")
-  }));
+  const [weeklyRatio, setWeeklyRatio] = useState(DEFAULT_WEEKLY_RATIO);
+  const [rangeMonths, setRangeMonths] = useState<number | null>(12);
+
+  const tickerName = useMemo(() => {
+    if (!code) return "";
+    return tickers.find((item) => item.code === code)?.name ?? "";
+  }, [tickers, code]);
+
+  const subtitle = useMemo(() => {
+    const parts = [] as string[];
+    if (tickerName) parts.push(tickerName);
+    parts.push("Daily / Weekly / Monthly");
+    return parts.join(" ? ");
+  }, [tickerName]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    (Object.keys(maSettings) as Timeframe[]).forEach((key) => {
-      const payload = maSettings[key].map((item) => ({
-        period: item.period,
-        visible: item.visible
-      }));
-      window.localStorage.setItem(`maSettings:${key}`, JSON.stringify(payload));
-    });
-  }, [maSettings]);
+    if (!tickers.length && !loadingList) {
+      loadList();
+    }
+  }, [tickers.length, loadingList, loadList]);
 
   useEffect(() => {
     if (!code) return;
-    const limit = limits[timeframe];
-    setLoading(true);
+    setLoadingDaily(true);
+    setDailyFetch((prev) => ({ ...prev, status: "loading", errorMessage: null }));
     api
-      .get(`/ticker/${timeframe}`, { params: { code, limit } })
+      .get("/ticker/daily", { params: { code, limit: dailyLimit } })
       .then((res) => {
-        const rows = (res.data || []) as number[][];
-        setData(rows);
-        setHasMore(rows.length >= limit);
+        if (!Array.isArray(res.data)) {
+          throw new Error("JSON parse failed: daily response is not an array");
+        }
+        const rows = res.data as number[][];
+        setDailyData(rows);
+        setHasMoreDaily(rows.length >= dailyLimit);
+        setDailyFetch({ status: "success", responseCount: rows.length, errorMessage: null });
       })
-      .finally(() => setLoading(false));
-  }, [code, timeframe, limits]);
+      .catch((error) => {
+        const message = error?.message || "Daily fetch failed";
+        setDailyFetch((prev) => ({
+          status: "error",
+          responseCount: prev.responseCount,
+          errorMessage: message
+        }));
+      })
+      .finally(() => setLoadingDaily(false));
+  }, [code, dailyLimit]);
 
-  const candles = useMemo(() => {
-    return data
-      .filter((row) => row.length >= 5)
-      .map((row) => ({
-        time: Number(row[0]),
-        open: Number(row[1]),
-        high: Number(row[2]),
-        low: Number(row[3]),
-        close: Number(row[4])
-      }))
-      .filter((row) => Number.isFinite(row.time));
-  }, [data]);
+  useEffect(() => {
+    if (!code) return;
+    setLoadingMonthly(true);
+    setMonthlyFetch((prev) => ({ ...prev, status: "loading", errorMessage: null }));
+    api
+      .get("/ticker/monthly", { params: { code, limit: monthlyLimit } })
+      .then((res) => {
+        if (!Array.isArray(res.data)) {
+          throw new Error("JSON parse failed: monthly response is not an array");
+        }
+        const rows = res.data as number[][];
+        setMonthlyData(rows);
+        setHasMoreMonthly(rows.length >= monthlyLimit);
+        setMonthlyFetch({ status: "success", responseCount: rows.length, errorMessage: null });
+      })
+      .catch((error) => {
+        const message = error?.message || "Monthly fetch failed";
+        setMonthlyFetch((prev) => ({
+          status: "error",
+          responseCount: prev.responseCount,
+          errorMessage: message
+        }));
+      })
+      .finally(() => setLoadingMonthly(false));
+  }, [code, monthlyLimit]);
 
-  const volume = useMemo(() => {
-    return data
-      .filter((row) => row.length >= 6 && row[5] != null)
-      .map((row) => ({
-        time: Number(row[0]),
-        value: Number(row[5])
-      }))
-      .filter((row) => Number.isFinite(row.time) && Number.isFinite(row.value));
-  }, [data]);
+  useEffect(() => {
+    if (!code) return;
+    api
+      .get("/ticker/boxes", { params: { code } })
+      .then((res) => {
+        const rows = (res.data || []) as Box[];
+        setBoxes(rows);
+      })
+      .catch(() => {
+        setBoxes([]);
+      });
+  }, [code]);
 
-  const maLines = useMemo(() => {
-    return maSettings[timeframe].map((setting) => ({
+  const dailyParse = useMemo(() => buildCandlesWithStats(dailyData), [dailyData]);
+  const monthlyParse = useMemo(() => buildCandlesWithStats(monthlyData), [monthlyData]);
+  const dailyCandles = dailyParse.candles;
+  const monthlyCandles = monthlyParse.candles;
+  const dailyVolume = useMemo(() => buildVolume(dailyData), [dailyData]);
+  const weeklyData = useMemo(() => buildWeekly(dailyCandles, dailyVolume), [dailyCandles, dailyVolume]);
+
+  const weeklyCandles = weeklyData.candles;
+  const weeklyVolume = weeklyData.volume;
+  const dailyRangeCount = useMemo(
+    () => countInRange(dailyCandles, rangeMonths),
+    [dailyCandles, rangeMonths]
+  );
+  const weeklyRangeCount = useMemo(
+    () => countInRange(weeklyCandles, rangeMonths),
+    [weeklyCandles, rangeMonths]
+  );
+  const monthlyRangeCount = useMemo(
+    () => countInRange(monthlyCandles, rangeMonths),
+    [monthlyCandles, rangeMonths]
+  );
+
+  const dailyError =
+    dailyFetch.status === "error"
+      ? dailyFetch.errorMessage
+      : dailyFetch.status === "success" && dailyFetch.responseCount === 0
+      ? "データ0件"
+      : dailyFetch.status === "success" &&
+        dailyParse.stats.parsed === 0 &&
+        dailyParse.stats.total > 0
+      ? `日付変換失敗 ${dailyParse.stats.invalidTime}件`
+      : null;
+
+  const monthlyError =
+    monthlyFetch.status === "error"
+      ? monthlyFetch.errorMessage
+      : monthlyFetch.status === "success" && monthlyFetch.responseCount === 0
+      ? "データ0件"
+      : monthlyFetch.status === "success" &&
+        monthlyParse.stats.parsed === 0 &&
+        monthlyParse.stats.total > 0
+      ? `日付変換失敗 ${monthlyParse.stats.invalidTime}件`
+      : null;
+
+  const dailyMaLines = useMemo(() => {
+    return maSettings.daily.map((setting) => ({
       key: setting.key,
       color: setting.color,
       visible: setting.visible,
-      data: computeMA(candles, setting.period)
+      lineWidth: setting.lineWidth,
+      data: computeMA(dailyCandles, setting.period)
     }));
-  }, [candles, maSettings, timeframe]);
+  }, [dailyCandles, maSettings.daily]);
 
-  const showVolume = timeframe === "daily" && volume.length > 0;
-  const subtitle = timeframe === "daily" ? "Daily candles with volume" : "Monthly candles";
-
-  const loadMore = () => {
-    setLimits((prev) => ({
-      ...prev,
-      [timeframe]: prev[timeframe] + LIMIT_STEP[timeframe]
+  const weeklyMaLines = useMemo(() => {
+    return maSettings.weekly.map((setting) => ({
+      key: setting.key,
+      color: setting.color,
+      visible: setting.visible,
+      lineWidth: setting.lineWidth,
+      data: computeMA(weeklyCandles, setting.period)
     }));
+  }, [weeklyCandles, maSettings.weekly]);
+
+  const monthlyMaLines = useMemo(() => {
+    return maSettings.monthly.map((setting) => ({
+      key: setting.key,
+      color: setting.color,
+      visible: setting.visible,
+      lineWidth: setting.lineWidth,
+      data: computeMA(monthlyCandles, setting.period)
+    }));
+  }, [monthlyCandles, maSettings.monthly]);
+
+  useEffect(() => {
+    if (!rangeMonths) {
+      dailyChartRef.current?.fitContent();
+      weeklyChartRef.current?.fitContent();
+      monthlyChartRef.current?.fitContent();
+      return;
+    }
+    const dailyRange = buildRange(dailyCandles, rangeMonths);
+    if (dailyRange) dailyChartRef.current?.setVisibleRange(dailyRange);
+    const weeklyRange = buildRange(weeklyCandles, rangeMonths);
+    if (weeklyRange) weeklyChartRef.current?.setVisibleRange(weeklyRange);
+    const monthlyRange = buildRange(monthlyCandles, rangeMonths);
+    if (monthlyRange) monthlyChartRef.current?.setVisibleRange(monthlyRange);
+  }, [rangeMonths, dailyCandles, weeklyCandles, monthlyCandles]);
+
+  useEffect(() => {
+    const handleMove = (event: MouseEvent | TouchEvent) => {
+      if (!draggingRef.current || !bottomRowRef.current) return;
+      let clientX = 0;
+      if ("touches" in event) {
+        if (!event.touches.length) return;
+        event.preventDefault();
+        clientX = event.touches[0].clientX;
+      } else {
+        clientX = event.clientX;
+      }
+      const rect = bottomRowRef.current.getBoundingClientRect();
+      const position = clamp((clientX - rect.left) / rect.width, 0.05, 0.95);
+      const nextWeekly = clamp(position, MIN_WEEKLY_RATIO, 1 - MIN_MONTHLY_RATIO);
+      setWeeklyRatio(nextWeekly);
+    };
+
+    const handleUp = () => {
+      draggingRef.current = false;
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    window.addEventListener("touchmove", handleMove, { passive: false });
+    window.addEventListener("touchend", handleUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+      window.removeEventListener("touchmove", handleMove);
+      window.removeEventListener("touchend", handleUp);
+    };
+  }, []);
+
+  const showVolumeDaily = dailyVolume.length > 0;
+
+  const loadMoreDaily = () => {
+    setDailyLimit((prev) => prev + LIMIT_STEP.daily);
   };
 
-  const updateSetting = (index: number, patch: Partial<MaSetting>) => {
-    setMaSettings((prev) => {
-      const next = [...prev[timeframe]];
-      next[index] = { ...next[index], ...patch };
-      return { ...prev, [timeframe]: next };
-    });
+  const loadMoreMonthly = () => {
+    setMonthlyLimit((prev) => prev + LIMIT_STEP.monthly);
   };
 
-  const resetSettings = () => {
-    setMaSettings((prev) => ({
-      ...prev,
-      [timeframe]: makeDefaultSettings(timeframe)
-    }));
+  const toggleRange = (months: number) => {
+    setRangeMonths((prev) => (prev === months ? null : months));
   };
+
+  const updateSetting = (timeframe: Timeframe, index: number, patch: Partial<MaSetting>) => {
+    updateMaSetting(timeframe, index, patch);
+  };
+
+  const resetSettings = (timeframe: Timeframe) => {
+    resetMaSettings(timeframe);
+  };
+
+  const startDrag = () => (event: ReactMouseEvent | ReactTouchEvent) => {
+    event.preventDefault();
+    draggingRef.current = true;
+  };
+
+  const handleDailyCrosshair = (time: number | null) => {
+    weeklyChartRef.current?.setCrosshair(time);
+    monthlyChartRef.current?.setCrosshair(time);
+  };
+
+  const handleWeeklyCrosshair = (time: number | null) => {
+    dailyChartRef.current?.setCrosshair(time);
+    monthlyChartRef.current?.setCrosshair(time);
+  };
+
+  const handleMonthlyCrosshair = (time: number | null) => {
+    dailyChartRef.current?.setCrosshair(time);
+    weeklyChartRef.current?.setCrosshair(time);
+  };
+
+  const dailyEmptyMessage =
+    dailyCandles.length === 0 ? dailyError ?? "データなし" : null;
+  const weeklyEmptyMessage =
+    weeklyCandles.length === 0 ? dailyError ?? "データなし" : null;
+  const monthlyEmptyMessage =
+    monthlyCandles.length === 0 ? monthlyError ?? "データなし" : null;
+
+  const monthlyRatio = 1 - weeklyRatio;
 
   return (
     <div className="detail-shell">
@@ -196,30 +548,117 @@ export default function DetailView() {
           <div className="subtitle">{subtitle}</div>
         </div>
         <div className="detail-controls">
-          <div className="segmented">
-            {["daily", "monthly"].map((value) => (
+          <div className="segmented detail-range">
+            {RANGE_PRESETS.map((preset) => (
               <button
-                key={value}
-                className={timeframe === value ? "active" : ""}
-                onClick={() => setTimeframe(value as Timeframe)}
+                key={preset.label}
+                className={rangeMonths === preset.months ? "active" : ""}
+                onClick={() => toggleRange(preset.months)}
               >
-                {value === "daily" ? "Daily" : "Monthly"}
+                {preset.label}
               </button>
             ))}
           </div>
+          <button
+            className={showBoxes ? "indicator-button active" : "indicator-button"}
+            onClick={() => setShowBoxes(!showBoxes)}
+          >
+            Boxes
+          </button>
           <button className="indicator-button" onClick={() => setShowIndicators(true)}>
             Indicators
           </button>
         </div>
       </div>
-      <div className="detail-chart">
-        <DetailChart candles={candles} volume={volume} maLines={maLines} showVolume={showVolume} />
+      <div className="detail-split">
+        <div className="detail-row detail-row-top" style={{ flex: `${DAILY_ROW_RATIO} 1 0%` }}>
+          <div className="detail-pane-header">Daily</div>
+          <div className="detail-chart">
+            <DetailChart
+              ref={dailyChartRef}
+              candles={dailyCandles}
+              volume={dailyVolume}
+              maLines={dailyMaLines}
+              showVolume={showVolumeDaily}
+              boxes={boxes}
+              showBoxes={showBoxes}
+              onCrosshairMove={handleDailyCrosshair}
+            />
+            {dailyEmptyMessage && <div className="detail-chart-empty">Daily: {dailyEmptyMessage}</div>}
+          </div>
+        </div>
+        <div className="detail-row detail-row-bottom" style={{ flex: `${1 - DAILY_ROW_RATIO} 1 0%` }} ref={bottomRowRef}>
+          <div className="detail-pane" style={{ flex: `${weeklyRatio} 1 0%` }}>
+            <div className="detail-pane-header">Weekly</div>
+            <div className="detail-chart">
+              <DetailChart
+              ref={weeklyChartRef}
+              candles={weeklyCandles}
+              volume={weeklyVolume}
+              maLines={weeklyMaLines}
+              showVolume={false}
+              boxes={boxes}
+              showBoxes={showBoxes}
+              onCrosshairMove={handleWeeklyCrosshair}
+            />
+            {weeklyEmptyMessage && <div className="detail-chart-empty">Weekly: {weeklyEmptyMessage}</div>}
+          </div>
+        </div>
+          <div className="detail-divider detail-divider-vertical" onMouseDown={startDrag()} onTouchStart={startDrag()} />
+          <div className="detail-pane" style={{ flex: `${monthlyRatio} 1 0%` }}>
+            <div className="detail-pane-header">Monthly</div>
+            <div className="detail-chart">
+              <DetailChart
+              ref={monthlyChartRef}
+              candles={monthlyCandles}
+              volume={[]}
+              maLines={monthlyMaLines}
+              showVolume={false}
+              boxes={boxes}
+              showBoxes={showBoxes}
+              onCrosshairMove={handleMonthlyCrosshair}
+            />
+            {monthlyEmptyMessage && <div className="detail-chart-empty">Monthly: {monthlyEmptyMessage}</div>}
+          </div>
+        </div>
+        </div>
       </div>
       <div className="detail-footer">
-        <button className="load-more" onClick={loadMore} disabled={loading || !hasMore}>
-          {loading ? "Loading..." : hasMore ? "Load more" : "All data loaded"}
-        </button>
-        <div className="detail-hint">{candles.length} bars loaded</div>
+        <div className="detail-footer-left">
+          <button className="load-more" onClick={loadMoreDaily} disabled={loadingDaily || !hasMoreDaily}>
+            {loadingDaily ? "Loading daily..." : hasMoreDaily ? "Load more daily" : "Daily all loaded"}
+          </button>
+          <button
+            className="load-more"
+            onClick={loadMoreMonthly}
+            disabled={loadingMonthly || !hasMoreMonthly}
+          >
+            {loadingMonthly
+              ? "Loading monthly..."
+              : hasMoreMonthly
+              ? "Load more monthly"
+              : "Monthly all loaded"}
+          </button>
+        </div>
+        <div className="detail-hint">
+          Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
+        </div>
+      </div>
+      <div className="detail-debug">
+        <div>
+          Daily({dailyFetch.status}) API {dailyFetch.responseCount} | Parsed {dailyParse.stats.parsed} | Range {dailyRangeCount} | InvalidRow{" "}
+          {dailyParse.stats.invalidRow} | InvalidTime {dailyParse.stats.invalidTime} | InvalidValue{" "}
+          {dailyParse.stats.invalidValue} | Error {dailyError ?? "-"}
+        </div>
+        <div>
+          Weekly Parsed {weeklyCandles.length} | Range {weeklyRangeCount} | Error{" "}
+          {dailyError ?? "-"}
+        </div>
+        <div>
+          Monthly({monthlyFetch.status}) API {monthlyFetch.responseCount} | Parsed {monthlyParse.stats.parsed} | Range {monthlyRangeCount} | InvalidRow{" "}
+          {monthlyParse.stats.invalidRow} | InvalidTime {monthlyParse.stats.invalidTime} | InvalidValue{" "}
+          {monthlyParse.stats.invalidValue} | Error {monthlyError ?? "-"}
+        </div>
       </div>
       {showIndicators && (
         <div className="indicator-overlay" onClick={() => setShowIndicators(false)}>
@@ -230,34 +669,51 @@ export default function DetailView() {
                 Close
               </button>
             </div>
-            <div className="indicator-section">
-              <div className="indicator-subtitle">Moving Averages ({timeframe})</div>
-              <div className="indicator-rows">
-                {maSettings[timeframe].map((setting, index) => (
-                  <div className="indicator-row" key={setting.key}>
-                    <input
-                      type="checkbox"
-                      checked={setting.visible}
-                      onChange={() => updateSetting(index, { visible: !setting.visible })}
-                    />
-                    <div className="indicator-label">{setting.label}</div>
-                    <input
-                      className="indicator-input"
-                      type="number"
-                      min={1}
-                      value={setting.period}
-                      onChange={(event) =>
-                        updateSetting(index, { period: Number(event.target.value) || 1 })
-                      }
-                    />
-                    <span className="indicator-color" style={{ background: setting.color }} />
-                  </div>
-                ))}
+            {(["daily", "weekly", "monthly"] as Timeframe[]).map((frame) => (
+              <div className="indicator-section" key={frame}>
+                <div className="indicator-subtitle">Moving Averages ({frame})</div>
+                <div className="indicator-rows">
+                  {maSettings[frame].map((setting, index) => (
+                    <div className="indicator-row" key={setting.key}>
+                      <input
+                        type="checkbox"
+                        checked={setting.visible}
+                        onChange={() => updateSetting(frame, index, { visible: !setting.visible })}
+                      />
+                      <div className="indicator-label">{setting.label}</div>
+                      <input
+                        className="indicator-input"
+                        type="number"
+                        min={1}
+                        value={setting.period}
+                        onChange={(event) =>
+                          updateSetting(frame, index, { period: Number(event.target.value) || 1 })
+                        }
+                      />
+                      <input
+                        className="indicator-input indicator-width"
+                        type="number"
+                        min={1}
+                        max={6}
+                        value={setting.lineWidth}
+                        onChange={(event) =>
+                          updateSetting(frame, index, { lineWidth: Number(event.target.value) })
+                        }
+                      />
+                      <input
+                        className="indicator-color-input"
+                        type="color"
+                        value={setting.color}
+                        onChange={(event) => updateSetting(frame, index, { color: event.target.value })}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <button className="indicator-reset" onClick={() => resetSettings(frame)}>
+                  Reset {frame}
+                </button>
               </div>
-              <button className="indicator-reset" onClick={resetSettings}>
-                Reset
-              </button>
-            </div>
+            ))}
           </div>
         </div>
       )}

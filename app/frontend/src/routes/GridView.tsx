@@ -2,11 +2,13 @@
 import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
+import type { MaSetting } from "../store";
 import { useStore } from "../store";
 import StockTile from "../components/StockTile";
 
-const TILE_HEIGHT = 230;
-const HEADER_HEIGHT = 88;
+const TILE_HEIGHT = 220;
+const GRID_GAP = 12;
+type Timeframe = "monthly" | "weekly" | "daily";
 
 function useResizeObserver() {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -49,8 +51,15 @@ export default function GridView() {
   const setSearch = useStore((state) => state.setSearch);
   const setGridScrollTop = useStore((state) => state.setGridScrollTop);
   const setGridTimeframe = useStore((state) => state.setGridTimeframe);
+  const showBoxes = useStore((state) => state.settings.showBoxes);
+  const setShowBoxes = useStore((state) => state.setShowBoxes);
+  const maSettings = useStore((state) => state.maSettings);
+  const updateMaSetting = useStore((state) => state.updateMaSetting);
+  const resetMaSettings = useStore((state) => state.resetMaSettings);
 
   const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [showIndicators, setShowIndicators] = useState(false);
+  const lastVisibleCodesRef = useRef<string[]>([]);
 
   useEffect(() => {
     loadList();
@@ -70,9 +79,11 @@ export default function GridView() {
     });
   }, [tickers, search]);
 
+  const gridHeight = Math.max(200, size.height);
+  const gridWidth = Math.max(0, size.width);
+  const innerHeight = Math.max(0, gridHeight);
   const rowCount = Math.ceil(filtered.length / columns);
-  const columnWidth = size.width > 0 ? Math.floor(size.width / columns) : 300;
-  const gridHeight = Math.max(200, size.height - HEADER_HEIGHT);
+  const columnWidth = gridWidth > 0 ? gridWidth / columns : 300;
 
   const onItemsRendered = ({
     visibleRowStartIndex,
@@ -80,7 +91,7 @@ export default function GridView() {
     visibleColumnStartIndex,
     visibleColumnStopIndex
   }: GridOnItemsRenderedProps) => {
-    const rowsPerViewport = Math.max(1, Math.floor(gridHeight / TILE_HEIGHT));
+    const rowsPerViewport = Math.max(1, Math.floor(gridHeight / (TILE_HEIGHT + GRID_GAP)));
     const prefetchStop = visibleRowStopIndex + rowsPerViewport;
     const start = visibleRowStartIndex * columns + visibleColumnStartIndex;
     const stop = Math.min(filtered.length - 1, prefetchStop * columns + visibleColumnStopIndex);
@@ -91,7 +102,21 @@ export default function GridView() {
       const item = filtered[index];
       if (item) codes.push(item.code);
     }
+    lastVisibleCodesRef.current = codes;
     ensureBarsForVisible(gridTimeframe, codes);
+  };
+
+  useEffect(() => {
+    if (!lastVisibleCodesRef.current.length) return;
+    ensureBarsForVisible(gridTimeframe, lastVisibleCodesRef.current);
+  }, [gridTimeframe, maSettings, ensureBarsForVisible]);
+
+  const updateSetting = (frame: Timeframe, index: number, patch: Partial<MaSetting>) => {
+    updateMaSetting(frame, index, patch);
+  };
+
+  const resetSettings = (frame: Timeframe) => {
+    resetMaSettings(frame);
   };
 
   return (
@@ -103,13 +128,13 @@ export default function GridView() {
         </div>
         <div className="controls">
           <div className="segmented">
-            {["monthly", "daily"].map((value) => (
+            {["monthly", "weekly", "daily"].map((value) => (
               <button
                 key={value}
                 className={gridTimeframe === value ? "active" : ""}
-                onClick={() => setGridTimeframe(value as "monthly" | "daily")}
+                onClick={() => setGridTimeframe(value as "monthly" | "weekly" | "daily")}
               >
-                {value === "monthly" ? "Monthly" : "Daily"}
+                {value === "monthly" ? "Monthly" : value === "weekly" ? "Weekly" : "Daily"}
               </button>
             ))}
           </div>
@@ -119,6 +144,15 @@ export default function GridView() {
             value={search}
             onChange={(event) => setSearch(event.target.value)}
           />
+          <button
+            className={showBoxes ? "indicator-button active" : "indicator-button"}
+            onClick={() => setShowBoxes(!showBoxes)}
+          >
+            Boxes
+          </button>
+          <button className="indicator-button" onClick={() => setShowIndicators(true)}>
+            Indicators
+          </button>
           <div className="segmented">
             {[2, 3, 4].map((count) => (
               <button
@@ -144,36 +178,100 @@ export default function GridView() {
       )}
       <div className="grid-shell" ref={ref}>
         {size.width > 0 && (
-          <Grid
-            key={gridTimeframe}
-            columnCount={columns}
-            columnWidth={columnWidth}
-            height={gridHeight}
-            rowCount={rowCount}
-            rowHeight={TILE_HEIGHT}
-            width={size.width}
-            overscanRowCount={2}
-            onItemsRendered={onItemsRendered}
-            initialScrollTop={gridScrollTop}
-            onScroll={({ scrollTop }) => setGridScrollTop(scrollTop)}
-          >
-            {({ columnIndex, rowIndex, style }) => {
-              const index = rowIndex * columns + columnIndex;
-              const item = filtered[index];
-              if (!item) return null;
-              return (
-                <div style={style}>
-                  <StockTile
-                    ticker={item}
-                    timeframe={gridTimeframe}
-                    onDoubleClick={() => navigate(`/detail/${item.code}`)}
-                  />
-                </div>
-              );
-            }}
-          </Grid>
+          <div className="grid-inner">
+            <Grid
+              key={gridTimeframe}
+              columnCount={columns}
+              columnWidth={columnWidth}
+              height={innerHeight}
+              rowCount={rowCount}
+              rowHeight={TILE_HEIGHT + GRID_GAP}
+              width={gridWidth}
+              overscanRowCount={2}
+              onItemsRendered={onItemsRendered}
+              initialScrollTop={gridScrollTop}
+              onScroll={({ scrollTop }) => setGridScrollTop(scrollTop)}
+            >
+              {({ columnIndex, rowIndex, style }) => {
+                const index = rowIndex * columns + columnIndex;
+                const item = filtered[index];
+                if (!item) return null;
+                const cellStyle = {
+                  ...style,
+                  padding: GRID_GAP / 2,
+                  boxSizing: "border-box"
+                };
+                return (
+                  <div style={cellStyle}>
+                    <StockTile
+                      ticker={item}
+                      timeframe={gridTimeframe}
+                      onDoubleClick={() => navigate(`/detail/${item.code}`)}
+                    />
+                  </div>
+                );
+              }}
+            </Grid>
+          </div>
         )}
       </div>
+      {showIndicators && (
+        <div className="indicator-overlay" onClick={() => setShowIndicators(false)}>
+          <div className="indicator-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="indicator-header">
+              <div className="indicator-title">Indicators</div>
+              <button className="indicator-close" onClick={() => setShowIndicators(false)}>
+                Close
+              </button>
+            </div>
+            {(["daily", "weekly", "monthly"] as Timeframe[]).map((frame) => (
+              <div className="indicator-section" key={frame}>
+                <div className="indicator-subtitle">Moving Averages ({frame})</div>
+                <div className="indicator-rows">
+                  {maSettings[frame].map((setting, index) => (
+                    <div className="indicator-row" key={setting.key}>
+                      <input
+                        type="checkbox"
+                        checked={setting.visible}
+                        onChange={() => updateSetting(frame, index, { visible: !setting.visible })}
+                      />
+                      <div className="indicator-label">{setting.label}</div>
+                      <input
+                        className="indicator-input"
+                        type="number"
+                        min={1}
+                        value={setting.period}
+                        onChange={(event) =>
+                          updateSetting(frame, index, { period: Number(event.target.value) || 1 })
+                        }
+                      />
+                      <input
+                        className="indicator-input indicator-width"
+                        type="number"
+                        min={1}
+                        max={6}
+                        value={setting.lineWidth}
+                        onChange={(event) =>
+                          updateSetting(frame, index, { lineWidth: Number(event.target.value) })
+                        }
+                      />
+                      <input
+                        className="indicator-color-input"
+                        type="color"
+                        value={setting.color}
+                        onChange={(event) => updateSetting(frame, index, { color: event.target.value })}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <button className="indicator-reset" onClick={() => resetSettings(frame)}>
+                  Reset {frame}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,34 +1,53 @@
-﻿import { useEffect, useMemo, useRef } from "react";
-import { BarsPayload } from "../store";
+import { useEffect, useMemo, useRef } from "react";
+import { BarsPayload, Box, MaSetting, useStore } from "../store";
+import { getBodyRangeFromBars, getBoxFill, getBoxStroke } from "../utils/boxes";
 
 const COLORS = {
-  up: "#42d392",
-  down: "#ef4444",
-  ma7: "#38bdf8",
-  ma20: "#f59e0b",
-  ma60: "#22c55e"
+  up: "#ef4444",
+  down: "#22c55e"
 };
 
-const HEIGHT = 120;
+const MIN_HEIGHT = 80;
+const MAX_BARS = 30;
+const BOX_FILL = getBoxFill();
+const BOX_STROKE = getBoxStroke();
 
-function toValueMap(series: number[][]) {
-  const map = new Map<number, number | null>();
-  series.forEach(([t, v]) => {
-    map.set(t, v === null ? null : Number(v));
-  });
+function buildMaMap(bars: number[][], period: number) {
+  const map = new Map<number, number>();
+  if (period <= 1) {
+    bars.forEach((bar) => {
+      map.set(bar[0], Number(bar[4]));
+    });
+    return map;
+  }
+  let sum = 0;
+  for (let i = 0; i < bars.length; i += 1) {
+    const close = Number(bars[i][4]);
+    sum += close;
+    if (i >= period) {
+      sum -= Number(bars[i - period][4]);
+    }
+    if (i >= period - 1) {
+      map.set(bars[i][0], sum / period);
+    }
+  }
   return map;
 }
 
 function drawChart(
   canvas: HTMLCanvasElement,
   payload: BarsPayload,
+  boxes: Box[],
+  showBoxes: boolean,
+  maSettings: MaSetting[],
   width: number,
   height: number
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
-  const bars = payload.bars;
+  const allBars = payload.bars;
+  const bars = allBars.slice(-MAX_BARS);
   if (!bars.length) {
     ctx.clearRect(0, 0, width, height);
     return;
@@ -37,8 +56,25 @@ function drawChart(
   const pad = 6;
   const hi = Math.max(...bars.map((b) => b[2]));
   const lo = Math.min(...bars.map((b) => b[3]));
-  const min = Math.min(lo, ...payload.ma.ma7.map((m) => m[1] ?? lo), ...payload.ma.ma20.map((m) => m[1] ?? lo), ...payload.ma.ma60.map((m) => m[1] ?? lo));
-  const max = Math.max(hi, ...payload.ma.ma7.map((m) => m[1] ?? hi), ...payload.ma.ma20.map((m) => m[1] ?? hi), ...payload.ma.ma60.map((m) => m[1] ?? hi));
+  let min = lo;
+  let max = hi;
+
+  const activeMaSettings = maSettings.filter((setting) => setting.visible);
+  const maMaps = activeMaSettings.map((setting) => ({
+    setting,
+    map: buildMaMap(allBars, setting.period)
+  }));
+
+  bars.forEach((bar) => {
+    const time = bar[0];
+    maMaps.forEach(({ map }) => {
+      const value = map.get(time);
+      if (value == null || Number.isNaN(value)) return;
+      min = Math.min(min, value);
+      max = Math.max(max, value);
+    });
+  });
+
   const range = Math.max(1e-6, max - min);
 
   const toY = (value: number) => {
@@ -73,18 +109,73 @@ function drawChart(
     ctx.fillRect(x - candleWidth / 2, rectY, candleWidth, rectH);
   });
 
-  const ma7 = toValueMap(payload.ma.ma7);
-  const ma20 = toValueMap(payload.ma.ma20);
-  const ma60 = toValueMap(payload.ma.ma60);
+  if (showBoxes && boxes.length) {
+    const times = bars.map((bar) => bar[0]);
+    const findStart = (time: number) => {
+      let left = 0;
+      let right = times.length - 1;
+      let result = -1;
+      while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        if (times[mid] >= time) {
+          result = mid;
+          right = mid - 1;
+        } else {
+          left = mid + 1;
+        }
+      }
+      return result;
+    };
+    const findEnd = (time: number) => {
+      let left = 0;
+      let right = times.length - 1;
+      let result = -1;
+      while (left <= right) {
+        const mid = Math.floor((left + right) / 2);
+        if (times[mid] <= time) {
+          result = mid;
+          left = mid + 1;
+        } else {
+          right = mid - 1;
+        }
+      }
+      return result;
+    };
 
-  const drawMa = (map: Map<number, number | null>, color: string) => {
-    ctx.strokeStyle = color;
+    ctx.save();
+    ctx.fillStyle = BOX_FILL;
+    ctx.strokeStyle = BOX_STROKE;
+    ctx.lineWidth = 1;
+    boxes.forEach((box) => {
+      const startIdx = findStart(box.startTime);
+      const endIdx = findEnd(box.endTime);
+      if (startIdx < 0 || endIdx < 0 || endIdx < startIdx) return;
+      const bodyRange = getBodyRangeFromBars(bars, box.startTime, box.endTime);
+      const upper = bodyRange?.upper ?? box.upper;
+      const lower = bodyRange?.lower ?? box.lower;
+      const x1 = step * startIdx;
+      const x2 = step * (endIdx + 1);
+      const y1 = toY(upper);
+      const y2 = toY(lower);
+      const rectX = x1;
+      const rectY = Math.min(y1, y2);
+      const rectW = Math.max(1, x2 - x1);
+      const rectH = Math.max(1, Math.abs(y2 - y1));
+      ctx.fillRect(rectX, rectY, rectW, rectH);
+      ctx.strokeRect(rectX, rectY, rectW, rectH);
+    });
+    ctx.restore();
+  }
+
+  const drawMa = (map: Map<number, number>, setting: MaSetting) => {
+    ctx.strokeStyle = setting.color;
+    ctx.lineWidth = Math.max(1, setting.lineWidth);
     ctx.beginPath();
     let started = false;
     bars.forEach((bar, index) => {
       const t = bar[0];
       const value = map.get(t);
-      if (value === null || value === undefined) {
+      if (value === undefined) {
         return;
       }
       const x = step * index + step / 2;
@@ -99,12 +190,29 @@ function drawChart(
     if (started) ctx.stroke();
   };
 
-  drawMa(ma7, COLORS.ma7);
-  drawMa(ma20, COLORS.ma20);
-  drawMa(ma60, COLORS.ma60);
+  maMaps.forEach(({ map, setting }) => {
+    drawMa(map, setting);
+  });
 }
 
-export default function ThumbnailCanvas({ payload }: { payload: BarsPayload }) {
+export default function ThumbnailCanvas({
+  payload,
+  boxes,
+  showBoxes,
+  timeframe
+}: {
+  payload: BarsPayload;
+  boxes: Box[];
+  showBoxes: boolean;
+  timeframe: "daily" | "weekly" | "monthly";
+}) {
+  const maSettings = useStore((state) =>
+    timeframe === "daily"
+      ? state.maSettings.daily
+      : timeframe === "weekly"
+      ? state.maSettings.weekly
+      : state.maSettings.monthly
+  );
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastKeyRef = useRef<string>("");
@@ -112,15 +220,19 @@ export default function ThumbnailCanvas({ payload }: { payload: BarsPayload }) {
   const renderKey = useMemo(() => {
     const bars = payload.bars;
     const last = bars[bars.length - 1];
-    return `${bars.length}-${bars[0]?.[0]}-${last?.[0]}-${last?.[4]}`;
-  }, [payload]);
+    const firstBox = boxes[0];
+    const settingsKey = maSettings
+      .map((setting) => `${setting.period}-${setting.visible}-${setting.color}-${setting.lineWidth}`)
+      .join("|");
+    return `${bars.length}-${bars[0]?.[0]}-${last?.[0]}-${last?.[4]}-${boxes.length}-${firstBox?.startTime ?? "none"}-${showBoxes}-${settingsKey}`;
+  }, [payload, boxes, showBoxes, maSettings]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
     const canvas = canvasRef.current;
     const resize = () => {
       const width = Math.floor(containerRef.current?.clientWidth || 0);
-      const height = HEIGHT;
+      const height = Math.max(MIN_HEIGHT, Math.floor(containerRef.current?.clientHeight || 0));
       const ratio = window.devicePixelRatio || 1;
       canvas.width = Math.floor(width * ratio);
       canvas.height = Math.floor(height * ratio);
@@ -130,21 +242,29 @@ export default function ThumbnailCanvas({ payload }: { payload: BarsPayload }) {
       if (ctx) {
         ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       }
-      drawChart(canvas, payload, width, height);
+      drawChart(canvas, payload, boxes, showBoxes, maSettings, width, height);
     };
 
     resize();
     const observer = new ResizeObserver(() => resize());
     observer.observe(containerRef.current);
     return () => observer.disconnect();
-  }, [payload, renderKey]);
+  }, [payload, boxes, showBoxes, maSettings, renderKey]);
 
   useEffect(() => {
     if (!canvasRef.current || !containerRef.current) return;
     if (lastKeyRef.current === renderKey) return;
     lastKeyRef.current = renderKey;
-    drawChart(canvasRef.current, payload, canvasRef.current.clientWidth, HEIGHT);
-  }, [payload, renderKey]);
+    drawChart(
+      canvasRef.current,
+      payload,
+      boxes,
+      showBoxes,
+      maSettings,
+      canvasRef.current.clientWidth,
+      Math.max(MIN_HEIGHT, canvasRef.current.clientHeight)
+    );
+  }, [payload, boxes, showBoxes, maSettings, renderKey]);
 
   return (
     <div ref={containerRef} className="thumb-canvas">

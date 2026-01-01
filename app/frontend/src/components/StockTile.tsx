@@ -1,5 +1,5 @@
 ﻿import { memo } from "react";
-import { BarsPayload, Ticker, useStore } from "../store";
+import { Ticker, useStore } from "../store";
 import ThumbnailCanvas from "./ThumbnailCanvas";
 
 const StockTile = memo(function StockTile({
@@ -8,10 +8,22 @@ const StockTile = memo(function StockTile({
   onDoubleClick
 }: {
   ticker: Ticker;
-  timeframe: "monthly" | "daily";
+  timeframe: "monthly" | "weekly" | "daily";
   onDoubleClick: () => void;
 }) {
-  const barsPayload = useStore((state) => state.barsCache[timeframe][ticker.code]);
+  const barsPayload = useStore((state) => {
+    const map = state.barsCache?.[timeframe] ?? {};
+    return map[ticker.code];
+  });
+  const boxes = useStore((state) => {
+    const map = state.boxesCache?.[timeframe] ?? {};
+    return map[ticker.code] ?? [];
+  });
+  const barsStatus = useStore((state) => {
+    const map = state.barsStatus?.[timeframe] ?? {};
+    return map[ticker.code] ?? "idle";
+  });
+  const showBoxes = useStore((state) => state.settings.showBoxes);
 
   const stageLabel = ticker.stage || "UNKNOWN";
   const stageClass = stageLabel.toLowerCase();
@@ -29,10 +41,21 @@ const StockTile = memo(function StockTile({
         </div>
       </div>
       <div className="tile-chart">
-        {barsPayload ? (
-          <ThumbnailCanvas payload={barsPayload} />
+        {barsPayload && barsPayload.bars?.length ? (
+          <ThumbnailCanvas
+            payload={barsPayload}
+            boxes={boxes}
+            showBoxes={showBoxes}
+            timeframe={timeframe}
+          />
         ) : (
-          <div className="tile-loading">Loading...</div>
+          <div className="tile-loading">
+            {barsStatus === "error"
+              ? "Load failed"
+              : barsStatus === "empty"
+              ? "No data"
+              : "Loading..."}
+          </div>
         )}
       </div>
     </button>

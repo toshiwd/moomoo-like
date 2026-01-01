@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from db import get_conn, init_schema
+from box_detector import detect_boxes
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "txt"))
 USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
@@ -101,7 +102,7 @@ def list_tickers():
 def batch_bars(payload: dict = Body(default={})):  # { timeframe, codes, limit }
     timeframe = payload.get("timeframe", "monthly")
     codes = payload.get("codes", [])
-    limit = min(int(payload.get("limit", 60)), 60)
+    limit = min(int(payload.get("limit", 60)), 2000)
 
     if not codes:
         return JSONResponse(content={"timeframe": timeframe, "limit": limit, "items": {}})
@@ -141,10 +142,28 @@ def batch_bars(payload: dict = Body(default={})):  # { timeframe, codes, limit }
 
     with get_conn() as conn:
         rows = conn.execute(query, codes + [limit]).fetchall()
+        monthly_rows = conn.execute(
+            f"""
+            SELECT code, month, o, h, l, c
+            FROM monthly_bars
+            WHERE code IN ({placeholders})
+            ORDER BY code, month
+            """,
+            codes
+        ).fetchall()
 
-    items: dict[str, dict[str, list]] = {}
+    monthly_by_code: dict[str, list[tuple]] = {}
+    for code, month, o, h, l, c in monthly_rows:
+        monthly_by_code.setdefault(code, []).append((month, o, h, l, c))
+
+    boxes_by_code = {code: detect_boxes(monthly_by_code.get(code, [])) for code in codes}
+
+    items: dict[str, dict[str, list]] = {
+        code: {"bars": [], "ma": {"ma7": [], "ma20": [], "ma60": []}, "boxes": boxes_by_code.get(code, [])}
+        for code in codes
+    }
     for code, t, o, h, l, c, ma7, ma20, ma60 in rows:
-        payload = items.setdefault(code, {"bars": [], "ma": {"ma7": [], "ma20": [], "ma60": []}})
+        payload = items.setdefault(code, {"bars": [], "ma": {"ma7": [], "ma20": [], "ma60": []}, "boxes": boxes_by_code.get(code, [])})
         payload["bars"].append([t, o, h, l, c])
         payload["ma"]["ma7"].append([t, ma7])
         payload["ma"]["ma20"].append([t, ma20])
@@ -216,3 +235,19 @@ def monthly(code: str, limit: int = 240):
         ).fetchall()
 
     return JSONResponse(content=rows)
+
+
+@app.get("/api/ticker/boxes")
+def ticker_boxes(code: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT month, o, h, l, c
+            FROM monthly_bars
+            WHERE code = ?
+            ORDER BY month
+            """,
+            [code]
+        ).fetchall()
+
+    return JSONResponse(content=detect_boxes(rows))

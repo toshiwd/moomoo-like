@@ -55,11 +55,11 @@ def get_txt_status() -> dict:
 def health():
     status = get_txt_status()
     with get_conn() as conn:
-        ticker_count = conn.execute("SELECT COUNT(*) FROM stock_meta").fetchone()[0]
+        code_count = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars").fetchone()[0]
     return {
         "ok": True,
         "txt_count": status["txt_count"],
-        "code_count": ticker_count,
+        "code_count": code_count,
         "last_updated": status["last_updated"],
         "code_txt_missing": status["code_txt_missing"],
         "errors": []
@@ -71,9 +71,14 @@ def list_tickers():
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT m.code, m.name, m.stage, m.score, m.reason
-            FROM stock_meta m
-            ORDER BY m.code
+            SELECT d.code,
+                   COALESCE(m.name, d.code) AS name,
+                   COALESCE(m.stage, 'UNKNOWN') AS stage,
+                   COALESCE(m.score, 0) AS score,
+                   COALESCE(m.reason, 'TXT_ONLY') AS reason
+            FROM (SELECT DISTINCT code FROM daily_bars) d
+            LEFT JOIN stock_meta m ON d.code = m.code
+            ORDER BY d.code
             """
         ).fetchall()
     return JSONResponse(content=rows)

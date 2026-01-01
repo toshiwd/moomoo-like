@@ -7,6 +7,9 @@ import pandas as pd
 from db import get_conn, init_schema
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "txt"))
+CODE_PATTERN_DEFAULT = r"^[0-9A-Za-z]{4,16}$"
+CODE_PATTERN = re.compile(os.getenv("CODE_PATTERN", CODE_PATTERN_DEFAULT))
+STRICT_CODE_VALIDATION = os.getenv("CODE_STRICT", "0") == "1"
 
 
 def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
@@ -14,45 +17,24 @@ def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
     return "UNKNOWN", 0.0, "TODO: Iizuka stage/score pipeline"
 
 
-def infer_code_from_filename(path: str) -> str | None:
-    base = os.path.splitext(os.path.basename(path))[0]
-    match = re.match(r"\s*([0-9A-Za-z]+)", base)
-    return match.group(1) if match else None
-
-
 def load_watchlist(data_dir: str) -> set[str] | None:
     path = os.path.join(data_dir, "code.txt")
     if not os.path.exists(path):
-        print("Warning: code.txt is missing. Falling back to TXT filenames.")
+        print("Warning: code.txt is missing. Falling back to TXT contents.")
         return None
     with open(path, "r", encoding="utf-8") as f:
         codes = [line.strip() for line in f.readlines() if line.strip()]
     return set(codes) if codes else None
 
 
-def select_txt_files(data_dir: str) -> list[str]:
+def list_txt_files(data_dir: str) -> list[str]:
     if not os.path.isdir(data_dir):
         return []
-    candidates = [
+    return [
         os.path.join(data_dir, name)
         for name in os.listdir(data_dir)
         if name.endswith(".txt") and name.lower() != "code.txt"
     ]
-
-    latest_per_code: dict[str, tuple[str, float]] = {}
-    passthrough: list[str] = []
-    for path in candidates:
-        inferred = infer_code_from_filename(path)
-        mtime = os.path.getmtime(path)
-        if inferred:
-            current = latest_per_code.get(inferred)
-            if current is None or mtime > current[1]:
-                latest_per_code[inferred] = (path, mtime)
-        else:
-            passthrough.append(path)
-
-    selected = [entry[0] for entry in latest_per_code.values()] + passthrough
-    return selected
 
 
 def read_csv_with_fallback(path: str) -> pd.DataFrame:
@@ -65,7 +47,8 @@ def read_csv_with_fallback(path: str) -> pd.DataFrame:
                 header=None,
                 names=["code", "date", "o", "h", "l", "c", "v"],
                 dtype="string",
-                encoding=encoding
+                encoding=encoding,
+                usecols=[0, 1, 2, 3, 4, 5, 6]
             )
         except Exception as exc:
             last_err = exc
@@ -83,37 +66,91 @@ def strip_header_row(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def read_daily_files(data_dir: str) -> pd.DataFrame:
-    files = select_txt_files(data_dir)
-    if not files:
+def normalize_code(df: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
+    df["code"] = df["code"].where(df["code"].notna(), "")
+    df["code"] = df["code"].astype(str).str.strip()
+    missing_mask = (df["code"] == "") | (df["code"].str.lower() == "nan")
+    missing_count = int(missing_mask.sum())
+    df = df[~missing_mask]
+
+    nonstandard_mask = ~df["code"].str.match(CODE_PATTERN, na=False)
+    nonstandard_count = int(nonstandard_mask.sum())
+    invalid_count = 0
+    if STRICT_CODE_VALIDATION and nonstandard_count:
+        invalid_count = nonstandard_count
+        df = df[~nonstandard_mask]
+
+    return df, missing_count, nonstandard_count, invalid_count
+
+
+def parse_file(path: str, watchlist: set[str] | None, counts: dict) -> pd.DataFrame:
+    try:
+        df = read_csv_with_fallback(path)
+    except Exception as exc:
+        counts["file_error"] += 1
+        print(f"Warning: failed to read {path}: {exc}")
         return pd.DataFrame(columns=["code", "date", "o", "h", "l", "c", "v"])
 
-    watchlist = load_watchlist(data_dir)
-    frames = []
+    df = strip_header_row(df)
+    if df.empty:
+        return df
+
+    df, missing_code, nonstandard_code, invalid_code = normalize_code(df)
+    counts["missing_code"] += missing_code
+    counts["nonstandard_code"] += nonstandard_code
+    counts["invalid_code"] += invalid_code
+
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    invalid_date = int(df["date"].isna().sum())
+    counts["invalid_date"] += invalid_date
+    df = df[df["date"].notna()]
+    if df.empty:
+        return df
+
+    if watchlist:
+        before = len(df)
+        df = df[df["code"].isin(watchlist)]
+        counts["filtered_watchlist"] += int(before - len(df))
+
+    if df.empty:
+        return df
+
+    for col in ["o", "h", "l", "c", "v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    non_numeric_mask = df[["o", "h", "l", "c", "v"]].isna().any(axis=1)
+    counts["non_numeric"] += int(non_numeric_mask.sum())
+    df = df[~non_numeric_mask]
+    if df.empty:
+        return df
+
+    df["v"] = df["v"].round().astype("int64")
+    return df
+
+
+def read_daily_files(files: list[str], watchlist: set[str] | None, counts: dict) -> pd.DataFrame:
+    latest_by_code: dict[str, tuple[float, pd.DataFrame]] = {}
     for path in files:
-        df = read_csv_with_fallback(path)
-        df = strip_header_row(df)
-
-        inferred_code = infer_code_from_filename(path)
-        if inferred_code:
-            df["code"] = df["code"].fillna(inferred_code)
-            df.loc[df["code"].str.len() == 0, "code"] = inferred_code
-
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])
-        if watchlist:
-            df = df[df["code"].isin(watchlist)]
+        df = parse_file(path, watchlist, counts)
         if df.empty:
             continue
 
-        for col in ["o", "h", "l", "c", "v"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["o", "h", "l", "c", "v"])
-        if df.empty:
-            continue
+        mtime = os.path.getmtime(path)
+        for code, group in df.groupby("code"):
+            existing = latest_by_code.get(code)
+            if existing is None:
+                latest_by_code[code] = (mtime, group)
+                continue
+            if existing[0] >= mtime:
+                counts["older_file"] += len(group)
+                continue
+            counts["older_file"] += len(existing[1])
+            latest_by_code[code] = (mtime, group)
 
-        frames.append(df)
-
+    frames = [entry[1] for entry in latest_by_code.values()]
     if not frames:
         return pd.DataFrame(columns=["code", "date", "o", "h", "l", "c", "v"])
 
@@ -170,11 +207,73 @@ def build_stock_meta(monthly: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def clear_tables() -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM daily_bars")
+        conn.execute("DELETE FROM daily_ma")
+        conn.execute("DELETE FROM monthly_bars")
+        conn.execute("DELETE FROM monthly_ma")
+        conn.execute("DELETE FROM stock_meta")
+        conn.execute("DELETE FROM tickers")
+
+
+def log_counts(counts: dict, parsed_rows: int) -> None:
+    skipped_total = sum(
+        counts[key]
+        for key in [
+            "missing_code",
+            "invalid_date",
+            "non_numeric",
+            "invalid_code",
+            "older_file",
+            "filtered_watchlist"
+        ]
+    )
+    reason_text = (
+        f"missing_code={counts['missing_code']}, "
+        f"invalid_date={counts['invalid_date']}, "
+        f"non_numeric={counts['non_numeric']}, "
+        f"invalid_code={counts['invalid_code']}, "
+        f"older_file={counts['older_file']}, "
+        f"filtered_watchlist={counts['filtered_watchlist']}"
+    )
+    print(f"PARSED_ROWS={parsed_rows}")
+    print(f"SKIPPED_ROWS={skipped_total} ({reason_text})")
+    print(f"NONSTANDARD_CODE_ROWS={counts['nonstandard_code']}")
+    print(f"FILE_ERRORS={counts['file_error']}")
+
+
 def ingest() -> None:
     init_schema()
-    daily = read_daily_files(DATA_DIR)
+
+    print(f"TXT_DIR={DATA_DIR}")
+    files = list_txt_files(DATA_DIR)
+    print(f"FOUND_FILES={len(files)}")
+
+    counts = {
+        "missing_code": 0,
+        "invalid_date": 0,
+        "non_numeric": 0,
+        "invalid_code": 0,
+        "older_file": 0,
+        "filtered_watchlist": 0,
+        "nonstandard_code": 0,
+        "file_error": 0
+    }
+
+    if not files:
+        clear_tables()
+        log_counts(counts, 0)
+        print("No TXT data found. Tables cleared.")
+        return
+
+    watchlist = load_watchlist(DATA_DIR)
+    daily = read_daily_files(files, watchlist, counts)
+
     if daily.empty:
-        print("No TXT data found. Nothing to ingest.")
+        clear_tables()
+        log_counts(counts, 0)
+        print("No valid TXT rows found. Tables cleared.")
         return
 
     monthly = build_monthly(daily)
@@ -209,6 +308,7 @@ def ingest() -> None:
 
         conn.execute("INSERT INTO tickers SELECT code, name FROM meta_df")
 
+    log_counts(counts, len(daily))
     print(f"Inserted {len(meta)} tickers")
     print(f"Inserted {len(monthly)} monthly rows")
     print(f"Inserted {len(daily)} daily rows")

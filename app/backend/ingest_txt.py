@@ -163,7 +163,7 @@ def read_daily_files(files: list[str], watchlist: set[str] | None, counts: dict)
 def build_monthly(daily: pd.DataFrame) -> pd.DataFrame:
     daily_dt = pd.to_datetime(daily["date"], unit="s", utc=True)
     daily = daily.assign(dt=daily_dt)
-    daily["month"] = daily["dt"].dt.to_period("M").dt.to_timestamp(tz="UTC")
+    daily["month"] = daily["dt"].dt.to_period("M").dt.to_timestamp()
     grouped = daily.sort_values("dt").groupby(["code", "month"], as_index=False)
     monthly = grouped.agg(
         o=("o", "first"),

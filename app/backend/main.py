@@ -8,6 +8,17 @@ from fastapi.responses import JSONResponse
 from db import get_conn, init_schema
 
 DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "txt"))
+USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
+
+
+def find_code_txt_path(data_dir: str) -> str | None:
+    direct = os.path.join(data_dir, "code.txt")
+    if os.path.exists(direct):
+        return direct
+    parent = os.path.join(os.path.dirname(data_dir), "code.txt")
+    if os.path.exists(parent):
+        return parent
+    return None
 
 app = FastAPI()
 
@@ -29,7 +40,7 @@ def get_txt_status() -> dict:
     if not os.path.isdir(DATA_DIR):
         return {
             "txt_count": 0,
-            "code_txt_missing": True,
+            "code_txt_missing": False,
             "last_updated": None
         }
 
@@ -38,7 +49,9 @@ def get_txt_status() -> dict:
         for name in os.listdir(DATA_DIR)
         if name.endswith(".txt") and name.lower() != "code.txt"
     ]
-    code_txt_missing = not os.path.exists(os.path.join(DATA_DIR, "code.txt"))
+    code_txt_missing = False
+    if USE_CODE_TXT:
+        code_txt_missing = find_code_txt_path(DATA_DIR) is None
     last_updated = None
     if txt_files:
         last_updated = max(os.path.getmtime(path) for path in txt_files)
@@ -171,6 +184,33 @@ def daily(code: str, limit: int = 400):
             SELECT date, o, h, l, c, v, ma7, ma20, ma60
             FROM tail
             ORDER BY date
+            """,
+            [code, limit]
+        ).fetchall()
+
+    return JSONResponse(content=rows)
+
+
+@app.get("/api/ticker/monthly")
+def monthly(code: str, limit: int = 240):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            WITH base AS (
+                SELECT
+                    month,
+                    o,
+                    h,
+                    l,
+                    c
+                FROM monthly_bars
+                WHERE code = ?
+                ORDER BY month DESC
+                LIMIT ?
+            )
+            SELECT month, o, h, l, c
+            FROM base
+            ORDER BY month
             """,
             [code, limit]
         ).fetchall()

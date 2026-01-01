@@ -1,106 +1,163 @@
-﻿import { useEffect, useRef } from "react";
+﻿import { useEffect, useLayoutEffect, useRef } from "react";
 import { createChart } from "lightweight-charts";
+
+type Candle = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
+type VolumePoint = {
+  time: number;
+  value: number;
+};
+
+type MaLine = {
+  key: string;
+  color: string;
+  data: { time: number; value: number }[];
+  visible: boolean;
+};
 
 export default function DetailChart({
   candles,
   volume,
-  ma7,
-  ma20,
-  ma60,
-  maVisible
+  maLines,
+  showVolume
 }: {
-  candles: { time: number; open: number; high: number; low: number; close: number }[];
-  volume: { time: number; value: number }[];
-  ma7: { time: number; value: number }[];
-  ma20: { time: number; value: number }[];
-  ma60: { time: number; value: number }[];
-  maVisible: { ma7: boolean; ma20: boolean; ma60: boolean };
+  candles: Candle[];
+  volume: VolumePoint[];
+  maLines: MaLine[];
+  showVolume: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const candleSeriesRef = useRef<any>(null);
   const volumeSeriesRef = useRef<any>(null);
-  const maRefs = useRef<Record<string, any>>({});
+  const lineSeriesRef = useRef<any[]>([]);
+  const dataRef = useRef({ candles, volume, maLines, showVolume });
 
-  useEffect(() => {
-    if (!containerRef.current || chartRef.current) return;
-    const chart = createChart(containerRef.current, {
-      height: containerRef.current.clientHeight,
-      width: containerRef.current.clientWidth,
-      layout: {
-        background: { color: "#0f1628" },
-        textColor: "#cbd5f5"
-      },
-      grid: {
-        vertLines: { color: "rgba(255,255,255,0.06)" },
-        horzLines: { color: "rgba(255,255,255,0.06)" }
-      },
-      rightPriceScale: { visible: true, borderVisible: false },
-      timeScale: { borderVisible: false }
-    });
-
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: "#42d392",
-      downColor: "#ef4444",
-      borderVisible: false,
-      wickUpColor: "#42d392",
-      wickDownColor: "#ef4444"
-    });
-
-    const volumeSeries = chart.addHistogramSeries({
-      priceScaleId: "",
-      color: "#4f6dff",
-      priceFormat: { type: "volume" },
-      scaleMargins: { top: 0.7, bottom: 0 }
-    });
-
-    const ma7Series = chart.addLineSeries({ color: "#38bdf8", lineWidth: 2, priceLineVisible: false });
-    const ma20Series = chart.addLineSeries({ color: "#f59e0b", lineWidth: 2, priceLineVisible: false });
-    const ma60Series = chart.addLineSeries({ color: "#22c55e", lineWidth: 2, priceLineVisible: false });
-
-    chartRef.current = chart;
-    candleSeriesRef.current = candleSeries;
-    volumeSeriesRef.current = volumeSeries;
-    maRefs.current = {
-      ma7: ma7Series,
-      ma20: ma20Series,
-      ma60: ma60Series
-    };
-
-    const resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        chart.applyOptions({
-          width: Math.floor(entry.contentRect.width),
-          height: Math.floor(entry.contentRect.height)
-        });
-      }
-    });
-    resizeObserver.observe(containerRef.current);
-
-    return () => {
-      resizeObserver.disconnect();
-      chart.remove();
-    };
-  }, []);
-
-  useEffect(() => {
+  const applyData = (next: typeof dataRef.current) => {
     if (candleSeriesRef.current) {
-      candleSeriesRef.current.setData(candles);
+      candleSeriesRef.current.setData(next.candles);
     }
     if (volumeSeriesRef.current) {
-      volumeSeriesRef.current.setData(volume);
+      volumeSeriesRef.current.setData(next.showVolume ? next.volume : []);
+      volumeSeriesRef.current.applyOptions({ visible: next.showVolume });
     }
-    if (maRefs.current.ma7) maRefs.current.ma7.setData(ma7);
-    if (maRefs.current.ma20) maRefs.current.ma20.setData(ma20);
-    if (maRefs.current.ma60) maRefs.current.ma60.setData(ma60);
-  }, [candles, volume, ma7, ma20, ma60]);
+    next.maLines.forEach((line, index) => {
+      const series = lineSeriesRef.current[index];
+      if (!series) return;
+      series.applyOptions({ color: line.color, visible: line.visible });
+      series.setData(line.data);
+    });
+    if (chartRef.current && next.candles.length) {
+      chartRef.current.timeScale().fitContent();
+    }
+  };
 
   useEffect(() => {
-    if (!maRefs.current) return;
-    maRefs.current.ma7?.applyOptions({ visible: maVisible.ma7 });
-    maRefs.current.ma20?.applyOptions({ visible: maVisible.ma20 });
-    maRefs.current.ma60?.applyOptions({ visible: maVisible.ma60 });
-  }, [maVisible]);
+    dataRef.current = { candles, volume, maLines, showVolume };
+    applyData(dataRef.current);
+  }, [candles, volume, maLines, showVolume]);
+
+  useLayoutEffect(() => {
+    if (!containerRef.current || chartRef.current) return;
+    const element = containerRef.current;
+    let resizeObserver: ResizeObserver | null = null;
+    let rafId = 0;
+
+    const init = () => {
+      if (chartRef.current) return;
+      const width = Math.floor(element.clientWidth);
+      const height = Math.floor(element.clientHeight);
+      if (width <= 0 || height <= 0) {
+        rafId = window.requestAnimationFrame(init);
+        return;
+      }
+
+      const chart = createChart(element, {
+        height,
+        width,
+        layout: {
+          background: { color: "#0f1628" },
+          textColor: "#cbd5f5"
+        },
+        grid: {
+          vertLines: { color: "rgba(255,255,255,0.06)" },
+          horzLines: { color: "rgba(255,255,255,0.06)" }
+        },
+        rightPriceScale: {
+          visible: true,
+          borderVisible: false,
+          scaleMargins: { top: 0.05, bottom: 0.2 }
+        },
+        timeScale: { borderVisible: false }
+      });
+
+      const candleSeries = chart.addCandlestickSeries({
+        upColor: "#42d392",
+        downColor: "#ef4444",
+        borderVisible: false,
+        wickUpColor: "#42d392",
+        wickDownColor: "#ef4444"
+      });
+
+      const volumeSeries = chart.addHistogramSeries({
+        priceScaleId: "volume",
+        color: "rgba(79, 109, 255, 0.6)",
+        priceFormat: { type: "volume" },
+        lastValueVisible: false
+      });
+
+      chart.priceScale("volume").applyOptions({
+        scaleMargins: { top: 0.82, bottom: 0 },
+        visible: false,
+        borderVisible: false
+      });
+
+      const lineSeries = maLines.map((line) =>
+        chart.addLineSeries({
+          color: line.color,
+          lineWidth: 2,
+          priceLineVisible: false
+        })
+      );
+
+      chartRef.current = chart;
+      candleSeriesRef.current = candleSeries;
+      volumeSeriesRef.current = volumeSeries;
+      lineSeriesRef.current = lineSeries;
+
+      applyData(dataRef.current);
+
+      resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          chart.applyOptions({
+            width: Math.floor(entry.contentRect.width),
+            height: Math.floor(entry.contentRect.height)
+          });
+        }
+      });
+      resizeObserver.observe(element);
+    };
+
+    init();
+
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      if (resizeObserver) resizeObserver.disconnect();
+      if (chartRef.current) {
+        chartRef.current.remove();
+      }
+      chartRef.current = null;
+      candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+      lineSeriesRef.current = [];
+    };
+  }, []);
 
   return <div className="detail-chart-inner" ref={containerRef} />;
 }

@@ -145,6 +145,7 @@ export default function GridView() {
       <div className="grid-shell" ref={ref}>
         {size.width > 0 && (
           <Grid
+            key={gridTimeframe}
             columnCount={columns}
             columnWidth={columnWidth}
             height={gridHeight}

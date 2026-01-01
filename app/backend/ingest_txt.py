@@ -10,6 +10,28 @@ DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "
 CODE_PATTERN_DEFAULT = r"^[0-9A-Za-z]{4,16}$"
 CODE_PATTERN = re.compile(os.getenv("CODE_PATTERN", CODE_PATTERN_DEFAULT))
 STRICT_CODE_VALIDATION = os.getenv("CODE_STRICT", "0") == "1"
+USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
+
+
+def find_code_txt_path(data_dir: str) -> str | None:
+    direct = os.path.join(data_dir, "code.txt")
+    if os.path.exists(direct):
+        return direct
+    parent = os.path.join(os.path.dirname(data_dir), "code.txt")
+    if os.path.exists(parent):
+        return parent
+    return None
+
+
+def name_from_filename(path: str, code: str) -> str | None:
+    base = os.path.splitext(os.path.basename(path))[0]
+    if "_" not in base:
+        return None
+    code_part, name_part = base.split("_", 1)
+    if code_part != code:
+        return None
+    name = name_part.strip()
+    return name if name else None
 
 
 def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
@@ -18,8 +40,10 @@ def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
 
 
 def load_watchlist(data_dir: str) -> set[str] | None:
-    path = os.path.join(data_dir, "code.txt")
-    if not os.path.exists(path):
+    if not USE_CODE_TXT:
+        return None
+    path = find_code_txt_path(data_dir)
+    if not path:
         print("Warning: code.txt is missing. Falling back to TXT contents.")
         return None
     with open(path, "r", encoding="utf-8") as f:
@@ -131,8 +155,11 @@ def parse_file(path: str, watchlist: set[str] | None, counts: dict) -> pd.DataFr
     return df
 
 
-def read_daily_files(files: list[str], watchlist: set[str] | None, counts: dict) -> pd.DataFrame:
+def read_daily_files(
+    files: list[str], watchlist: set[str] | None, counts: dict
+) -> tuple[pd.DataFrame, dict[str, str]]:
     latest_by_code: dict[str, tuple[float, pd.DataFrame]] = {}
+    name_map: dict[str, str] = {}
     for path in files:
         df = parse_file(path, watchlist, counts)
         if df.empty:
@@ -143,21 +170,27 @@ def read_daily_files(files: list[str], watchlist: set[str] | None, counts: dict)
             existing = latest_by_code.get(code)
             if existing is None:
                 latest_by_code[code] = (mtime, group)
+                display_name = name_from_filename(path, code)
+                if display_name:
+                    name_map[code] = display_name
                 continue
             if existing[0] >= mtime:
                 counts["older_file"] += len(group)
                 continue
             counts["older_file"] += len(existing[1])
             latest_by_code[code] = (mtime, group)
+            display_name = name_from_filename(path, code)
+            if display_name:
+                name_map[code] = display_name
 
     frames = [entry[1] for entry in latest_by_code.values()]
     if not frames:
-        return pd.DataFrame(columns=["code", "date", "o", "h", "l", "c", "v"])
+        return pd.DataFrame(columns=["code", "date", "o", "h", "l", "c", "v"]), name_map
 
     daily = pd.concat(frames, ignore_index=True)
     daily["date"] = daily["date"].dt.tz_localize("UTC")
     daily["date"] = (daily["date"].astype("int64") // 1_000_000_000).astype("int64")
-    return daily
+    return daily, name_map
 
 
 def build_monthly(daily: pd.DataFrame) -> pd.DataFrame:
@@ -191,14 +224,14 @@ def build_daily_ma(daily: pd.DataFrame) -> pd.DataFrame:
     return daily[["code", "date", "ma7", "ma20", "ma60"]]
 
 
-def build_stock_meta(monthly: pd.DataFrame) -> pd.DataFrame:
+def build_stock_meta(monthly: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
     now = datetime.now(tz=timezone.utc)
     records = []
     for code, group in monthly.groupby("code"):
         stage, score, reason = compute_stage_score(group)
         records.append({
             "code": code,
-            "name": code,
+            "name": name_map.get(code, code),
             "stage": stage,
             "score": score,
             "reason": reason,
@@ -268,7 +301,7 @@ def ingest() -> None:
         return
 
     watchlist = load_watchlist(DATA_DIR)
-    daily = read_daily_files(files, watchlist, counts)
+    daily, name_map = read_daily_files(files, watchlist, counts)
 
     if daily.empty:
         clear_tables()
@@ -279,7 +312,7 @@ def ingest() -> None:
     monthly = build_monthly(daily)
     monthly_ma = build_monthly_ma(monthly)
     daily_ma = build_daily_ma(daily)
-    meta = build_stock_meta(monthly)
+    meta = build_stock_meta(monthly, name_map)
 
     with get_conn() as conn:
         conn.execute("DELETE FROM daily_bars")

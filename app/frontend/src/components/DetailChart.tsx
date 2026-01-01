@@ -3,15 +3,24 @@ import { createChart } from "lightweight-charts";
 
 export default function DetailChart({
   candles,
-  volume
+  volume,
+  ma7,
+  ma20,
+  ma60,
+  maVisible
 }: {
   candles: { time: number; open: number; high: number; low: number; close: number }[];
   volume: { time: number; value: number }[];
+  ma7: { time: number; value: number }[];
+  ma20: { time: number; value: number }[];
+  ma60: { time: number; value: number }[];
+  maVisible: { ma7: boolean; ma20: boolean; ma60: boolean };
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const candleSeriesRef = useRef<any>(null);
   const volumeSeriesRef = useRef<any>(null);
+  const maRefs = useRef<Record<string, any>>({});
 
   useEffect(() => {
     if (!containerRef.current || chartRef.current) return;
@@ -45,9 +54,18 @@ export default function DetailChart({
       scaleMargins: { top: 0.7, bottom: 0 }
     });
 
+    const ma7Series = chart.addLineSeries({ color: "#38bdf8", lineWidth: 2, priceLineVisible: false });
+    const ma20Series = chart.addLineSeries({ color: "#f59e0b", lineWidth: 2, priceLineVisible: false });
+    const ma60Series = chart.addLineSeries({ color: "#22c55e", lineWidth: 2, priceLineVisible: false });
+
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
+    maRefs.current = {
+      ma7: ma7Series,
+      ma20: ma20Series,
+      ma60: ma60Series
+    };
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -72,7 +90,17 @@ export default function DetailChart({
     if (volumeSeriesRef.current) {
       volumeSeriesRef.current.setData(volume);
     }
-  }, [candles, volume]);
+    if (maRefs.current.ma7) maRefs.current.ma7.setData(ma7);
+    if (maRefs.current.ma20) maRefs.current.ma20.setData(ma20);
+    if (maRefs.current.ma60) maRefs.current.ma60.setData(ma60);
+  }, [candles, volume, ma7, ma20, ma60]);
+
+  useEffect(() => {
+    if (!maRefs.current) return;
+    maRefs.current.ma7?.applyOptions({ visible: maVisible.ma7 });
+    maRefs.current.ma20?.applyOptions({ visible: maVisible.ma20 });
+    maRefs.current.ma60?.applyOptions({ visible: maVisible.ma60 });
+  }, [maVisible]);
 
   return <div className="detail-chart-inner" ref={containerRef} />;
 }

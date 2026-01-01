@@ -1,28 +1,39 @@
 ﻿import { memo } from "react";
-import { Ticker } from "../store";
-import Sparkline from "./Sparkline";
+import { BarsPayload, Ticker, useStore } from "../store";
+import ThumbnailCanvas from "./ThumbnailCanvas";
 
 const StockTile = memo(function StockTile({
   ticker,
-  onClick
+  timeframe,
+  onDoubleClick
 }: {
   ticker: Ticker;
-  onClick: () => void;
+  timeframe: "monthly" | "daily";
+  onDoubleClick: () => void;
 }) {
+  const barsPayload = useStore((state) => state.barsCache[timeframe][ticker.code]);
+
+  const stageLabel = ticker.stage || "UNKNOWN";
+  const stageClass = stageLabel.toLowerCase();
+
   return (
-    <button className="tile" type="button" onClick={onClick}>
+    <button className="tile" type="button" onDoubleClick={onDoubleClick}>
       <div className="tile-header">
         <div>
           <div className="tile-code">{ticker.code}</div>
           <div className="tile-name">{ticker.name}</div>
         </div>
         <div className="tile-meta">
-          <span className={`badge stage-${ticker.stage || "na"}`}>{ticker.stage || "n/a"}</span>
+          <span className={`badge stage-${stageClass}`}>{stageLabel}</span>
           <span className="score">{ticker.score?.toFixed(1) ?? "--"}</span>
         </div>
       </div>
       <div className="tile-chart">
-        <Sparkline code={ticker.code} />
+        {barsPayload ? (
+          <ThumbnailCanvas payload={barsPayload} />
+        ) : (
+          <div className="tile-loading">Loading...</div>
+        )}
       </div>
     </button>
   );

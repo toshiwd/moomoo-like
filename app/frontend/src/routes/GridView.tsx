@@ -1,11 +1,12 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
 import { useNavigate } from "react-router-dom";
+import { api } from "../api";
 import { useStore } from "../store";
 import StockTile from "../components/StockTile";
 
 const TILE_HEIGHT = 230;
-const HEADER_HEIGHT = 72;
+const HEADER_HEIGHT = 88;
 
 function useResizeObserver() {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -27,22 +28,39 @@ function useResizeObserver() {
   return { ref, size };
 }
 
+type HealthStatus = {
+  txt_count: number;
+  code_count: number;
+  last_updated: string | null;
+  code_txt_missing: boolean;
+};
+
 export default function GridView() {
   const navigate = useNavigate();
   const { ref, size } = useResizeObserver();
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
-  const ensureMonthlyForVisible = useStore((state) => state.ensureMonthlyForVisible);
+  const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const columns = useStore((state) => state.settings.columns);
   const search = useStore((state) => state.settings.search);
   const gridScrollTop = useStore((state) => state.settings.gridScrollTop);
+  const gridTimeframe = useStore((state) => state.settings.gridTimeframe);
   const setColumns = useStore((state) => state.setColumns);
   const setSearch = useStore((state) => state.setSearch);
   const setGridScrollTop = useStore((state) => state.setGridScrollTop);
+  const setGridTimeframe = useStore((state) => state.setGridTimeframe);
+
+  const [health, setHealth] = useState<HealthStatus | null>(null);
 
   useEffect(() => {
     loadList();
   }, [loadList]);
+
+  useEffect(() => {
+    api.get("/health").then((res) => {
+      setHealth(res.data as HealthStatus);
+    });
+  }, []);
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -73,7 +91,7 @@ export default function GridView() {
       const item = filtered[index];
       if (item) codes.push(item.code);
     }
-    ensureMonthlyForVisible(codes);
+    ensureBarsForVisible(gridTimeframe, codes);
   };
 
   return (
@@ -81,9 +99,20 @@ export default function GridView() {
       <header className="top-bar">
         <div>
           <div className="title">Moomoo-like Screener</div>
-          <div className="subtitle">Fast grid with virtualized monthly sparklines</div>
+          <div className="subtitle">Fast grid with canvas sparklines</div>
         </div>
         <div className="controls">
+          <div className="segmented">
+            {["monthly", "daily"].map((value) => (
+              <button
+                key={value}
+                className={gridTimeframe === value ? "active" : ""}
+                onClick={() => setGridTimeframe(value as "monthly" | "daily")}
+              >
+                {value === "monthly" ? "Monthly" : "Daily"}
+              </button>
+            ))}
+          </div>
           <input
             className="search"
             placeholder="Search code or name"
@@ -103,6 +132,16 @@ export default function GridView() {
           </div>
         </div>
       </header>
+      {health && health.txt_count === 0 && (
+        <div className="data-warning">
+          TXTが見つかりません。PANROLLINGで出力したTXTを `data/txt` に配置してください。
+        </div>
+      )}
+      {health && health.code_txt_missing && health.txt_count > 0 && (
+        <div className="data-warning subtle">
+          code.txt がありません。ファイル名から銘柄コードを推定しています（code.txt推奨）。
+        </div>
+      )}
       <div className="grid-shell" ref={ref}>
         {size.width > 0 && (
           <Grid
@@ -125,7 +164,8 @@ export default function GridView() {
                 <div style={style}>
                   <StockTile
                     ticker={item}
-                    onClick={() => navigate(`/detail/${item.code}`)}
+                    timeframe={gridTimeframe}
+                    onDoubleClick={() => navigate(`/detail/${item.code}`)}
                   />
                 </div>
               );

@@ -282,14 +282,16 @@ export default function DetailView() {
 
   const tickerName = useMemo(() => {
     if (!code) return "";
-    return tickers.find((item) => item.code === code)?.name ?? "";
+    const raw = tickers.find((item) => item.code === code)?.name ?? "";
+    const cleaned = raw.replace(/\s*\?\s*$/, "").trim();
+    return cleaned === "?" ? "" : cleaned;
   }, [tickers, code]);
 
   const subtitle = useMemo(() => {
     const parts = [] as string[];
     if (tickerName) parts.push(tickerName);
     parts.push("Daily / Weekly / Monthly");
-    return parts.join(" ? ");
+    return parts.filter(Boolean).join(" / ");
   }, [tickerName]);
 
   useEffect(() => {
@@ -385,27 +387,73 @@ export default function DetailView() {
     [monthlyCandles, rangeMonths]
   );
 
+  const dailyInvalidCount =
+    dailyParse.stats.invalidRow + dailyParse.stats.invalidTime + dailyParse.stats.invalidValue;
+  const monthlyInvalidCount =
+    monthlyParse.stats.invalidRow + monthlyParse.stats.invalidTime + monthlyParse.stats.invalidValue;
+  const dailyHasEmpty = dailyFetch.status === "success" && dailyFetch.responseCount === 0;
+  const monthlyHasEmpty = monthlyFetch.status === "success" && monthlyFetch.responseCount === 0;
+  const dailyHasParsedZero = dailyParse.stats.parsed === 0 && dailyParse.stats.total > 0;
+  const monthlyHasParsedZero = monthlyParse.stats.parsed === 0 && monthlyParse.stats.total > 0;
+
   const dailyError =
     dailyFetch.status === "error"
       ? dailyFetch.errorMessage
-      : dailyFetch.status === "success" && dailyFetch.responseCount === 0
-      ? "データ0件"
-      : dailyFetch.status === "success" &&
-        dailyParse.stats.parsed === 0 &&
-        dailyParse.stats.total > 0
-      ? `日付変換失敗 ${dailyParse.stats.invalidTime}件`
+      : dailyHasEmpty
+      ? "No data"
+      : dailyHasParsedZero
+      ? `Date parse failed ${dailyParse.stats.invalidTime}`
       : null;
 
   const monthlyError =
     monthlyFetch.status === "error"
       ? monthlyFetch.errorMessage
-      : monthlyFetch.status === "success" && monthlyFetch.responseCount === 0
-      ? "データ0件"
-      : monthlyFetch.status === "success" &&
-        monthlyParse.stats.parsed === 0 &&
-        monthlyParse.stats.total > 0
-      ? `日付変換失敗 ${monthlyParse.stats.invalidTime}件`
+      : monthlyHasEmpty
+      ? "No data"
+      : monthlyHasParsedZero
+      ? `Date parse failed ${monthlyParse.stats.invalidTime}`
       : null;
+
+  const weeklyHasEmpty = weeklyCandles.length === 0 && dailyCandles.length > 0;
+  const dailyIssue =
+    dailyFetch.status === "error" || dailyHasEmpty || dailyHasParsedZero || dailyInvalidCount > 0;
+  const weeklyIssue = dailyFetch.status === "error" || weeklyHasEmpty;
+  const monthlyIssue =
+    monthlyFetch.status === "error" ||
+    monthlyHasEmpty ||
+    monthlyHasParsedZero ||
+    monthlyInvalidCount > 0;
+  const hasIssues = dailyIssue || weeklyIssue || monthlyIssue;
+
+  const debugMode = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    return new URLSearchParams(window.location.search).get("debug") === "1";
+  }, []);
+  const [debugOpen, setDebugOpen] = useState(false);
+
+  const debugSummary = useMemo(() => {
+    const parts: string[] = [];
+    if (dailyFetch.status === "error") parts.push("Daily fetch error");
+    if (dailyHasEmpty) parts.push("Daily 0 bars");
+    if (dailyHasParsedZero) parts.push("Daily parsed 0");
+    if (dailyInvalidCount > 0) parts.push(`Daily invalid ${dailyInvalidCount}`);
+    if (weeklyHasEmpty && dailyFetch.status !== "error") parts.push("Weekly 0 bars");
+    if (monthlyFetch.status === "error") parts.push("Monthly fetch error");
+    if (monthlyHasEmpty) parts.push("Monthly 0 bars");
+    if (monthlyHasParsedZero) parts.push("Monthly parsed 0");
+    if (monthlyInvalidCount > 0) parts.push(`Monthly invalid ${monthlyInvalidCount}`);
+    return parts;
+  }, [
+    dailyFetch.status,
+    dailyHasEmpty,
+    dailyHasParsedZero,
+    dailyInvalidCount,
+    weeklyHasEmpty,
+    monthlyFetch.status,
+    monthlyHasEmpty,
+    monthlyHasParsedZero,
+    monthlyInvalidCount
+  ]);
 
   const dailyMaLines = useMemo(() => {
     return maSettings.daily.map((setting) => ({
@@ -528,12 +576,9 @@ export default function DetailView() {
     weeklyChartRef.current?.setCrosshair(time);
   };
 
-  const dailyEmptyMessage =
-    dailyCandles.length === 0 ? dailyError ?? "データなし" : null;
-  const weeklyEmptyMessage =
-    weeklyCandles.length === 0 ? dailyError ?? "データなし" : null;
-  const monthlyEmptyMessage =
-    monthlyCandles.length === 0 ? monthlyError ?? "データなし" : null;
+  const dailyEmptyMessage = dailyCandles.length === 0 ? dailyError ?? "No data" : null;
+  const weeklyEmptyMessage = weeklyCandles.length === 0 ? dailyError ?? "No data" : null;
+  const monthlyEmptyMessage = monthlyCandles.length === 0 ? monthlyError ?? "No data" : null;
 
   const monthlyRatio = 1 - weeklyRatio;
 
@@ -644,22 +689,46 @@ export default function DetailView() {
           Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
         </div>
       </div>
-      <div className="detail-debug">
-        <div>
-          Daily({dailyFetch.status}) API {dailyFetch.responseCount} | Parsed {dailyParse.stats.parsed} | Range {dailyRangeCount} | InvalidRow{" "}
-          {dailyParse.stats.invalidRow} | InvalidTime {dailyParse.stats.invalidTime} | InvalidValue{" "}
-          {dailyParse.stats.invalidValue} | Error {dailyError ?? "-"}
+      {(hasIssues || debugMode) && (
+        <div className={`detail-debug-banner ${hasIssues ? "warning" : "info"}`}>
+          <button
+            type="button"
+            className="detail-debug-toggle"
+            onClick={() => setDebugOpen((prev) => !prev)}
+          >
+            {hasIssues
+              ? `Data issue detected${
+                  debugSummary.length ? ` (${debugSummary.join(", ")})` : ""
+                }`
+              : "Show debug info"}
+          </button>
+          {debugOpen && (
+            <div className="detail-debug-panel">
+              <div className="detail-debug-header">
+                <div className="detail-debug-title">Debug Details</div>
+                <button
+                  type="button"
+                  className="detail-debug-close"
+                  onClick={() => setDebugOpen(false)}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="detail-debug-lines">
+                <div>
+                  Daily({dailyFetch.status}) API {dailyFetch.responseCount} | Parsed {dailyParse.stats.parsed} | Range {dailyRangeCount} | InvalidRow {dailyParse.stats.invalidRow} | InvalidTime {dailyParse.stats.invalidTime} | InvalidValue {dailyParse.stats.invalidValue} | Error {dailyError ?? "-"}
+                </div>
+                <div>
+                  Weekly Parsed {weeklyCandles.length} | Range {weeklyRangeCount} | Error {dailyError ?? "-"}
+                </div>
+                <div>
+                  Monthly({monthlyFetch.status}) API {monthlyFetch.responseCount} | Parsed {monthlyParse.stats.parsed} | Range {monthlyRangeCount} | InvalidRow {monthlyParse.stats.invalidRow} | InvalidTime {monthlyParse.stats.invalidTime} | InvalidValue {monthlyParse.stats.invalidValue} | Error {monthlyError ?? "-"}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
-        <div>
-          Weekly Parsed {weeklyCandles.length} | Range {weeklyRangeCount} | Error{" "}
-          {dailyError ?? "-"}
-        </div>
-        <div>
-          Monthly({monthlyFetch.status}) API {monthlyFetch.responseCount} | Parsed {monthlyParse.stats.parsed} | Range {monthlyRangeCount} | InvalidRow{" "}
-          {monthlyParse.stats.invalidRow} | InvalidTime {monthlyParse.stats.invalidTime} | InvalidValue{" "}
-          {monthlyParse.stats.invalidValue} | Error {monthlyError ?? "-"}
-        </div>
-      </div>
+      )}
       {showIndicators && (
         <div className="indicator-overlay" onClick={() => setShowIndicators(false)}>
           <div className="indicator-panel" onClick={(event) => event.stopPropagation()}>

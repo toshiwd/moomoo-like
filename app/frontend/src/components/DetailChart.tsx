@@ -1,7 +1,9 @@
-import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { createChart } from "lightweight-charts";
 import type { Box } from "../store";
+import type { DailyPosition, TradeMarker } from "../utils/positions";
 import { getBodyRangeFromCandles, getBoxFill, getBoxStroke } from "../utils/boxes";
+import PositionOverlay from "./PositionOverlay";
 
 type Candle = {
   time: number;
@@ -38,11 +40,29 @@ type DetailChartProps = {
   showVolume: boolean;
   boxes: Box[];
   showBoxes: boolean;
+  visibleRange?: { from: number; to: number } | null;
+  positionOverlay?: {
+    dailyPositions: DailyPosition[];
+    tradeMarkers: TradeMarker[];
+    showOverlay: boolean;
+    showPnL: boolean;
+    hoverTime: number | null;
+  };
   onCrosshairMove?: (time: number | null) => void;
 };
 
 const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function DetailChart(
-  { candles, volume, maLines, showVolume, boxes, showBoxes, onCrosshairMove },
+  {
+    candles,
+    volume,
+    maLines,
+    showVolume,
+    boxes,
+    showBoxes,
+    visibleRange,
+    positionOverlay,
+    onCrosshairMove
+  },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -52,7 +72,11 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
   const candleSeriesRef = useRef<any>(null);
   const volumeSeriesRef = useRef<any>(null);
   const lineSeriesRef = useRef<any[]>([]);
+  const [overlayTargets, setOverlayTargets] = useState<{
+    candleSeries: any;
+  }>({ candleSeries: null });
   const dataRef = useRef({ candles, volume, maLines, showVolume, boxes, showBoxes });
+  const visibleRangeRef = useRef<DetailChartProps["visibleRange"]>(visibleRange);
   const candlesRef = useRef<Candle[]>(candles);
   const boxesRef = useRef<Box[]>(boxes);
   const showBoxesRef = useRef(showBoxes);
@@ -102,6 +126,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     const timeScale = chart.timeScale();
     const series = candleSeriesRef.current;
     if (!series) return;
+    if (typeof timeScale.timeToCoordinate !== "function") return;
+    if (typeof series.priceToCoordinate !== "function") return;
 
     ctx.fillStyle = BOX_FILL;
     ctx.strokeStyle = BOX_STROKE;
@@ -113,6 +139,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       const bodyRange = getBodyRangeFromCandles(candlesRef.current, box.startTime, box.endTime);
       const upper = bodyRange?.upper ?? box.upper;
       const lower = bodyRange?.lower ?? box.lower;
+      if (!Number.isFinite(upper) || !Number.isFinite(lower)) return;
       const y1 = series.priceToCoordinate(upper);
       const y2 = series.priceToCoordinate(lower);
       if (x1 == null || x2 == null || y1 == null || y2 == null) return;
@@ -193,7 +220,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       series.applyOptions({ color: line.color, visible: line.visible, lineWidth: line.lineWidth });
       series.setData(line.data);
     });
-    if (chart && next.candles.length) {
+    if (chart && next.candles.length && !visibleRangeRef.current) {
       chart.timeScale().fitContent();
     }
     drawBoxes();
@@ -255,6 +282,17 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     showBoxesRef.current = showBoxes;
     applyData(dataRef.current);
   }, [candles, volume, maLines, showVolume, boxes, showBoxes]);
+
+  useEffect(() => {
+    visibleRangeRef.current = visibleRange ?? null;
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (!visibleRange) {
+      chart.timeScale().fitContent();
+      return;
+    }
+    chart.timeScale().setVisibleRange(visibleRange);
+  }, [visibleRange]);
 
   useEffect(() => {
     onCrosshairMoveRef.current = onCrosshairMove;
@@ -366,6 +404,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       candleSeriesRef.current = candleSeries;
       volumeSeriesRef.current = volumeSeries;
       lineSeriesRef.current = lineSeries;
+      setOverlayTargets({ candleSeries });
 
       applyData(dataRef.current);
       resizeOverlay();
@@ -408,6 +447,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
       lineSeriesRef.current = [];
+      setOverlayTargets({ candleSeries: null });
     };
   }, []);
 
@@ -415,6 +455,16 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     <div className="detail-chart-wrapper" ref={wrapperRef}>
       <div className="detail-chart-inner" ref={containerRef} />
       <canvas className="detail-chart-overlay" ref={overlayRef} />
+      {positionOverlay && (positionOverlay.showOverlay || positionOverlay.showPnL) && (
+        <PositionOverlay
+          candleSeries={overlayTargets.candleSeries}
+          dailyPositions={positionOverlay.dailyPositions}
+          tradeMarkers={positionOverlay.tradeMarkers}
+          showOverlay={positionOverlay.showOverlay}
+          showPnL={positionOverlay.showPnL}
+          hoverTime={positionOverlay.hoverTime}
+        />
+      )}
     </div>
   );
 });

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { BarsPayload, Box, MaSetting, useStore } from "../store";
+import { BarsPayload, Box, MaSetting } from "../store";
 import { getBodyRangeFromBars, getBoxFill, getBoxStroke } from "../utils/boxes";
 
 const COLORS = {
@@ -199,20 +199,13 @@ export default function ThumbnailCanvas({
   payload,
   boxes,
   showBoxes,
-  timeframe
+  maSettings
 }: {
   payload: BarsPayload;
   boxes: Box[];
   showBoxes: boolean;
-  timeframe: "daily" | "weekly" | "monthly";
+  maSettings: MaSetting[];
 }) {
-  const maSettings = useStore((state) =>
-    timeframe === "daily"
-      ? state.maSettings.daily
-      : timeframe === "weekly"
-      ? state.maSettings.weekly
-      : state.maSettings.monthly
-  );
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastKeyRef = useRef<string>("");

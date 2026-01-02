@@ -76,6 +76,7 @@ type Settings = {
   gridScrollTop: number;
   gridTimeframe: "monthly" | "weekly" | "daily";
   showBoxes: boolean;
+  sortMode: SortMode;
 };
 
 type StoreState = {
@@ -100,9 +101,12 @@ type StoreState = {
   setGridScrollTop: (value: number) => void;
   setGridTimeframe: (value: Settings["gridTimeframe"]) => void;
   setShowBoxes: (value: boolean) => void;
+  setSortMode: (value: SortMode) => void;
   updateMaSetting: (timeframe: MaTimeframe, index: number, patch: Partial<MaSetting>) => void;
   resetMaSettings: (timeframe: MaTimeframe) => void;
 };
+
+export type SortMode = "trend-up" | "trend-down" | "trend-abs" | "exhaustion";
 
 const MA_COLORS = ["#ef4444", "#22c55e", "#3b82f6", "#a855f7", "#f59e0b"];
 const THUMB_BARS = 30;
@@ -291,7 +295,8 @@ export const useStore = create<StoreState>((set, get) => ({
     search: "",
     gridScrollTop: 0,
     gridTimeframe: getInitialTimeframe(),
-    showBoxes: true
+    showBoxes: true,
+    sortMode: "trend-up"
   },
   loadList: async () => {
     if (get().loadingList) return;
@@ -522,6 +527,9 @@ export const useStore = create<StoreState>((set, get) => ({
   },
   setShowBoxes: (value) => {
     set((state) => ({ settings: { ...state.settings, showBoxes: value } }));
+  },
+  setSortMode: (value) => {
+    set((state) => ({ settings: { ...state.settings, sortMode: value } }));
   },
   updateMaSetting: (timeframe, index, patch) => {
     set((state) => {

@@ -4,8 +4,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import DetailChart, { DetailChartHandle } from "../components/DetailChart";
 import { Box, MaSetting, useStore } from "../store";
+import { computeSignalMetrics } from "../utils/signals";
+import type { TradeEvent } from "../utils/positions";
+import { buildDailyPositions } from "../utils/positions";
 
 type Timeframe = "daily" | "weekly" | "monthly";
+type FocusPanel = Timeframe | null;
 
 type Candle = {
   time: number;
@@ -262,6 +266,9 @@ export default function DetailView() {
   const [dailyData, setDailyData] = useState<number[][]>([]);
   const [monthlyData, setMonthlyData] = useState<number[][]>([]);
   const [boxes, setBoxes] = useState<Box[]>([]);
+  const [trades, setTrades] = useState<TradeEvent[]>([]);
+  const [tradeWarnings, setTradeWarnings] = useState<string[]>([]);
+  const [tradeError, setTradeError] = useState<string | null>(null);
   const [dailyFetch, setDailyFetch] = useState<FetchState>({
     status: "idle",
     responseCount: 0,
@@ -279,6 +286,10 @@ export default function DetailView() {
   const [showIndicators, setShowIndicators] = useState(false);
   const [weeklyRatio, setWeeklyRatio] = useState(DEFAULT_WEEKLY_RATIO);
   const [rangeMonths, setRangeMonths] = useState<number | null>(12);
+  const [showTradesOverlay, setShowTradesOverlay] = useState(true);
+  const [showPnLPanel, setShowPnLPanel] = useState(true);
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  const [focusPanel, setFocusPanel] = useState<FocusPanel>(null);
 
   const tickerName = useMemo(() => {
     if (!code) return "";
@@ -365,15 +376,56 @@ export default function DetailView() {
       });
   }, [code]);
 
+  useEffect(() => {
+    if (!code) return;
+    setTradeError(null);
+    api
+      .get(`/trades/${code}`)
+      .then((res) => {
+        const payload = res.data as {
+          events?: TradeEvent[];
+          warnings?: string[];
+          currentPosition?: { buyUnits: number; sellUnits: number; text?: string };
+        };
+        if (!payload || !Array.isArray(payload.events)) {
+          throw new Error("Trades response is invalid");
+        }
+        setTrades(payload.events ?? []);
+        setTradeWarnings(payload.warnings ?? []);
+      })
+      .catch((error) => {
+        const message = error?.message || "Trades fetch failed";
+        setTradeError(message);
+        setTrades([]);
+        setTradeWarnings([]);
+      });
+  }, [code]);
+
   const dailyParse = useMemo(() => buildCandlesWithStats(dailyData), [dailyData]);
   const monthlyParse = useMemo(() => buildCandlesWithStats(monthlyData), [monthlyData]);
   const dailyCandles = dailyParse.candles;
   const monthlyCandles = monthlyParse.candles;
   const dailyVolume = useMemo(() => buildVolume(dailyData), [dailyData]);
+  const monthlyVolume = useMemo(() => buildVolume(monthlyData), [monthlyData]);
   const weeklyData = useMemo(() => buildWeekly(dailyCandles, dailyVolume), [dailyCandles, dailyVolume]);
 
   const weeklyCandles = weeklyData.candles;
   const weeklyVolume = weeklyData.volume;
+  const dailySignalBars = useMemo(
+    () => dailyCandles.map((candle) => [candle.time, candle.open, candle.high, candle.low, candle.close]),
+    [dailyCandles]
+  );
+  const dailySignalMetrics = useMemo(
+    () => computeSignalMetrics(dailySignalBars),
+    [dailySignalBars]
+  );
+  const dailySignals = dailySignalMetrics.signals;
+  const positionData = useMemo(
+    () => buildDailyPositions(dailyCandles, trades),
+    [dailyCandles, trades]
+  );
+  const dailyPositions = positionData.dailyPositions;
+  const tradeMarkers = positionData.tradeMarkers;
   const dailyRangeCount = useMemo(
     () => countInRange(dailyCandles, rangeMonths),
     [dailyCandles, rangeMonths]
@@ -416,7 +468,12 @@ export default function DetailView() {
 
   const weeklyHasEmpty = weeklyCandles.length === 0 && dailyCandles.length > 0;
   const dailyIssue =
-    dailyFetch.status === "error" || dailyHasEmpty || dailyHasParsedZero || dailyInvalidCount > 0;
+    dailyFetch.status === "error" ||
+    dailyHasEmpty ||
+    dailyHasParsedZero ||
+    dailyInvalidCount > 0 ||
+    !!tradeError ||
+    tradeWarnings.length > 0;
   const weeklyIssue = dailyFetch.status === "error" || weeklyHasEmpty;
   const monthlyIssue =
     monthlyFetch.status === "error" ||
@@ -442,6 +499,11 @@ export default function DetailView() {
     if (monthlyHasEmpty) parts.push("Monthly 0 bars");
     if (monthlyHasParsedZero) parts.push("Monthly parsed 0");
     if (monthlyInvalidCount > 0) parts.push(`Monthly invalid ${monthlyInvalidCount}`);
+    if (tradeError) parts.push("Trades error");
+    if (tradeWarnings.length) {
+      const preview = tradeWarnings.slice(0, 2).join(", ");
+      parts.push(preview ? `Trades warning: ${preview}` : "Trades warning");
+    }
     return parts;
   }, [
     dailyFetch.status,
@@ -452,7 +514,9 @@ export default function DetailView() {
     monthlyFetch.status,
     monthlyHasEmpty,
     monthlyHasParsedZero,
-    monthlyInvalidCount
+    monthlyInvalidCount,
+    tradeError,
+    tradeWarnings.length
   ]);
 
   const dailyMaLines = useMemo(() => {
@@ -485,20 +549,20 @@ export default function DetailView() {
     }));
   }, [monthlyCandles, maSettings.monthly]);
 
-  useEffect(() => {
-    if (!rangeMonths) {
-      dailyChartRef.current?.fitContent();
-      weeklyChartRef.current?.fitContent();
-      monthlyChartRef.current?.fitContent();
-      return;
-    }
-    const dailyRange = buildRange(dailyCandles, rangeMonths);
-    if (dailyRange) dailyChartRef.current?.setVisibleRange(dailyRange);
-    const weeklyRange = buildRange(weeklyCandles, rangeMonths);
-    if (weeklyRange) weeklyChartRef.current?.setVisibleRange(weeklyRange);
-    const monthlyRange = buildRange(monthlyCandles, rangeMonths);
-    if (monthlyRange) monthlyChartRef.current?.setVisibleRange(monthlyRange);
-  }, [rangeMonths, dailyCandles, weeklyCandles, monthlyCandles]);
+  const dailyVisibleRange = useMemo(
+    () => (rangeMonths ? buildRange(dailyCandles, rangeMonths) : null),
+    [dailyCandles, rangeMonths]
+  );
+
+  const weeklyVisibleRange = useMemo(
+    () => (rangeMonths ? buildRange(weeklyCandles, rangeMonths) : null),
+    [weeklyCandles, rangeMonths]
+  );
+
+  const monthlyVisibleRange = useMemo(
+    () => (rangeMonths ? buildRange(monthlyCandles, rangeMonths) : null),
+    [monthlyCandles, rangeMonths]
+  );
 
   useEffect(() => {
     const handleMove = (event: MouseEvent | TouchEvent) => {
@@ -534,6 +598,25 @@ export default function DetailView() {
     };
   }, []);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setFocusPanel(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    setHoverTime(null);
+    dailyChartRef.current?.clearCrosshair();
+    weeklyChartRef.current?.clearCrosshair();
+    monthlyChartRef.current?.clearCrosshair();
+  }, [focusPanel]);
+
   const showVolumeDaily = dailyVolume.length > 0;
 
   const loadMoreDaily = () => {
@@ -561,19 +644,32 @@ export default function DetailView() {
     draggingRef.current = true;
   };
 
+  const toggleFocus = (panel: Timeframe) => {
+    setFocusPanel((prev) => (prev === panel ? null : panel));
+  };
+
   const handleDailyCrosshair = (time: number | null) => {
     weeklyChartRef.current?.setCrosshair(time);
     monthlyChartRef.current?.setCrosshair(time);
+    if (focusPanel === null || focusPanel === "daily") {
+      setHoverTime(time);
+    }
   };
 
   const handleWeeklyCrosshair = (time: number | null) => {
     dailyChartRef.current?.setCrosshair(time);
     monthlyChartRef.current?.setCrosshair(time);
+    if (focusPanel === "weekly") {
+      setHoverTime(time);
+    }
   };
 
   const handleMonthlyCrosshair = (time: number | null) => {
     dailyChartRef.current?.setCrosshair(time);
     weeklyChartRef.current?.setCrosshair(time);
+    if (focusPanel === "monthly") {
+      setHoverTime(time);
+    }
   };
 
   const dailyEmptyMessage = dailyCandles.length === 0 ? dailyError ?? "No data" : null;
@@ -581,6 +677,8 @@ export default function DetailView() {
   const monthlyEmptyMessage = monthlyCandles.length === 0 ? monthlyError ?? "No data" : null;
 
   const monthlyRatio = 1 - weeklyRatio;
+  const focusTitle =
+    focusPanel === "daily" ? "Daily (Focused)" : focusPanel === "weekly" ? "Weekly (Focused)" : "Monthly (Focused)";
 
   return (
     <div className="detail-shell">
@@ -591,6 +689,18 @@ export default function DetailView() {
         <div>
           <div className="title">{code}</div>
           <div className="subtitle">{subtitle}</div>
+          {dailySignals.length > 0 && (
+            <div className="detail-signals">
+              {dailySignals.map((signal) => (
+                <span
+                  key={signal.label}
+                  className={`signal-chip ${signal.kind === "warning" ? "warning" : "achieved"}`}
+                >
+                  {signal.label}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
         <div className="detail-controls">
           <div className="segmented detail-range">
@@ -610,63 +720,209 @@ export default function DetailView() {
           >
             Boxes
           </button>
+          <button
+            className={showTradesOverlay ? "indicator-button active" : "indicator-button"}
+            onClick={() => setShowTradesOverlay(!showTradesOverlay)}
+          >
+            Positions
+          </button>
+          <button
+            className={showPnLPanel ? "indicator-button active" : "indicator-button"}
+            onClick={() => setShowPnLPanel(!showPnLPanel)}
+          >
+            PnL
+          </button>
           <button className="indicator-button" onClick={() => setShowIndicators(true)}>
             Indicators
           </button>
         </div>
       </div>
-      <div className="detail-split">
-        <div className="detail-row detail-row-top" style={{ flex: `${DAILY_ROW_RATIO} 1 0%` }}>
-          <div className="detail-pane-header">Daily</div>
-          <div className="detail-chart">
-            <DetailChart
-              ref={dailyChartRef}
-              candles={dailyCandles}
-              volume={dailyVolume}
-              maLines={dailyMaLines}
-              showVolume={showVolumeDaily}
-              boxes={boxes}
-              showBoxes={showBoxes}
-              onCrosshairMove={handleDailyCrosshair}
-            />
-            {dailyEmptyMessage && <div className="detail-chart-empty">Daily: {dailyEmptyMessage}</div>}
+      <div className={`detail-split ${focusPanel ? "detail-split-focus" : ""}`}>
+        {focusPanel ? (
+          <div className="detail-row detail-row-focus">
+            <div className="detail-pane-header">{focusTitle}</div>
+            <div
+              className="detail-chart detail-chart-focused"
+              onDoubleClick={() => toggleFocus(focusPanel)}
+            >
+              {focusPanel === "daily" && (
+                <DetailChart
+                  ref={dailyChartRef}
+                  candles={dailyCandles}
+                  volume={dailyVolume}
+                  maLines={dailyMaLines}
+                  showVolume={showVolumeDaily}
+                  boxes={boxes}
+                  showBoxes={showBoxes}
+                  visibleRange={dailyVisibleRange}
+                  positionOverlay={{
+                    dailyPositions,
+                    tradeMarkers,
+                    showOverlay: showTradesOverlay,
+                    showMarkers: true,
+                    showPnL: showPnLPanel,
+                    hoverTime,
+                    bars: dailyCandles,
+                    volume: dailyVolume
+                  }}
+                  onCrosshairMove={handleDailyCrosshair}
+                />
+              )}
+              {focusPanel === "weekly" && (
+                <DetailChart
+                  ref={weeklyChartRef}
+                  candles={weeklyCandles}
+                  volume={weeklyVolume}
+                  maLines={weeklyMaLines}
+                  showVolume={false}
+                  boxes={boxes}
+                  showBoxes={showBoxes}
+                  visibleRange={weeklyVisibleRange}
+                  positionOverlay={{
+                    dailyPositions,
+                    tradeMarkers,
+                    showOverlay: showTradesOverlay,
+                    showMarkers: false,
+                    showPnL: showPnLPanel,
+                    hoverTime,
+                    bars: weeklyCandles,
+                    volume: weeklyVolume
+                  }}
+                  onCrosshairMove={handleWeeklyCrosshair}
+                />
+              )}
+              {focusPanel === "monthly" && (
+                <DetailChart
+                  ref={monthlyChartRef}
+                  candles={monthlyCandles}
+                  volume={monthlyVolume}
+                  maLines={monthlyMaLines}
+                  showVolume={false}
+                  boxes={boxes}
+                  showBoxes={showBoxes}
+                  visibleRange={monthlyVisibleRange}
+                  positionOverlay={{
+                    dailyPositions,
+                    tradeMarkers,
+                    showOverlay: showTradesOverlay,
+                    showMarkers: false,
+                    showPnL: showPnLPanel,
+                    hoverTime,
+                    bars: monthlyCandles,
+                    volume: monthlyVolume
+                  }}
+                  onCrosshairMove={handleMonthlyCrosshair}
+                />
+              )}
+              {focusPanel === "daily" && dailyEmptyMessage && (
+                <div className="detail-chart-empty">Daily: {dailyEmptyMessage}</div>
+              )}
+              {focusPanel === "weekly" && weeklyEmptyMessage && (
+                <div className="detail-chart-empty">Weekly: {weeklyEmptyMessage}</div>
+              )}
+              {focusPanel === "monthly" && monthlyEmptyMessage && (
+                <div className="detail-chart-empty">Monthly: {monthlyEmptyMessage}</div>
+              )}
+              <button
+                type="button"
+                className="detail-focus-back"
+                onClick={() => setFocusPanel(null)}
+              >
+                Back to 3 charts
+              </button>
+            </div>
           </div>
-        </div>
-        <div className="detail-row detail-row-bottom" style={{ flex: `${1 - DAILY_ROW_RATIO} 1 0%` }} ref={bottomRowRef}>
-          <div className="detail-pane" style={{ flex: `${weeklyRatio} 1 0%` }}>
-            <div className="detail-pane-header">Weekly</div>
-            <div className="detail-chart">
-              <DetailChart
-              ref={weeklyChartRef}
-              candles={weeklyCandles}
-              volume={weeklyVolume}
-              maLines={weeklyMaLines}
-              showVolume={false}
-              boxes={boxes}
-              showBoxes={showBoxes}
-              onCrosshairMove={handleWeeklyCrosshair}
-            />
-            {weeklyEmptyMessage && <div className="detail-chart-empty">Weekly: {weeklyEmptyMessage}</div>}
-          </div>
-        </div>
-          <div className="detail-divider detail-divider-vertical" onMouseDown={startDrag()} onTouchStart={startDrag()} />
-          <div className="detail-pane" style={{ flex: `${monthlyRatio} 1 0%` }}>
-            <div className="detail-pane-header">Monthly</div>
-            <div className="detail-chart">
-              <DetailChart
-              ref={monthlyChartRef}
-              candles={monthlyCandles}
-              volume={[]}
-              maLines={monthlyMaLines}
-              showVolume={false}
-              boxes={boxes}
-              showBoxes={showBoxes}
-              onCrosshairMove={handleMonthlyCrosshair}
-            />
-            {monthlyEmptyMessage && <div className="detail-chart-empty">Monthly: {monthlyEmptyMessage}</div>}
-          </div>
-        </div>
-        </div>
+        ) : (
+          <>
+            <div className="detail-row detail-row-top" style={{ flex: `${DAILY_ROW_RATIO} 1 0%` }}>
+              <div className="detail-pane-header">Daily</div>
+              <div
+                className="detail-chart detail-chart-focusable"
+                onDoubleClick={() => toggleFocus("daily")}
+              >
+                <DetailChart
+                  ref={dailyChartRef}
+                  candles={dailyCandles}
+                  volume={dailyVolume}
+                  maLines={dailyMaLines}
+                  showVolume={showVolumeDaily}
+                  boxes={boxes}
+                  showBoxes={showBoxes}
+                  visibleRange={dailyVisibleRange}
+                  positionOverlay={{
+                    dailyPositions,
+                    tradeMarkers,
+                    showOverlay: showTradesOverlay,
+                    showMarkers: true,
+                    showPnL: showPnLPanel,
+                    hoverTime,
+                    bars: dailyCandles,
+                    volume: dailyVolume
+                  }}
+                  onCrosshairMove={handleDailyCrosshair}
+                />
+                {dailyEmptyMessage && (
+                  <div className="detail-chart-empty">Daily: {dailyEmptyMessage}</div>
+                )}
+              </div>
+            </div>
+            <div
+              className="detail-row detail-row-bottom"
+              style={{ flex: `${1 - DAILY_ROW_RATIO} 1 0%` }}
+              ref={bottomRowRef}
+            >
+              <div className="detail-pane" style={{ flex: `${weeklyRatio} 1 0%` }}>
+                <div className="detail-pane-header">Weekly</div>
+                <div
+                  className="detail-chart detail-chart-focusable"
+                  onDoubleClick={() => toggleFocus("weekly")}
+                >
+                  <DetailChart
+                    ref={weeklyChartRef}
+                    candles={weeklyCandles}
+                    volume={weeklyVolume}
+                    maLines={weeklyMaLines}
+                    showVolume={false}
+                    boxes={boxes}
+                    showBoxes={showBoxes}
+                    visibleRange={weeklyVisibleRange}
+                    onCrosshairMove={handleWeeklyCrosshair}
+                  />
+                  {weeklyEmptyMessage && (
+                    <div className="detail-chart-empty">Weekly: {weeklyEmptyMessage}</div>
+                  )}
+                </div>
+              </div>
+              <div
+                className="detail-divider detail-divider-vertical"
+                onMouseDown={startDrag()}
+                onTouchStart={startDrag()}
+              />
+              <div className="detail-pane" style={{ flex: `${monthlyRatio} 1 0%` }}>
+                <div className="detail-pane-header">Monthly</div>
+                <div
+                  className="detail-chart detail-chart-focusable"
+                  onDoubleClick={() => toggleFocus("monthly")}
+                >
+                  <DetailChart
+                    ref={monthlyChartRef}
+                    candles={monthlyCandles}
+                    volume={monthlyVolume}
+                    maLines={monthlyMaLines}
+                    showVolume={false}
+                    boxes={boxes}
+                    showBoxes={showBoxes}
+                    visibleRange={monthlyVisibleRange}
+                    onCrosshairMove={handleMonthlyCrosshair}
+                  />
+                  {monthlyEmptyMessage && (
+                    <div className="detail-chart-empty">Monthly: {monthlyEmptyMessage}</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
       </div>
       <div className="detail-footer">
         <div className="detail-footer-left">
@@ -724,6 +980,9 @@ export default function DetailView() {
                 <div>
                   Monthly({monthlyFetch.status}) API {monthlyFetch.responseCount} | Parsed {monthlyParse.stats.parsed} | Range {monthlyRangeCount} | InvalidRow {monthlyParse.stats.invalidRow} | InvalidTime {monthlyParse.stats.invalidTime} | InvalidValue {monthlyParse.stats.invalidValue} | Error {monthlyError ?? "-"}
                 </div>
+                {tradeWarnings.length > 0 && (
+                  <div>Trades warnings: {tradeWarnings.slice(0, 5).join(", ")}</div>
+                )}
               </div>
             </div>
           )}

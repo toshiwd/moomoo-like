@@ -304,6 +304,9 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     const element = containerRef.current;
     let resizeObserver: ResizeObserver | null = null;
     let rafId = 0;
+    let resizeRafId = 0;
+    let pendingResize: { width: number; height: number } | null = null;
+    let lastSize = { width: 0, height: 0 };
 
     const init = () => {
       if (chartRef.current) return;
@@ -412,11 +415,21 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
 
       resizeObserver = new ResizeObserver((entries) => {
         for (const entry of entries) {
-          chart.applyOptions({
-            width: Math.floor(entry.contentRect.width),
-            height: Math.floor(entry.contentRect.height)
+          const width = Math.floor(entry.contentRect.width);
+          const height = Math.floor(entry.contentRect.height);
+          if (width <= 0 || height <= 0) continue;
+          pendingResize = { width, height };
+          if (resizeRafId) continue;
+          resizeRafId = window.requestAnimationFrame(() => {
+            resizeRafId = 0;
+            if (!pendingResize) return;
+            const { width: nextWidth, height: nextHeight } = pendingResize;
+            pendingResize = null;
+            if (lastSize.width === nextWidth && lastSize.height === nextHeight) return;
+            lastSize = { width: nextWidth, height: nextHeight };
+            chart.applyOptions({ width: nextWidth, height: nextHeight });
+            resizeOverlay();
           });
-          resizeOverlay();
         }
       });
       resizeObserver.observe(element);
@@ -440,6 +453,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     return () => {
       if (teardown) teardown();
       if (rafId) window.cancelAnimationFrame(rafId);
+      if (resizeRafId) window.cancelAnimationFrame(resizeRafId);
       if (resizeObserver) resizeObserver.disconnect();
       if (chartRef.current) {
         chartRef.current.remove();

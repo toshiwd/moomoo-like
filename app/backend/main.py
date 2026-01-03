@@ -1,7 +1,10 @@
 ﻿from datetime import datetime, timedelta
 import csv
+import json
 import os
 import re
+import sqlite3
+import time
 
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +20,70 @@ DEFAULT_TRADE_CSV_PATH = os.path.abspath(
 TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH") or DEFAULT_TRADE_CSV_PATH
 USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
 DEFAULT_DB_PATH = os.getenv("STOCKS_DB_PATH", os.path.join(os.path.dirname(__file__), "stocks.duckdb"))
+RANK_CONFIG_PATH = os.getenv("RANK_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "rank_config.json"))
+FAVORITES_DB_PATH = os.getenv(
+    "FAVORITES_DB_PATH", os.path.join(os.path.dirname(__file__), "favorites.sqlite")
+)
 
 
 _trade_cache = {"mtime": None, "path": None, "rows": [], "warnings": []}
 _screener_cache = {"mtime": None, "rows": []}
+_rank_cache = {"mtime": None, "config_mtime": None, "weekly": {}, "monthly": {}}
+_rank_config_cache = {"mtime": None, "config": None}
+
+
+def _get_favorites_conn():
+    conn = sqlite3.connect(FAVORITES_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_favorites_schema() -> None:
+    with _get_favorites_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                code TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+
+def _normalize_code(value: str | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    match = re.search(r"\d{4}", text)
+    if match:
+        return match.group(0)
+    return text.upper()
+
+
+def _load_favorite_codes() -> list[str]:
+    with _get_favorites_conn() as conn:
+        rows = conn.execute("SELECT code FROM favorites ORDER BY code").fetchall()
+    return [row["code"] for row in rows]
+
+
+def _load_favorite_items() -> list[dict]:
+    codes = _load_favorite_codes()
+    if not codes:
+        return []
+    names_by_code: dict[str, str] = {}
+    placeholders = ",".join(["?"] * len(codes))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT code, name FROM tickers WHERE code IN ({placeholders})",
+            codes
+        ).fetchall()
+    for row in rows:
+        code = str(row[0])
+        name = row[1] or code
+        names_by_code[code] = name
+    return [{"code": code, "name": names_by_code.get(code, code)} for code in codes]
 
 
 def find_code_txt_path(data_dir: str) -> str | None:
@@ -46,6 +109,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_schema()
+    _init_favorites_schema()
 
 
 def _parse_trade_csv() -> dict:
@@ -693,6 +757,834 @@ def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> t
     return payload, box_state
 
 
+def _load_rank_config() -> dict:
+    path = RANK_CONFIG_PATH
+    mtime = os.path.getmtime(path) if os.path.isfile(path) else None
+    cached = _rank_config_cache.get("config")
+    if _rank_config_cache.get("mtime") == mtime and cached is not None:
+        return cached
+    config: dict = {}
+    if mtime is not None:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                config = json.load(handle) or {}
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    _rank_config_cache["mtime"] = mtime
+    _rank_config_cache["config"] = config
+    return config
+
+
+def _get_config_value(config: dict, keys: list[str], default):
+    current = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _parse_as_of_date(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.match(r"^\d{8}$", text):
+        try:
+            year = int(text[:4])
+            month = int(text[4:6])
+            day = int(text[6:8])
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+    if re.match(r"^\d{6}$", text):
+        try:
+            year = int(text[:4])
+            month = int(text[4:6])
+            return datetime(year, month, 1)
+        except ValueError:
+            return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _as_of_int(value: str | None) -> int | None:
+    dt = _parse_as_of_date(value)
+    if not dt:
+        return None
+    return dt.year * 10000 + dt.month * 100 + dt.day
+
+
+def _as_of_month_int(value: str | None) -> int | None:
+    dt = _parse_as_of_date(value)
+    if not dt:
+        return None
+    return dt.year * 100 + dt.month
+
+
+def _format_daily_label(value: int | None) -> str | None:
+    if value is None:
+        return None
+    raw = str(int(value)).zfill(8)
+    return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+
+
+def _parse_codes_from_text(text: str) -> list[str]:
+    codes = re.findall(r"\d{4}", text)
+    return sorted(set(codes))
+
+
+def _load_universe_codes(universe: str | None) -> tuple[list[str], str | None, float | None]:
+    if not universe:
+        return [], None, None
+    key = universe.strip().lower()
+    if not key or key in ("all", "*"):
+        return [], None, None
+
+    path = None
+    if key in ("watchlist", "code", "code.txt"):
+        path = find_code_txt_path(DATA_DIR)
+    else:
+        candidates = [
+            os.path.join(DATA_DIR, f"{universe}.txt"),
+            os.path.join(os.path.dirname(DATA_DIR), f"{universe}.txt"),
+            os.path.join(os.path.dirname(os.path.dirname(DATA_DIR)), f"{universe}.txt")
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                path = candidate
+                break
+
+    if not path or not os.path.isfile(path):
+        return [], None, None
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return [], path, None
+
+    codes = _parse_codes_from_text(text)
+    mtime = os.path.getmtime(path) if os.path.isfile(path) else None
+    return codes, path, mtime
+
+
+def _resolve_universe_codes(conn, universe: str | None) -> tuple[list[str], dict]:
+    all_codes = [row[0] for row in conn.execute(
+        "SELECT DISTINCT code FROM daily_bars ORDER BY code"
+    ).fetchall()]
+    if not universe or universe.strip().lower() in ("", "all", "*"):
+        return all_codes, {"source": "all", "requested": universe}
+
+    universe_codes, path, mtime = _load_universe_codes(universe)
+    if not universe_codes:
+        return all_codes, {"source": "all", "requested": universe, "warning": "universe_not_found"}
+
+    allowed = set(all_codes)
+    filtered = [code for code in universe_codes if code in allowed]
+    return filtered, {
+        "source": "file",
+        "requested": universe,
+        "path": path,
+        "mtime": mtime,
+        "missing": len(universe_codes) - len(filtered)
+    }
+
+
+def _group_rows_by_code(rows: list[tuple]) -> dict[str, list[tuple]]:
+    grouped: dict[str, list[tuple]] = {}
+    for row in rows:
+        if not row:
+            continue
+        code = row[0]
+        grouped.setdefault(code, []).append(row[1:])
+    return grouped
+
+
+def _fetch_daily_rows(conn, codes: list[str], as_of: int | None, limit: int) -> dict[str, list[tuple]]:
+    if not codes:
+        return {}
+    placeholders = ",".join(["?"] * len(codes))
+    where_clauses = [f"code IN ({placeholders})"]
+    params: list = list(codes)
+    if as_of is not None:
+        where_clauses.append("date <= ?")
+        params.append(as_of)
+    where_sql = " AND ".join(where_clauses)
+
+    query = f"""
+        SELECT code, date, o, h, l, c, v
+        FROM (
+            SELECT
+                code,
+                date,
+                o,
+                h,
+                l,
+                c,
+                v,
+                ROW_NUMBER() OVER (PARTITION BY code ORDER BY date DESC) AS rn
+            FROM daily_bars
+            WHERE {where_sql}
+        )
+        WHERE rn <= ?
+        ORDER BY code, date
+    """
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return _group_rows_by_code(rows)
+
+
+def _fetch_monthly_rows(conn, codes: list[str], as_of_month: int | None, limit: int) -> dict[str, list[tuple]]:
+    if not codes:
+        return {}
+    placeholders = ",".join(["?"] * len(codes))
+    where_clauses = [f"code IN ({placeholders})"]
+    params: list = list(codes)
+    if as_of_month is not None:
+        where_clauses.append("month <= ?")
+        params.append(as_of_month)
+    where_sql = " AND ".join(where_clauses)
+    query = f"""
+        SELECT code, month, o, h, l, c
+        FROM (
+            SELECT
+                code,
+                month,
+                o,
+                h,
+                l,
+                c,
+                ROW_NUMBER() OVER (PARTITION BY code ORDER BY month DESC) AS rn
+            FROM monthly_bars
+            WHERE {where_sql}
+        )
+        WHERE rn <= ?
+        ORDER BY code, month
+    """
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return _group_rows_by_code(rows)
+
+
+def _normalize_daily_rows(rows: list[tuple], as_of: int | None) -> list[tuple]:
+    by_date: dict[int, tuple] = {}
+    for row in rows:
+        if len(row) < 6:
+            continue
+        date_value = row[0]
+        if date_value is None:
+            continue
+        date_int = int(date_value)
+        if as_of is not None and date_int > as_of:
+            continue
+        by_date[date_int] = row
+    return [by_date[key] for key in sorted(by_date.keys())]
+
+
+def _normalize_monthly_rows(rows: list[tuple], as_of_month: int | None) -> list[tuple]:
+    by_month: dict[int, tuple] = {}
+    for row in rows:
+        if len(row) < 5:
+            continue
+        month_value = row[0]
+        if month_value is None:
+            continue
+        month_int = int(month_value)
+        if as_of_month is not None and month_int > as_of_month:
+            continue
+        by_month[month_int] = row
+    return [by_month[key] for key in sorted(by_month.keys())]
+
+
+def _compute_atr(highs: list[float], lows: list[float], closes: list[float], period: int) -> float | None:
+    if len(closes) < 2 or len(closes) != len(highs) or len(closes) != len(lows):
+        return None
+    trs: list[float] = []
+    prev_close = closes[0]
+    for high, low, close in zip(highs, lows, closes):
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+    if len(trs) < period:
+        return None
+    window = trs[-period:]
+    return sum(window) / period
+
+
+def _compute_volume_ratio(volumes: list[float], period: int, include_latest: bool) -> float | None:
+    if period <= 0:
+        return None
+    if include_latest:
+        if len(volumes) < period:
+            return None
+        window = volumes[-period:]
+    else:
+        if len(volumes) < period + 1:
+            return None
+        window = volumes[-period - 1:-1]
+    avg = sum(window) / period if period else 0
+    if avg <= 0:
+        return None
+    latest = volumes[-1]
+    return latest / avg
+
+
+def _calc_slope(values: list[float | None], lookback: int) -> float | None:
+    if lookback <= 0 or len(values) <= lookback:
+        return None
+    current = values[-1]
+    past = values[-1 - lookback]
+    if current is None or past is None:
+        return None
+    return float(current) - float(past)
+
+
+def _calc_recent_bounds(highs: list[float], lows: list[float], lookback: int) -> tuple[float | None, float | None]:
+    if not highs or not lows:
+        return None, None
+    if lookback <= 0:
+        return max(highs), min(lows)
+    window_highs = highs[-lookback:] if len(highs) >= lookback else highs
+    window_lows = lows[-lookback:] if len(lows) >= lookback else lows
+    return max(window_highs), min(window_lows)
+
+
+def _detect_body_box(monthly_rows: list[tuple], config: dict) -> dict | None:
+    thresholds = _get_config_value(config, ["monthly", "thresholds"], {})
+    min_months = int(thresholds.get("min_months", 3))
+    max_months = int(thresholds.get("max_months", 14))
+    max_range_pct = float(thresholds.get("max_range_pct", 0.2))
+    wild_wick_pct = float(thresholds.get("wild_wick_pct", 0.1))
+
+    bars: list[dict] = []
+    for row in monthly_rows:
+        if len(row) < 5:
+            continue
+        month_value, open_, high, low, close = row[:5]
+        if month_value is None or open_ is None or high is None or low is None or close is None:
+            continue
+        body_high = max(float(open_), float(close))
+        body_low = min(float(open_), float(close))
+        bars.append(
+            {
+                "time": int(month_value),
+                "open": float(open_),
+                "high": float(high),
+                "low": float(low),
+                "close": float(close),
+                "body_high": body_high,
+                "body_low": body_low
+            }
+        )
+
+    if len(bars) < min_months:
+        return None
+
+    bars.sort(key=lambda item: item["time"])
+    max_months = min(max_months, len(bars))
+
+    for length in range(max_months, min_months - 1, -1):
+        window = bars[-length:]
+        upper = max(item["body_high"] for item in window)
+        lower = min(item["body_low"] for item in window)
+        base = max(abs(lower), 1e-9)
+        range_pct = (upper - lower) / base
+        if range_pct > max_range_pct:
+            continue
+        wild = False
+        for item in window:
+            if item["high"] > upper * (1 + wild_wick_pct) or item["low"] < lower * (1 - wild_wick_pct):
+                wild = True
+                break
+        return {
+            "start": window[0]["time"],
+            "end": window[-1]["time"],
+            "upper": upper,
+            "lower": lower,
+            "months": length,
+            "range_pct": range_pct,
+            "wild": wild,
+            "last_close": window[-1]["close"]
+        }
+
+    return None
+
+
+def _score_weekly_candidate(code: str, name: str, rows: list[tuple], config: dict, as_of: int | None) -> tuple[dict | None, dict | None, str | None]:
+    rows = _normalize_daily_rows(rows, as_of)
+    common = _get_config_value(config, ["common"], {})
+    min_bars = int(common.get("min_daily_bars", 80))
+    if len(rows) < min_bars:
+        return None, None, "insufficient_daily_bars"
+
+    dates = [int(row[0]) for row in rows]
+    opens = [float(row[1]) for row in rows]
+    highs = [float(row[2]) for row in rows]
+    lows = [float(row[3]) for row in rows]
+    closes = [float(row[4]) for row in rows]
+    volumes = [float(row[5]) if row[5] is not None else 0.0 for row in rows]
+
+    close = closes[-1] if closes else None
+    if close is None:
+        return None, None, "missing_close"
+
+    ma7_series = _build_ma_series(closes, 7)
+    ma20_series = _build_ma_series(closes, 20)
+    ma60_series = _build_ma_series(closes, 60)
+
+    ma7 = ma7_series[-1] if ma7_series else None
+    ma20 = ma20_series[-1] if ma20_series else None
+    ma60 = ma60_series[-1] if ma60_series else None
+    if ma20 is None or ma60 is None:
+        return None, None, "missing_ma"
+
+    slope_lookback = int(common.get("slope_lookback", 3))
+    slope20 = _calc_slope(ma20_series, slope_lookback)
+
+    atr_period = int(common.get("atr_period", 14))
+    atr14 = _compute_atr(highs, lows, closes, atr_period)
+
+    volume_period = int(common.get("volume_period", 20))
+    include_latest = common.get("volume_ratio_mode", "exclude_latest") == "include_latest"
+    volume_ratio = _compute_volume_ratio(volumes, volume_period, include_latest)
+
+    up7 = _count_streak(closes, ma7_series, "up")
+    down7 = _count_streak(closes, ma7_series, "down")
+
+    trigger_lookback = int(common.get("trigger_lookback", 20))
+    recent_high, recent_low = _calc_recent_bounds(highs, lows, trigger_lookback)
+    break_up_pct = None
+    break_down_pct = None
+    if recent_high is not None and close:
+        break_up_pct = max(0.0, (recent_high - close) / close * 100)
+    if recent_low is not None and close:
+        break_down_pct = max(0.0, (close - recent_low) / close * 100)
+
+    weekly = _get_config_value(config, ["weekly"], {})
+    weights = weekly.get("weights", {})
+    thresholds = weekly.get("thresholds", {})
+    down_weights = weekly.get("down_weights", {})
+    down_thresholds = weekly.get("down_thresholds", {})
+    max_reasons = int(common.get("max_reasons", 6))
+
+    up_reasons: list[tuple[float, str]] = []
+    down_reasons: list[tuple[float, str]] = []
+    up_badges: list[str] = []
+    down_badges: list[str] = []
+    up_score = 0.0
+    down_score = 0.0
+
+    def push_reason(target: list[tuple[float, str]], weight: float, label: str):
+        if weight:
+            target.append((weight, label))
+
+    def push_badge(target: list[str], label: str):
+        if label and label not in target:
+            target.append(label)
+
+    if close > ma20 and ma20 > ma60:
+        weight = float(weights.get("ma_alignment", 0))
+        up_score += weight
+        push_reason(up_reasons, weight, "MA20がMA60より上")
+        push_badge(up_badges, "MA整列")
+
+    pull_min = int(thresholds.get("pullback_down7_min", 1))
+    pull_max = int(thresholds.get("pullback_down7_max", 2))
+    slope_min = float(thresholds.get("slope_min", 0))
+    if close > ma20 and down7 is not None and pull_min <= down7 <= pull_max:
+        if slope20 is None or slope20 >= slope_min:
+            weight = float(weights.get("pullback_above_ma20", 0))
+            up_score += weight
+            push_reason(up_reasons, weight, f"MA20上で押し目（下{down7}本）")
+            push_badge(up_badges, "押し目")
+
+    vol_thresh = float(thresholds.get("volume_ratio", 1.5))
+    if volume_ratio is not None and volume_ratio >= vol_thresh:
+        weight = float(weights.get("volume_spike", 0))
+        up_score += weight
+        push_reason(up_reasons, weight, f"出来高増（20日比{volume_ratio:.2f}倍）")
+        push_badge(up_badges, "出来高増")
+
+    near_pct = float(thresholds.get("near_break_pct", 2.0))
+    if break_up_pct is not None and break_up_pct <= near_pct:
+        weight = float(weights.get("near_high_break", 0))
+        up_score += weight
+        push_reason(up_reasons, weight, f"高値ブレイク接近（{break_up_pct:.1f}%）")
+        push_badge(up_badges, "高値接近")
+
+    if slope20 is not None and slope20 >= slope_min:
+        weight = float(weights.get("slope_up", 0))
+        up_score += weight
+        push_reason(up_reasons, weight, "MA20上向き")
+        push_badge(up_badges, "MA上向き")
+
+    big_candle = float(thresholds.get("big_candle_atr", 1.2))
+    if atr14 is not None and abs(close - opens[-1]) >= atr14 * big_candle and close > opens[-1]:
+        weight = float(weights.get("big_bull_candle", 0))
+        up_score += weight
+        push_reason(up_reasons, weight, "強い陽線")
+        push_badge(up_badges, "陽線強")
+
+    ma20_dist = float(thresholds.get("ma20_distance_pct", 2.0))
+    if ma20:
+        dist_pct = abs(close - ma20) / ma20 * 100
+        if close >= ma20 and dist_pct <= ma20_dist:
+            weight = float(weights.get("ma20_support", 0))
+            up_score += weight
+            push_reason(up_reasons, weight, f"MA20近接（{dist_pct:.1f}%）")
+            push_badge(up_badges, "MA20近接")
+
+    if close < ma20 and ma20 < ma60:
+        weight = float(down_weights.get("ma_alignment", 0))
+        down_score += weight
+        push_reason(down_reasons, weight, "MA20がMA60より下")
+        push_badge(down_badges, "MA逆転")
+
+    pull_min = int(down_thresholds.get("pullback_up7_min", 1))
+    pull_max = int(down_thresholds.get("pullback_up7_max", 2))
+    slope_max = float(down_thresholds.get("slope_max", 0))
+    if close < ma20 and up7 is not None and pull_min <= up7 <= pull_max:
+        if slope20 is None or slope20 <= slope_max:
+            weight = float(down_weights.get("pullback_below_ma20", 0))
+            down_score += weight
+            push_reason(down_reasons, weight, f"MA20下で戻り（上{up7}本）")
+            push_badge(down_badges, "戻り")
+
+    vol_thresh = float(down_thresholds.get("volume_ratio", vol_thresh))
+    if volume_ratio is not None and volume_ratio >= vol_thresh:
+        weight = float(down_weights.get("volume_spike", 0))
+        down_score += weight
+        push_reason(down_reasons, weight, f"出来高増（20日比{volume_ratio:.2f}倍）")
+        push_badge(down_badges, "出来高増")
+
+    near_pct = float(down_thresholds.get("near_break_pct", near_pct))
+    if break_down_pct is not None and break_down_pct <= near_pct:
+        weight = float(down_weights.get("near_low_break", 0))
+        down_score += weight
+        push_reason(down_reasons, weight, f"安値ブレイク接近（{break_down_pct:.1f}%）")
+        push_badge(down_badges, "安値接近")
+
+    if slope20 is not None and slope20 <= slope_max:
+        weight = float(down_weights.get("slope_down", 0))
+        down_score += weight
+        push_reason(down_reasons, weight, "MA20下向き")
+        push_badge(down_badges, "MA下向き")
+
+    big_candle = float(down_thresholds.get("big_candle_atr", big_candle))
+    if atr14 is not None and abs(close - opens[-1]) >= atr14 * big_candle and close < opens[-1]:
+        weight = float(down_weights.get("big_bear_candle", 0))
+        down_score += weight
+        push_reason(down_reasons, weight, "強い陰線")
+        push_badge(down_badges, "陰線強")
+
+    ma20_dist = float(down_thresholds.get("ma20_distance_pct", ma20_dist))
+    if ma20:
+        dist_pct = abs(close - ma20) / ma20 * 100
+        if close <= ma20 and dist_pct <= ma20_dist:
+            weight = float(down_weights.get("ma20_resistance", 0))
+            down_score += weight
+            push_reason(down_reasons, weight, f"MA20近接（{dist_pct:.1f}%）")
+            push_badge(down_badges, "MA20近接")
+
+    up_reasons.sort(key=lambda item: item[0], reverse=True)
+    down_reasons.sort(key=lambda item: item[0], reverse=True)
+
+    levels = {
+        "close": close,
+        "ma7": ma7,
+        "ma20": ma20,
+        "ma60": ma60,
+        "atr14": atr14,
+        "volume_ratio": volume_ratio
+    }
+
+    chart_hint = {
+        "lines": {
+            "ma20": ma20,
+            "ma60": ma60,
+            "recent_high": recent_high,
+            "recent_low": recent_low
+        }
+    }
+
+    as_of_label = _format_daily_label(dates[-1])
+    series_bars = int(common.get("rank_series_bars", 60))
+    series_rows = rows[-series_bars:] if series_bars > 0 else rows
+    series = [
+        [int(item[0]), float(item[1]), float(item[2]), float(item[3]), float(item[4])]
+        for item in series_rows
+    ]
+
+    base = {
+        "code": code,
+        "name": name or code,
+        "as_of": as_of_label,
+        "levels": levels,
+        "series": series,
+        "distance_to_trigger": {
+            "break_up_pct": break_up_pct,
+            "break_down_pct": break_down_pct
+        },
+        "chart_hint": chart_hint
+    }
+
+    up_item = {
+        **base,
+        "total_score": round(up_score, 3),
+        "reasons": [label for _, label in up_reasons[:max_reasons]],
+        "badges": up_badges[:max_reasons]
+    }
+    down_item = {
+        **base,
+        "total_score": round(down_score, 3),
+        "reasons": [label for _, label in down_reasons[:max_reasons]],
+        "badges": down_badges[:max_reasons]
+    }
+
+    return up_item, down_item, None
+
+
+def _score_monthly_candidate(code: str, name: str, rows: list[tuple], config: dict, as_of_month: int | None) -> tuple[dict | None, str | None]:
+    rows = _normalize_monthly_rows(rows, as_of_month)
+    thresholds = _get_config_value(config, ["monthly", "thresholds"], {})
+    min_months = int(thresholds.get("min_months", 3))
+    if len(rows) < min_months:
+        return None, "insufficient_monthly_bars"
+
+    box = _detect_body_box(rows, config)
+    if not box:
+        return None, "no_box"
+
+    weights = _get_config_value(config, ["monthly", "weights"], {})
+    max_reasons = int(_get_config_value(config, ["common", "max_reasons"], 6))
+    near_edge_pct = float(thresholds.get("near_edge_pct", 4.0))
+    wild_penalty = float(weights.get("wild_box_penalty", 0))
+
+    close = float(box["last_close"])
+    upper = float(box["upper"])
+    lower = float(box["lower"])
+    break_up_pct = max(0.0, (upper - close) / close * 100) if close else None
+    break_down_pct = max(0.0, (close - lower) / close * 100) if close else None
+    edge_pct = None
+    if break_up_pct is not None and break_down_pct is not None:
+        edge_pct = min(break_up_pct, break_down_pct)
+
+    reasons: list[tuple[float, str]] = []
+    score = 0.0
+
+    months = int(box["months"])
+    weight_month = float(weights.get("box_months", 0))
+    if weight_month:
+        score += weight_month * months
+        reasons.append((weight_month, f"箱の期間{months}か月"))
+
+    if edge_pct is not None and edge_pct <= near_edge_pct:
+        weight = float(weights.get("near_edge", 0))
+        ratio = 1 - edge_pct / near_edge_pct if near_edge_pct else 1
+        score += weight * ratio
+        if break_up_pct is not None and break_down_pct is not None:
+            if break_up_pct <= break_down_pct:
+                reasons.append((weight, f"上抜けまで{break_up_pct:.1f}%"))
+            else:
+                reasons.append((weight, f"下抜けまで{break_down_pct:.1f}%"))
+
+    if box["wild"] and wild_penalty:
+        score += wild_penalty
+        reasons.append((wild_penalty, "荒れ箱"))
+
+    closes = [float(row[4]) for row in rows if len(row) >= 5 and row[4] is not None]
+    ma7_series = _build_ma_series(closes, 7)
+    ma20_series = _build_ma_series(closes, 20)
+    ma60_series = _build_ma_series(closes, 60)
+    ma7 = ma7_series[-1] if ma7_series else None
+    ma20 = ma20_series[-1] if ma20_series else None
+    ma60 = ma60_series[-1] if ma60_series else None
+
+    reasons.sort(key=lambda item: item[0], reverse=True)
+
+    levels = {
+        "close": close,
+        "ma7": ma7,
+        "ma20": ma20,
+        "ma60": ma60,
+        "atr14": None
+    }
+
+    chart_hint = {
+        "lines": {
+            "box_upper": upper,
+            "box_lower": lower,
+            "ma20": ma20
+        }
+    }
+
+    return {
+        "code": code,
+        "name": name or code,
+        "as_of": _format_month_label(box["end"]),
+        "total_score": round(score, 3),
+        "reasons": [label for _, label in reasons[:max_reasons]],
+        "levels": levels,
+        "distance_to_trigger": {
+            "break_up_pct": break_up_pct,
+            "break_down_pct": break_down_pct
+        },
+        "box_info": {
+            "box_start": _format_month_label(box["start"]),
+            "box_end": _format_month_label(box["end"]),
+            "box_upper_body": upper,
+            "box_lower_body": lower,
+            "box_months": months,
+            "wild_box_flag": box["wild"],
+            "range_pct": box["range_pct"]
+        },
+        "box_start": _format_month_label(box["start"]),
+        "box_end": _format_month_label(box["end"]),
+        "box_upper_body": upper,
+        "box_lower_body": lower,
+        "box_months": months,
+        "wild_box_flag": box["wild"],
+        "chart_hint": chart_hint
+    }, None
+
+
+def _rank_cache_key(as_of: str | None, limit: int, universe_meta: dict) -> str:
+    uni_key = universe_meta.get("path") or universe_meta.get("requested") or "all"
+    mtime = universe_meta.get("mtime")
+    return f"{as_of or 'latest'}|{limit}|{uni_key}|{mtime or 'none'}"
+
+
+def _ensure_rank_cache_state() -> tuple[float | None, float | None]:
+    db_mtime = os.path.getmtime(DEFAULT_DB_PATH) if os.path.isfile(DEFAULT_DB_PATH) else None
+    config_mtime = _rank_config_cache.get("mtime")
+    if _rank_cache.get("mtime") != db_mtime or _rank_cache.get("config_mtime") != config_mtime:
+        _rank_cache["weekly"] = {}
+        _rank_cache["monthly"] = {}
+        _rank_cache["mtime"] = db_mtime
+        _rank_cache["config_mtime"] = config_mtime
+    return db_mtime, config_mtime
+
+
+def _build_weekly_ranking(as_of: str | None, limit: int, universe: str | None) -> dict:
+    start = time.perf_counter()
+    config = _load_rank_config()
+    _ensure_rank_cache_state()
+    as_of_int = _as_of_int(as_of)
+    common = _get_config_value(config, ["common"], {})
+    max_bars = int(common.get("max_daily_bars", 260))
+
+    with get_conn() as conn:
+        codes, universe_meta = _resolve_universe_codes(conn, universe)
+        if not codes:
+            return {"up": [], "down": [], "meta": {"as_of": as_of, "count": 0, "errors": []}}
+        cache_key = _rank_cache_key(as_of, limit, universe_meta)
+        cached = _rank_cache["weekly"].get(cache_key)
+        if cached:
+            return cached
+        meta_rows = conn.execute(
+            f"SELECT code, name FROM stock_meta WHERE code IN ({','.join(['?'] * len(codes))})",
+            codes
+        ).fetchall()
+        name_map = {row[0]: row[1] for row in meta_rows}
+        daily_map = _fetch_daily_rows(conn, codes, as_of_int, max_bars)
+
+    up_items: list[dict] = []
+    down_items: list[dict] = []
+    skipped: list[dict] = []
+
+    for code in codes:
+        rows = daily_map.get(code, [])
+        up_item, down_item, skip_reason = _score_weekly_candidate(code, name_map.get(code, code), rows, config, as_of_int)
+        if skip_reason:
+            skipped.append({"code": code, "reason": skip_reason})
+            continue
+        if up_item:
+            up_items.append(up_item)
+        if down_item:
+            down_items.append(down_item)
+
+    up_items.sort(key=lambda item: item.get("total_score", 0), reverse=True)
+    down_items.sort(key=lambda item: item.get("total_score", 0), reverse=True)
+
+    elapsed = (time.perf_counter() - start) * 1000
+    print(f"[rank_weekly] codes={len(codes)} skipped={len(skipped)} ms={elapsed:.1f}")
+
+    result = {
+        "up": up_items[:limit],
+        "down": down_items[:limit],
+        "meta": {
+            "as_of": as_of,
+            "count": len(codes),
+            "skipped": skipped,
+            "elapsed_ms": round(elapsed, 2),
+            "universe": universe_meta,
+            "errors": []
+        }
+    }
+    _rank_cache["weekly"][cache_key] = result
+    return result
+
+
+def _build_monthly_ranking(as_of: str | None, limit: int, universe: str | None) -> dict:
+    start = time.perf_counter()
+    config = _load_rank_config()
+    _ensure_rank_cache_state()
+    as_of_month = _as_of_month_int(as_of)
+    common = _get_config_value(config, ["common"], {})
+    max_bars = int(common.get("max_monthly_bars", 120))
+
+    with get_conn() as conn:
+        codes, universe_meta = _resolve_universe_codes(conn, universe)
+        if not codes:
+            return {"box": [], "meta": {"as_of": as_of, "count": 0, "errors": []}}
+        cache_key = _rank_cache_key(as_of, limit, universe_meta)
+        cached = _rank_cache["monthly"].get(cache_key)
+        if cached:
+            return cached
+        meta_rows = conn.execute(
+            f"SELECT code, name FROM stock_meta WHERE code IN ({','.join(['?'] * len(codes))})",
+            codes
+        ).fetchall()
+        name_map = {row[0]: row[1] for row in meta_rows}
+        monthly_map = _fetch_monthly_rows(conn, codes, as_of_month, max_bars)
+
+    items: list[dict] = []
+    skipped: list[dict] = []
+
+    for code in codes:
+        rows = monthly_map.get(code, [])
+        item, skip_reason = _score_monthly_candidate(code, name_map.get(code, code), rows, config, as_of_month)
+        if skip_reason:
+            skipped.append({"code": code, "reason": skip_reason})
+            continue
+        if item:
+            items.append(item)
+
+    items.sort(key=lambda item: item.get("total_score", 0), reverse=True)
+    elapsed = (time.perf_counter() - start) * 1000
+    print(f"[rank_monthly] codes={len(codes)} skipped={len(skipped)} ms={elapsed:.1f}")
+
+    result = {
+        "box": items[:limit],
+        "meta": {
+            "as_of": as_of,
+            "count": len(codes),
+            "skipped": skipped,
+            "elapsed_ms": round(elapsed, 2),
+            "universe": universe_meta,
+            "errors": []
+        }
+    }
+    _rank_cache["monthly"][cache_key] = result
+    return result
+
+
 def _compute_screener_metrics(
     daily_rows: list[tuple],
     monthly_rows: list[tuple]
@@ -989,8 +1881,22 @@ def health():
     status = get_txt_status()
     with get_conn() as conn:
         code_count = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars").fetchone()[0]
+        daily_rows = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+        monthly_rows = conn.execute("SELECT COUNT(*) FROM monthly_bars").fetchone()[0]
+    ready = True
+    phase = "ready"
+    message = "準備完了"
     return {
         "ok": True,
+        "status": "ok",
+        "ready": ready,
+        "phase": phase,
+        "message": message,
+        "stats": {
+            "tickers": code_count,
+            "daily_rows": daily_rows,
+            "monthly_rows": monthly_rows
+        },
         "txt_count": status["txt_count"],
         "code_count": code_count,
         "last_updated": status["last_updated"],
@@ -1077,6 +1983,133 @@ def list_tickers():
             """
         ).fetchall()
     return JSONResponse(content=rows)
+
+
+@app.get("/rank/weekly")
+def rank_weekly(as_of: str | None = None, limit: int = 50, universe: str | None = None):
+    try:
+        limit_value = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit_value = 50
+    try:
+        result = _build_weekly_ranking(as_of, limit_value, universe)
+        return JSONResponse(content=result)
+    except Exception as exc:
+        return JSONResponse(
+            content={
+                "up": [],
+                "down": [],
+                "meta": {
+                    "as_of": as_of,
+                    "count": 0,
+                    "errors": [f"rank_weekly_failed:{exc}"]
+                }
+            }
+        )
+
+
+@app.get("/rank/monthly")
+def rank_monthly(as_of: str | None = None, limit: int = 50, universe: str | None = None):
+    try:
+        limit_value = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit_value = 50
+    try:
+        result = _build_monthly_ranking(as_of, limit_value, universe)
+        return JSONResponse(content=result)
+    except Exception as exc:
+        return JSONResponse(
+            content={
+                "box": [],
+                "meta": {
+                    "as_of": as_of,
+                    "count": 0,
+                    "errors": [f"rank_monthly_failed:{exc}"]
+                }
+            }
+        )
+
+
+@app.get("/rank")
+@app.get("/api/rank")
+def rank_dir(dir: str = "up", as_of: str | None = None, limit: int = 50, universe: str | None = None):
+    try:
+        limit_value = max(1, min(200, int(limit)))
+    except (TypeError, ValueError):
+        limit_value = 50
+    direction = (dir or "up").lower()
+    if direction not in ("up", "down"):
+        direction = "up"
+    try:
+        result = _build_weekly_ranking(as_of, limit_value, universe)
+        favorites = set(_load_favorite_codes())
+        items = []
+        for item in result.get(direction, []):
+            code = item.get("code")
+            items.append(
+                {
+                    **item,
+                    "is_favorite": bool(code and code in favorites)
+                }
+            )
+        return JSONResponse(
+            content={
+                "items": items,
+                "meta": {
+                    "as_of": result.get("meta", {}).get("as_of"),
+                    "count": len(items),
+                    "dir": direction,
+                    "universe": result.get("meta", {}).get("universe")
+                },
+                "errors": []
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            content={
+                "items": [],
+                "meta": {"as_of": as_of, "count": 0, "dir": direction, "universe": universe},
+                "errors": [f"rank_failed:{exc}"]
+            }
+        )
+
+
+@app.get("/favorites")
+@app.get("/api/favorites")
+def favorites_list():
+    try:
+        items = _load_favorite_items()
+        return JSONResponse(content={"items": items, "errors": []})
+    except Exception as exc:
+        return JSONResponse(content={"items": [], "errors": [f"favorites_failed:{exc}"]})
+
+
+@app.post("/favorites/{code}")
+@app.post("/api/favorites/{code}")
+def favorites_add(code: str):
+    normalized = _normalize_code(code)
+    if not normalized:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_code"})
+    try:
+        with _get_favorites_conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO favorites (code) VALUES (?)", (normalized,))
+        return JSONResponse(content={"ok": True, "code": normalized})
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"ok": False, "error": f"favorite_add_failed:{exc}"})
+
+
+@app.delete("/favorites/{code}")
+@app.delete("/api/favorites/{code}")
+def favorites_remove(code: str):
+    normalized = _normalize_code(code)
+    if not normalized:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_code"})
+    try:
+        with _get_favorites_conn() as conn:
+            conn.execute("DELETE FROM favorites WHERE code = ?", (normalized,))
+        return JSONResponse(content={"ok": True, "code": normalized})
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"ok": False, "error": f"favorite_remove_failed:{exc}"})
 
 
 @app.get("/api/screener")

@@ -2,9 +2,11 @@
 import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { useBackendReadyState } from "../backendReady";
 import type { MaSetting, SortDir, SortKey } from "../store";
 import { useStore } from "../store";
 import StockTile from "../components/StockTile";
+import TopNav from "../components/TopNav";
 import { computeSignalMetrics } from "../utils/signals";
 
 const TILE_HEIGHT = 220;
@@ -43,8 +45,10 @@ type HealthStatus = {
 export default function GridView() {
   const navigate = useNavigate();
   const { ref, size } = useResizeObserver();
+  const { ready: backendReady } = useBackendReadyState();
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
+  const loadingList = useStore((state) => state.loadingList);
   const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const barsCache = useStore((state) => state.barsCache);
   const columns = useStore((state) => state.settings.columns);
@@ -76,14 +80,16 @@ export default function GridView() {
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
 
   useEffect(() => {
+    if (!backendReady) return;
     loadList();
-  }, [loadList]);
+  }, [backendReady, loadList]);
 
   useEffect(() => {
+    if (!backendReady) return;
     api.get("/health").then((res) => {
       setHealth(res.data as HealthStatus);
     });
-  }, []);
+  }, [backendReady]);
 
   useEffect(() => {
     if (!sortOpen && !displayOpen) return;
@@ -288,6 +294,7 @@ export default function GridView() {
   const innerHeight = Math.max(0, gridHeight);
   const rowCount = Math.ceil(sortedTickers.length / columns);
   const columnWidth = gridWidth > 0 ? gridWidth / columns : 300;
+  const showSkeleton = backendReady && loadingList && tickers.length === 0;
 
   const onItemsRendered = ({
     visibleRowStartIndex,
@@ -295,6 +302,7 @@ export default function GridView() {
     visibleColumnStartIndex,
     visibleColumnStopIndex
   }: GridOnItemsRenderedProps) => {
+    if (!backendReady) return;
     const rowsPerViewport = Math.max(1, Math.floor(gridHeight / (TILE_HEIGHT + GRID_GAP)));
     const prefetchStop = visibleRowStopIndex + rowsPerViewport;
     const start = visibleRowStartIndex * columns + visibleColumnStartIndex;
@@ -312,11 +320,13 @@ export default function GridView() {
   };
 
   useEffect(() => {
+    if (!backendReady) return;
     if (!lastVisibleCodesRef.current.length) return;
     ensureBarsForVisible(gridTimeframe, lastVisibleCodesRef.current);
-  }, [gridTimeframe, maSettings, ensureBarsForVisible]);
+  }, [backendReady, gridTimeframe, maSettings, ensureBarsForVisible]);
 
   useEffect(() => {
+    if (!backendReady) return;
     const range = lastVisibleRangeRef.current;
     if (!range) return;
     const codes: string[] = [];
@@ -326,7 +336,7 @@ export default function GridView() {
     }
     if (!codes.length) return;
     ensureBarsForVisible(gridTimeframe, codes);
-  }, [sortedTickers, gridTimeframe, ensureBarsForVisible]);
+  }, [backendReady, sortedTickers, gridTimeframe, ensureBarsForVisible]);
 
   const itemKey = useCallback(
     ({ columnIndex, rowIndex, data }: { columnIndex: number; rowIndex: number; data: typeof sortedTickers }) => {
@@ -363,6 +373,7 @@ export default function GridView() {
         <div className="top-bar-heading">
           <div className="title">Moomoo-like Screener</div>
           <div className="subtitle">Fast grid with canvas sparklines</div>
+          <TopNav />
         </div>
         <div className="top-bar-controls">
           <div className="top-bar-left">
@@ -527,7 +538,18 @@ export default function GridView() {
         </div>
       )}
       <div className="grid-shell" ref={ref}>
-        {size.width > 0 && (
+        {showSkeleton && (
+          <div className="grid-skeleton">
+            {Array.from({ length: 8 }).map((_, index) => (
+              <div className="tile skeleton-card" key={`skeleton-${index}`}>
+                <div className="skeleton-line wide" />
+                <div className="skeleton-line" />
+                <div className="skeleton-block" />
+              </div>
+            ))}
+          </div>
+        )}
+        {!showSkeleton && size.width > 0 && (
           <div className="grid-inner">
             <Grid
               key={gridTimeframe}

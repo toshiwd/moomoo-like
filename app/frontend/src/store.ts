@@ -111,6 +111,9 @@ type Settings = {
 
 type StoreState = {
   tickers: Ticker[];
+  favorites: string[];
+  favoritesLoaded: boolean;
+  favoritesLoading: boolean;
   barsCache: BarsCache;
   boxesCache: BoxesCache;
   barsLoading: LoadingMap;
@@ -119,6 +122,9 @@ type StoreState = {
   maSettings: MaSettings;
   settings: Settings;
   loadList: () => Promise<void>;
+  loadFavorites: () => Promise<void>;
+  replaceFavorites: (codes: string[]) => void;
+  setFavoriteLocal: (code: string, isFavorite: boolean) => void;
   loadBarsBatch: (
     timeframe: Settings["gridTimeframe"],
     codes: string[],
@@ -158,7 +164,7 @@ export type SortKey =
 export type SortDir = "asc" | "desc";
 
 const MA_COLORS = ["#ef4444", "#22c55e", "#3b82f6", "#a855f7", "#f59e0b"];
-const THUMB_BARS = 30;
+const THUMB_BARS = 60;
 const MIN_BATCH_LIMIT = 60;
 const MAX_BATCH_LIMIT = 2000;
 const WEEKLY_DAILY_FACTOR = 7;
@@ -359,6 +365,9 @@ const getInitialSortDir = (): SortDir => {
 
 export const useStore = create<StoreState>((set, get) => ({
   tickers: [],
+  favorites: [],
+  favoritesLoaded: false,
+  favoritesLoading: false,
   barsCache: { monthly: {}, weekly: {}, daily: {} },
   boxesCache: { monthly: {}, weekly: {}, daily: {} },
   barsLoading: { monthly: {}, weekly: {}, daily: {} },
@@ -378,6 +387,41 @@ export const useStore = create<StoreState>((set, get) => ({
     sortKey: getInitialSortKey(),
     sortDir: getInitialSortDir()
   },
+  loadFavorites: async () => {
+    if (get().favoritesLoading) return;
+    set({ favoritesLoading: true });
+    try {
+      const res = await api.get("/favorites");
+      const payload = res.data as { items?: { code?: string }[] } | { code?: string }[];
+      const items = Array.isArray(payload) ? payload : payload.items ?? [];
+      const codes = items
+        .map((item) => (typeof item.code === "string" ? item.code : ""))
+        .filter((code) => code);
+      set({ favorites: codes, favoritesLoaded: true });
+    } catch {
+      set({ favorites: [], favoritesLoaded: true });
+    } finally {
+      set({ favoritesLoading: false });
+    }
+  },
+  replaceFavorites: (codes) =>
+    set({ favorites: [...new Set(codes.filter((code) => code))], favoritesLoaded: true }),
+  setFavoriteLocal: (code, isFavorite) =>
+    set((state) => {
+      const normalized = code?.trim();
+      if (!normalized) return state;
+      const exists = state.favorites.includes(normalized);
+      if (isFavorite && !exists) {
+        return { favorites: [...state.favorites, normalized], favoritesLoaded: true };
+      }
+      if (!isFavorite && exists) {
+        return {
+          favorites: state.favorites.filter((item) => item !== normalized),
+          favoritesLoaded: true
+        };
+      }
+      return state;
+    }),
   loadList: async () => {
     if (get().loadingList) return;
     set({ loadingList: true });

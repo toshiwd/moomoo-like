@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { BarsPayload, Box, MaSetting } from "../store";
 import { getBodyRangeFromBars, getBoxFill, getBoxStroke } from "../utils/boxes";
 import { setThumbnailCache } from "./thumbnailCache";
@@ -9,9 +10,60 @@ const COLORS = {
 };
 
 const MIN_HEIGHT = 80;
-const MAX_BARS = 30;
+const DEFAULT_MAX_BARS = 60;
 const BOX_FILL = getBoxFill();
 const BOX_STROKE = getBoxStroke();
+
+const formatDate = (value: number) => {
+  if (!Number.isFinite(value)) return "--";
+  const raw = Number(value);
+  if (raw >= 10000000 && raw < 100000000) {
+    const year = Math.floor(raw / 10000);
+    const month = Math.floor((raw % 10000) / 100);
+    const day = raw % 100;
+    const mm = String(month).padStart(2, "0");
+    const dd = String(day).padStart(2, "0");
+    return `${year}-${mm}-${dd}`;
+  }
+  if (raw > 1000000000000) {
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return "--";
+    return date.toISOString().slice(0, 10);
+  }
+  if (raw > 1000000000) {
+    const date = new Date(raw * 1000);
+    if (Number.isNaN(date.getTime())) return "--";
+    return date.toISOString().slice(0, 10);
+  }
+  return "--";
+};
+
+const formatDateShort = (value: number) => {
+  if (!Number.isFinite(value)) return "--";
+  const raw = Number(value);
+  if (raw >= 10000000 && raw < 100000000) {
+    const month = Math.floor((raw % 10000) / 100);
+    const day = raw % 100;
+    const mm = String(month).padStart(2, "0");
+    const dd = String(day).padStart(2, "0");
+    return `${mm}/${dd}`;
+  }
+  let date: Date | null = null;
+  if (raw > 1000000000000) {
+    date = new Date(raw);
+  } else if (raw > 1000000000) {
+    date = new Date(raw * 1000);
+  }
+  if (!date || Number.isNaN(date.getTime())) return "--";
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(date.getUTCDate()).padStart(2, "0");
+  return `${mm}/${dd}`;
+};
+
+const formatPrice = (value: number) => {
+  if (!Number.isFinite(value)) return "--";
+  return Math.round(value).toLocaleString("ja-JP");
+};
 
 function buildMaMap(bars: number[][], period: number) {
   const map = new Map<number, number>();
@@ -42,13 +94,15 @@ function drawChart(
   showBoxes: boolean,
   maSettings: MaSetting[],
   width: number,
-  height: number
+  height: number,
+  maxBars: number,
+  showAxes: boolean
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
   const allBars = payload.bars;
-  const bars = allBars.slice(-MAX_BARS);
+  const bars = allBars.slice(-maxBars);
   if (!bars.length) {
     ctx.clearRect(0, 0, width, height);
     return;
@@ -194,6 +248,32 @@ function drawChart(
   maMaps.forEach(({ map, setting }) => {
     drawMa(map, setting);
   });
+
+  if (showAxes) {
+    ctx.save();
+    ctx.font = "11px 'Noto Sans JP', 'IBM Plex Sans', sans-serif";
+    ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const priceTicks = [max, (max + min) / 2, min];
+    priceTicks.forEach((value) => {
+      const y = toY(value);
+      ctx.fillText(formatPrice(value), width - 4, y);
+    });
+
+    const leftTime = bars[0]?.[0];
+    const midTime = bars[Math.floor(bars.length / 2)]?.[0];
+    const rightTime = bars[bars.length - 1]?.[0];
+    const labelY = height - 4;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    if (leftTime) ctx.fillText(formatDateShort(leftTime), 4, labelY);
+    ctx.textAlign = "center";
+    if (midTime) ctx.fillText(formatDateShort(midTime), width / 2, labelY);
+    ctx.textAlign = "right";
+    if (rightTime) ctx.fillText(formatDateShort(rightTime), width - 4, labelY);
+    ctx.restore();
+  }
 }
 
 export default function ThumbnailCanvas({
@@ -201,29 +281,43 @@ export default function ThumbnailCanvas({
   boxes,
   showBoxes,
   maSettings,
-  cacheKey
+  cacheKey,
+  maxBars,
+  showAxes = false
 }: {
   payload: BarsPayload;
   boxes: Box[];
   showBoxes: boolean;
   maSettings: MaSetting[];
   cacheKey?: string;
+  maxBars?: number;
+  showAxes?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastKeyRef = useRef<string>("");
   const rafRef = useRef<number | null>(null);
   const lastSnapshotRef = useRef<string>("");
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const hoverIndexRef = useRef<number | null>(null);
+  const hoverRafRef = useRef<number | null>(null);
+  const hoverPendingRef = useRef<number | null>(null);
+  const maxBarsValue = Math.max(1, Math.floor(maxBars ?? DEFAULT_MAX_BARS));
+  const displayBars = useMemo(() => {
+    const allBars = payload.bars ?? [];
+    if (allBars.length <= maxBarsValue) return allBars;
+    return allBars.slice(-maxBarsValue);
+  }, [payload, maxBarsValue]);
 
   const renderKey = useMemo(() => {
-    const bars = payload.bars;
+    const bars = displayBars;
     const last = bars[bars.length - 1];
     const firstBox = boxes[0];
     const settingsKey = maSettings
       .map((setting) => `${setting.period}-${setting.visible}-${setting.color}-${setting.lineWidth}`)
       .join("|");
-    return `${bars.length}-${bars[0]?.[0]}-${last?.[0]}-${last?.[4]}-${boxes.length}-${firstBox?.startTime ?? "none"}-${showBoxes}-${settingsKey}`;
-  }, [payload, boxes, showBoxes, maSettings]);
+    return `${bars.length}-${bars[0]?.[0]}-${last?.[0]}-${last?.[4]}-${boxes.length}-${firstBox?.startTime ?? "none"}-${showBoxes}-${settingsKey}-${maxBarsValue}-${showAxes}`;
+  }, [displayBars, boxes, showBoxes, maSettings, maxBarsValue, showAxes]);
 
   const draw = useCallback(() => {
     if (!containerRef.current || !canvasRef.current) return false;
@@ -240,7 +334,7 @@ export default function ThumbnailCanvas({
     if (ctx) {
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     }
-    drawChart(canvas, payload, boxes, showBoxes, maSettings, width, height);
+    drawChart(canvas, payload, boxes, showBoxes, maSettings, width, height, maxBarsValue, showAxes);
     if (cacheKey) {
       const snapshotKey = `${cacheKey}:${renderKey}:${width}x${height}`;
       if (lastSnapshotRef.current !== snapshotKey) {
@@ -253,7 +347,7 @@ export default function ThumbnailCanvas({
       }
     }
     return true;
-  }, [payload, boxes, showBoxes, maSettings, renderKey, cacheKey]);
+  }, [payload, boxes, showBoxes, maSettings, renderKey, cacheKey, maxBarsValue, showAxes]);
 
   const scheduleDraw = useCallback(() => {
     if (rafRef.current !== null) {
@@ -282,6 +376,10 @@ export default function ThumbnailCanvas({
         window.cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
+      if (hoverRafRef.current !== null) {
+        window.cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = null;
+      }
     };
   }, [scheduleDraw]);
 
@@ -291,9 +389,61 @@ export default function ThumbnailCanvas({
     scheduleDraw();
   }, [renderKey, scheduleDraw]);
 
+  const scheduleHoverIndex = (index: number | null) => {
+    hoverPendingRef.current = index;
+    if (hoverRafRef.current !== null) return;
+    hoverRafRef.current = window.requestAnimationFrame(() => {
+      hoverRafRef.current = null;
+      const next = hoverPendingRef.current;
+      if (hoverIndexRef.current === next) return;
+      hoverIndexRef.current = next;
+      setHoverIndex(next);
+    });
+  };
+
+  const handleMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!displayBars.length || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    if (rect.width <= 0) return;
+    const ratio = Math.min(0.999, Math.max(0, x / rect.width));
+    const nextIndex = Math.min(displayBars.length - 1, Math.floor(ratio * displayBars.length));
+    scheduleHoverIndex(nextIndex);
+  };
+
+  const handleMouseLeave = () => {
+    scheduleHoverIndex(null);
+  };
+
+  const safeHoverIndex =
+    hoverIndex !== null && displayBars.length
+      ? Math.min(hoverIndex, displayBars.length - 1)
+      : null;
+  const activeIndex =
+    safeHoverIndex !== null ? safeHoverIndex : displayBars.length ? displayBars.length - 1 : null;
+  const activeBar = activeIndex !== null ? displayBars[activeIndex] : null;
+  const crosshairLeft =
+    safeHoverIndex !== null && displayBars.length
+      ? `${((safeHoverIndex + 0.5) / displayBars.length) * 100}%`
+      : null;
+
   return (
-    <div ref={containerRef} className="thumb-canvas">
+    <div
+      ref={containerRef}
+      className="thumb-canvas"
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+    >
       <canvas ref={canvasRef} />
+      {activeBar && (
+        <div className="thumb-overlay">
+          <div className="thumb-overlay-label">日付</div>
+          <div className="thumb-overlay-value">{formatDate(activeBar[0])}</div>
+          <div className="thumb-overlay-label">終値</div>
+          <div className="thumb-overlay-value">{formatPrice(activeBar[4])}</div>
+        </div>
+      )}
+      {crosshairLeft && <div className="thumb-crosshair" style={{ left: crosshairLeft }} />}
     </div>
   );
 }

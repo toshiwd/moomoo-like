@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, TouchEvent as ReactTouchEvent } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
+import { useBackendReadyState } from "../backendReady";
 import DetailChart, { DetailChartHandle } from "../components/DetailChart";
+import Toast from "../components/Toast";
 import { Box, MaSetting, useStore } from "../store";
 import { computeSignalMetrics } from "../utils/signals";
 import type { TradeEvent } from "../utils/positions";
@@ -256,15 +258,23 @@ const countInRange = (candles: Candle[], months: number | null) => {
 export default function DetailView() {
   const { code } = useParams();
   const navigate = useNavigate();
+  const { ready: backendReady } = useBackendReadyState();
   const dailyChartRef = useRef<DetailChartHandle | null>(null);
   const weeklyChartRef = useRef<DetailChartHandle | null>(null);
   const monthlyChartRef = useRef<DetailChartHandle | null>(null);
   const bottomRowRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
+  const hoverTimeRef = useRef<number | null>(null);
+  const hoverTimePendingRef = useRef<number | null>(null);
+  const hoverRafRef = useRef<number | null>(null);
 
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
   const loadingList = useStore((state) => state.loadingList);
+  const favorites = useStore((state) => state.favorites);
+  const favoritesLoaded = useStore((state) => state.favoritesLoaded);
+  const loadFavorites = useStore((state) => state.loadFavorites);
+  const setFavoriteLocal = useStore((state) => state.setFavoriteLocal);
   const showBoxes = useStore((state) => state.settings.showBoxes);
   const setShowBoxes = useStore((state) => state.setShowBoxes);
   const maSettings = useStore((state) => state.maSettings);
@@ -302,6 +312,7 @@ export default function DetailView() {
   const [showPnLPanel, setShowPnLPanel] = useState(true);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [focusPanel, setFocusPanel] = useState<FocusPanel>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const tickerName = useMemo(() => {
     if (!code) return "";
@@ -317,13 +328,25 @@ export default function DetailView() {
     return parts.filter(Boolean).join(" / ");
   }, [tickerName]);
 
+  const favoritesSet = useMemo(() => new Set(favorites), [favorites]);
+  const isFavorite = useMemo(() => (code ? favoritesSet.has(code) : false), [favoritesSet, code]);
+
   useEffect(() => {
+    if (!backendReady) return;
     if (!tickers.length && !loadingList) {
       loadList();
     }
-  }, [tickers.length, loadingList, loadList]);
+  }, [backendReady, tickers.length, loadingList, loadList]);
 
   useEffect(() => {
+    if (!backendReady) return;
+    if (!favoritesLoaded) {
+      loadFavorites();
+    }
+  }, [backendReady, favoritesLoaded, loadFavorites]);
+
+  useEffect(() => {
+    if (!backendReady) return;
     if (!code) return;
     setLoadingDaily(true);
     setDailyErrors([]);
@@ -347,9 +370,10 @@ export default function DetailView() {
         }));
       })
       .finally(() => setLoadingDaily(false));
-  }, [code, dailyLimit]);
+  }, [backendReady, code, dailyLimit]);
 
   useEffect(() => {
+    if (!backendReady) return;
     if (!code) return;
     setLoadingMonthly(true);
     setMonthlyErrors([]);
@@ -373,9 +397,10 @@ export default function DetailView() {
         }));
       })
       .finally(() => setLoadingMonthly(false));
-  }, [code, monthlyLimit]);
+  }, [backendReady, code, monthlyLimit]);
 
   useEffect(() => {
+    if (!backendReady) return;
     if (!code) return;
     api
       .get("/ticker/boxes", { params: { code } })
@@ -386,9 +411,10 @@ export default function DetailView() {
       .catch(() => {
         setBoxes([]);
       });
-  }, [code]);
+  }, [backendReady, code]);
 
   useEffect(() => {
+    if (!backendReady) return;
     if (!code) return;
     setTradeErrors([]);
     setTradeWarnings({ items: [] });
@@ -414,7 +440,7 @@ export default function DetailView() {
         setTrades([]);
         setTradeWarnings({ items: [] });
       });
-  }, [code]);
+  }, [backendReady, code]);
 
   const dailyParse = useMemo(() => buildCandlesWithStats(dailyData), [dailyData]);
   const monthlyParse = useMemo(() => buildCandlesWithStats(monthlyData), [monthlyData]);
@@ -608,11 +634,38 @@ export default function DetailView() {
   }, []);
 
   useEffect(() => {
+    if (hoverRafRef.current !== null) {
+      window.cancelAnimationFrame(hoverRafRef.current);
+      hoverRafRef.current = null;
+    }
+    hoverTimePendingRef.current = null;
+    hoverTimeRef.current = null;
     setHoverTime(null);
     dailyChartRef.current?.clearCrosshair();
     weeklyChartRef.current?.clearCrosshair();
     monthlyChartRef.current?.clearCrosshair();
   }, [focusPanel]);
+
+  useEffect(() => {
+    return () => {
+      if (hoverRafRef.current !== null) {
+        window.cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = null;
+      }
+    };
+  }, []);
+
+  const scheduleHoverTime = (time: number | null) => {
+    hoverTimePendingRef.current = time;
+    if (hoverRafRef.current !== null) return;
+    hoverRafRef.current = window.requestAnimationFrame(() => {
+      hoverRafRef.current = null;
+      const next = hoverTimePendingRef.current ?? null;
+      if (hoverTimeRef.current === next) return;
+      hoverTimeRef.current = next;
+      setHoverTime(next);
+    });
+  };
 
   const showVolumeDaily = dailyVolume.length > 0;
 
@@ -671,11 +724,27 @@ export default function DetailView() {
     setFocusPanel((prev) => (prev === panel ? null : panel));
   };
 
+  const handleToggleFavorite = async () => {
+    if (!code) return;
+    const next = !isFavorite;
+    setFavoriteLocal(code, next);
+    try {
+      if (next) {
+        await api.post(`/favorites/${encodeURIComponent(code)}`);
+      } else {
+        await api.delete(`/favorites/${encodeURIComponent(code)}`);
+      }
+    } catch {
+      setFavoriteLocal(code, !next);
+      setToastMessage("お気に入りの更新に失敗しました。");
+    }
+  };
+
   const handleDailyCrosshair = (time: number | null) => {
     weeklyChartRef.current?.setCrosshair(time);
     monthlyChartRef.current?.setCrosshair(time);
     if (focusPanel === null || focusPanel === "daily") {
-      setHoverTime(time);
+      scheduleHoverTime(time);
     }
   };
 
@@ -683,7 +752,7 @@ export default function DetailView() {
     dailyChartRef.current?.setCrosshair(time);
     monthlyChartRef.current?.setCrosshair(time);
     if (focusPanel === "weekly") {
-      setHoverTime(time);
+      scheduleHoverTime(time);
     }
   };
 
@@ -691,7 +760,7 @@ export default function DetailView() {
     dailyChartRef.current?.setCrosshair(time);
     weeklyChartRef.current?.setCrosshair(time);
     if (focusPanel === "monthly") {
-      setHoverTime(time);
+      scheduleHoverTime(time);
     }
   };
 
@@ -709,21 +778,32 @@ export default function DetailView() {
         <button className="back" onClick={() => navigate(-1)}>
           Back
         </button>
-        <div>
-          <div className="title">{code}</div>
-          <div className="subtitle">{subtitle}</div>
-          {dailySignals.length > 0 && (
-            <div className="detail-signals">
-              {dailySignals.map((signal) => (
-                <span
-                  key={signal.label}
-                  className={`signal-chip ${signal.kind === "warning" ? "warning" : "achieved"}`}
-                >
-                  {signal.label}
-                </span>
-              ))}
-            </div>
-          )}
+        <div className="detail-title">
+          <div>
+            <div className="title">{code}</div>
+            <div className="subtitle">{subtitle}</div>
+            {dailySignals.length > 0 && (
+              <div className="detail-signals">
+                {dailySignals.map((signal) => (
+                  <span
+                    key={signal.label}
+                    className={`signal-chip ${signal.kind === "warning" ? "warning" : "achieved"}`}
+                  >
+                    {signal.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className={isFavorite ? "favorite-toggle active" : "favorite-toggle"}
+            aria-pressed={isFavorite}
+            aria-label="お気に入り"
+            onClick={handleToggleFavorite}
+          >
+            {isFavorite ? "❤️" : "♡"}
+          </button>
         </div>
         <div className="detail-controls">
           <div className="segmented detail-range">
@@ -1065,6 +1145,7 @@ export default function DetailView() {
           </div>
         </div>
       )}
+      <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
     </div>
   );
 }

@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
@@ -10,6 +10,8 @@ import { computeSignalMetrics } from "../utils/signals";
 const TILE_HEIGHT = 220;
 const GRID_GAP = 12;
 type Timeframe = "monthly" | "weekly" | "daily";
+type SortOption = { key: SortKey; label: string };
+type SortSection = { title: string; options: SortOption[] };
 
 function useResizeObserver() {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -65,7 +67,13 @@ export default function GridView() {
 
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [showIndicators, setShowIndicators] = useState(false);
+  const [sortOpen, setSortOpen] = useState(false);
+  const [displayOpen, setDisplayOpen] = useState(false);
+  const [isSorting, setIsSorting] = useState(false);
+  const sortRef = useRef<HTMLDivElement | null>(null);
+  const displayRef = useRef<HTMLDivElement | null>(null);
   const lastVisibleCodesRef = useRef<string[]>([]);
+  const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
 
   useEffect(() => {
     loadList();
@@ -76,6 +84,106 @@ export default function GridView() {
       setHealth(res.data as HealthStatus);
     });
   }, []);
+
+  useEffect(() => {
+    if (!sortOpen && !displayOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (sortRef.current && sortRef.current.contains(target)) return;
+      if (displayRef.current && displayRef.current.contains(target)) return;
+      setSortOpen(false);
+      setDisplayOpen(false);
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [sortOpen, displayOpen]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable) {
+          return;
+        }
+      }
+      if (event.key === "Escape") {
+        setSortOpen(false);
+        setDisplayOpen(false);
+      } else if (event.key === "1") {
+        setGridTimeframe("monthly");
+      } else if (event.key === "2") {
+        setGridTimeframe("weekly");
+      } else if (event.key === "3") {
+        setGridTimeframe("daily");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [setGridTimeframe]);
+
+  useEffect(() => {
+    setIsSorting(true);
+    const timer = window.setTimeout(() => setIsSorting(false), 120);
+    return () => window.clearTimeout(timer);
+  }, [sortKey, sortDir]);
+
+  const sortSections = useMemo<SortSection[]>(
+    () => [
+      {
+        title: "基本",
+        options: [
+          { key: "code", label: "コード" },
+          { key: "name", label: "銘柄名" }
+        ]
+      },
+      {
+        title: "騰落率（直近）",
+        options: [
+          { key: "chg1D", label: "騰落率（1日）" },
+          { key: "chg1W", label: "騰落率（1週）" },
+          { key: "chg1M", label: "騰落率（1ヶ月）" },
+          { key: "chg1Q", label: "騰落率（3ヶ月）" },
+          { key: "chg1Y", label: "騰落率（1年）" }
+        ]
+      },
+      {
+        title: "騰落率（確定期間）",
+        options: [
+          { key: "prevWeekChg", label: "前週騰落率" },
+          { key: "prevMonthChg", label: "前月騰落率" },
+          { key: "prevQuarterChg", label: "前四半期騰落率" },
+          { key: "prevYearChg", label: "前年騰落率" }
+        ]
+      },
+      {
+        title: "スコア",
+        options: [
+          { key: "upScore", label: "上昇スコア" },
+          { key: "downScore", label: "下落スコア" },
+          { key: "overheatUp", label: "過熱（上）" },
+          { key: "overheatDown", label: "過熱（下）" }
+        ]
+      },
+      {
+        title: "ボックス",
+        options: [{ key: "boxState", label: "ボックス状態" }]
+      }
+    ],
+    []
+  );
+
+  const sortOptions = useMemo(
+    () => sortSections.flatMap((section) => section.options),
+    [sortSections]
+  );
+
+  const sortLabel = useMemo(
+    () => sortOptions.find((option) => option.key === sortKey)?.label ?? "コード",
+    [sortOptions, sortKey]
+  );
+
+  const sortDirLabel = sortDir === "desc" ? "降順" : "昇順";
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -93,38 +201,62 @@ export default function GridView() {
     });
   }, [filtered, barsCache, gridTimeframe]);
 
+  const collator = useMemo(
+    () => new Intl.Collator("ja-JP", { numeric: true, sensitivity: "base" }),
+    []
+  );
+
   const sortedTickers = useMemo(() => {
-    const items = [...scoredTickers];
     const boxOrder: Record<string, number> = {
       BREAKOUT_UP: 3,
       IN_BOX: 2,
       BREAKOUT_DOWN: 1,
       NONE: 0
     };
-    const getSortValue = (ticker: typeof scoredTickers[number]["ticker"]) => {
+    const items = scoredTickers.map((item) => {
+      const ticker = item.ticker;
+      let sortValue: string | number | null = null;
       if ((sortKey === "upScore" || sortKey === "downScore") && ticker.statusLabel === "UNKNOWN") {
-        return null;
-      }
-      if (sortKey === "code") return ticker.code;
-      if (sortKey === "name") return ticker.name ?? "";
-      if (sortKey === "chg1D") return ticker.chg1D ?? null;
-      if (sortKey === "chg1W") return ticker.chg1W ?? null;
-      if (sortKey === "chg1M") return ticker.chg1M ?? null;
-      if (sortKey === "chg1Q") return ticker.chg1Q ?? null;
-      if (sortKey === "chg1Y") return ticker.chg1Y ?? null;
-      if (sortKey === "upScore") return ticker.scores?.upScore ?? null;
-      if (sortKey === "downScore") return ticker.scores?.downScore ?? null;
-      if (sortKey === "overheatUp") return ticker.scores?.overheatUp ?? null;
-      if (sortKey === "overheatDown") return ticker.scores?.overheatDown ?? null;
-      if (sortKey === "boxState") {
+        sortValue = null;
+      } else if (sortKey === "code") {
+        sortValue = ticker.code;
+      } else if (sortKey === "name") {
+        sortValue = ticker.name ?? "";
+      } else if (sortKey === "chg1D") {
+        sortValue = ticker.chg1D ?? null;
+      } else if (sortKey === "chg1W") {
+        sortValue = ticker.chg1W ?? null;
+      } else if (sortKey === "chg1M") {
+        sortValue = ticker.chg1M ?? null;
+      } else if (sortKey === "chg1Q") {
+        sortValue = ticker.chg1Q ?? null;
+      } else if (sortKey === "chg1Y") {
+        sortValue = ticker.chg1Y ?? null;
+      } else if (sortKey === "prevWeekChg") {
+        sortValue = ticker.prevWeekChg ?? null;
+      } else if (sortKey === "prevMonthChg") {
+        sortValue = ticker.prevMonthChg ?? null;
+      } else if (sortKey === "prevQuarterChg") {
+        sortValue = ticker.prevQuarterChg ?? null;
+      } else if (sortKey === "prevYearChg") {
+        sortValue = ticker.prevYearChg ?? null;
+      } else if (sortKey === "upScore") {
+        sortValue = ticker.scores?.upScore ?? null;
+      } else if (sortKey === "downScore") {
+        sortValue = ticker.scores?.downScore ?? null;
+      } else if (sortKey === "overheatUp") {
+        sortValue = ticker.scores?.overheatUp ?? null;
+      } else if (sortKey === "overheatDown") {
+        sortValue = ticker.scores?.overheatDown ?? null;
+      } else if (sortKey === "boxState") {
         const state = ticker.boxState ?? "NONE";
-        return boxOrder[state] ?? 0;
+        sortValue = boxOrder[state] ?? 0;
       }
-      return null;
-    };
-    const compare = (a: typeof scoredTickers[number], b: typeof scoredTickers[number]) => {
-      const av = getSortValue(a.ticker);
-      const bv = getSortValue(b.ticker);
+      return { ...item, sortValue };
+    });
+    const compare = (a: typeof items[number], b: typeof items[number]) => {
+      const av = a.sortValue;
+      const bv = b.sortValue;
       const aMissing =
         av === null ||
         av === undefined ||
@@ -140,7 +272,7 @@ export default function GridView() {
       if (bMissing) return -1;
       let result = 0;
       if (typeof av === "string" || typeof bv === "string") {
-        result = String(av).localeCompare(String(bv));
+        result = collator.compare(String(av), String(bv));
       } else {
         result = Number(av) - Number(bv);
       }
@@ -149,7 +281,7 @@ export default function GridView() {
     };
     items.sort(compare);
     return items;
-  }, [scoredTickers, sortKey, sortDir]);
+  }, [scoredTickers, sortKey, sortDir, collator]);
 
   const gridHeight = Math.max(200, size.height);
   const gridWidth = Math.max(0, size.width);
@@ -175,6 +307,7 @@ export default function GridView() {
       if (item) codes.push(item.ticker.code);
     }
     lastVisibleCodesRef.current = codes;
+    lastVisibleRangeRef.current = { start, stop };
     ensureBarsForVisible(gridTimeframe, codes);
   };
 
@@ -182,6 +315,39 @@ export default function GridView() {
     if (!lastVisibleCodesRef.current.length) return;
     ensureBarsForVisible(gridTimeframe, lastVisibleCodesRef.current);
   }, [gridTimeframe, maSettings, ensureBarsForVisible]);
+
+  useEffect(() => {
+    const range = lastVisibleRangeRef.current;
+    if (!range) return;
+    const codes: string[] = [];
+    for (let index = range.start; index <= range.stop; index += 1) {
+      const item = sortedTickers[index];
+      if (item) codes.push(item.ticker.code);
+    }
+    if (!codes.length) return;
+    ensureBarsForVisible(gridTimeframe, codes);
+  }, [sortedTickers, gridTimeframe, ensureBarsForVisible]);
+
+  const itemKey = useCallback(
+    ({ columnIndex, rowIndex, data }: { columnIndex: number; rowIndex: number; data: typeof sortedTickers }) => {
+      const index = rowIndex * columns + columnIndex;
+      const item = data[index];
+      return item ? item.ticker.code : `${rowIndex}-${columnIndex}`;
+    },
+    [columns]
+  );
+
+  const handleOpenDetail = useCallback(
+    (code: string) => {
+      navigate(`/detail/${code}`);
+    },
+    [navigate]
+  );
+
+  const resetDisplay = useCallback(() => {
+    setColumns(3);
+    setShowBoxes(true);
+  }, [setColumns, setShowBoxes]);
 
   const updateSetting = (frame: Timeframe, index: number, patch: Partial<MaSetting>) => {
     updateMaSetting(frame, index, patch);
@@ -194,76 +360,159 @@ export default function GridView() {
   return (
     <div className="app-shell">
       <header className="top-bar">
-        <div>
+        <div className="top-bar-heading">
           <div className="title">Moomoo-like Screener</div>
           <div className="subtitle">Fast grid with canvas sparklines</div>
         </div>
-        <div className="controls">
-          <div className="segmented">
-            {["monthly", "weekly", "daily"].map((value) => (
-              <button
-                key={value}
-                className={gridTimeframe === value ? "active" : ""}
-                onClick={() => setGridTimeframe(value as "monthly" | "weekly" | "daily")}
-              >
-                {value === "monthly" ? "Monthly" : value === "weekly" ? "Weekly" : "Daily"}
-              </button>
-            ))}
+        <div className="top-bar-controls">
+          <div className="top-bar-left">
+            <div className="segmented timeframe-segment">
+              {(["monthly", "weekly", "daily"] as const).map((value) => (
+                <button
+                  key={value}
+                  className={gridTimeframe === value ? "active" : ""}
+                  onClick={() => setGridTimeframe(value)}
+                >
+                  {value === "monthly" ? "月足" : value === "weekly" ? "週足" : "日足"}
+                </button>
+              ))}
+            </div>
+            <div className="search-field">
+              <input
+                className="search-input"
+                placeholder="コード / 銘柄名で検索"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+              />
+              {search && (
+                <button type="button" className="search-clear" onClick={() => setSearch("")}>
+                  クリア
+                </button>
+              )}
+            </div>
           </div>
-          <input
-            className="search"
-            placeholder="Search code or name"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-          />
-          <select
-            className="sort-select"
-            value={sortKey}
-            onChange={(event) => setSortKey(event.target.value as SortKey)}
-          >
-            <option value="code">Code</option>
-            <option value="name">Name</option>
-            <option value="chg1D">Chg 1D</option>
-            <option value="chg1W">Chg 1W</option>
-            <option value="chg1M">Chg 1M</option>
-            <option value="chg1Q">Chg 1Q</option>
-            <option value="chg1Y">Chg 1Y</option>
-            <option value="upScore">Up Score</option>
-            <option value="downScore">Down Score</option>
-            <option value="overheatUp">Overheat Up</option>
-            <option value="overheatDown">Overheat Down</option>
-            <option value="boxState">Box State</option>
-          </select>
-          <div className="segmented">
-            {(["asc", "desc"] as SortDir[]).map((dir) => (
+          <div className="top-bar-right">
+            <div className="popover-anchor" ref={sortRef}>
               <button
-                key={dir}
-                className={sortDir === dir ? "active" : ""}
-                onClick={() => setSortDir(dir)}
+                type="button"
+                className={`sort-button ${isSorting ? "is-sorting" : ""}`}
+                onClick={() => {
+                  setSortOpen((prev) => !prev);
+                  setDisplayOpen(false);
+                }}
               >
-                {dir.toUpperCase()}
+                並び替え：{sortLabel}・{sortDirLabel}
+                <span className="caret">▼</span>
               </button>
-            ))}
-          </div>
-          <button
-            className={showBoxes ? "indicator-button active" : "indicator-button"}
-            onClick={() => setShowBoxes(!showBoxes)}
-          >
-            Boxes
-          </button>
-          <button className="indicator-button" onClick={() => setShowIndicators(true)}>
-            Indicators
-          </button>
-          <div className="segmented">
-            {[2, 3, 4].map((count) => (
+              {sortOpen && (
+                <div className="popover-panel">
+                  <div className="popover-section">
+                    <div className="popover-title">並び替え項目</div>
+                    <div className="popover-groups">
+                      {sortSections.map((section) => (
+                        <div className="popover-group" key={section.title}>
+                          <div className="popover-group-title">{section.title}</div>
+                          <div className="popover-group-list">
+                            {section.options.map((option) => (
+                              <button
+                                type="button"
+                                key={option.key}
+                                className={
+                                  sortKey === option.key ? "popover-item active" : "popover-item"
+                                }
+                                onClick={() => {
+                                  setSortKey(option.key);
+                                  setSortOpen(false);
+                                }}
+                              >
+                                <span>{option.label}</span>
+                                {sortKey === option.key && (
+                                  <span className="popover-status">選択中</span>
+                                )}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="popover-section">
+                    <div className="popover-title">順序</div>
+                    <div className="segmented">
+                      {(["desc", "asc"] as SortDir[]).map((dir) => (
+                        <button
+                          key={dir}
+                          className={sortDir === dir ? "active" : ""}
+                          onClick={() => setSortDir(dir)}
+                        >
+                          {dir === "desc" ? "降順" : "昇順"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="popover-anchor" ref={displayRef}>
               <button
-                key={count}
-                className={columns === count ? "active" : ""}
-                onClick={() => setColumns(count as 2 | 3 | 4)}
+                type="button"
+                className="display-button"
+                onClick={() => {
+                  setDisplayOpen((prev) => !prev);
+                  setSortOpen(false);
+                }}
               >
-                {count} cols
+                表示
+                <span className="caret">▼</span>
               </button>
-            ))}
+              {displayOpen && (
+                <div className="popover-panel">
+                  <div className="popover-section">
+                    <div className="popover-title">列数</div>
+                    <div className="segmented">
+                      {[2, 3, 4].map((count) => (
+                        <button
+                          key={count}
+                          className={columns === count ? "active" : ""}
+                          onClick={() => setColumns(count as 2 | 3 | 4)}
+                        >
+                          {count}列
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="popover-section">
+                    <div className="popover-title">チャート表示</div>
+                    <div className="popover-list">
+                      <button
+                        type="button"
+                        className={showBoxes ? "popover-item active" : "popover-item"}
+                        onClick={() => setShowBoxes(!showBoxes)}
+                      >
+                        <span>ボックス表示</span>
+                        <span className="popover-status">{showBoxes ? "オン" : "オフ"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="popover-item"
+                        onClick={() => {
+                          setShowIndicators(true);
+                          setDisplayOpen(false);
+                        }}
+                      >
+                        <span>移動平均設定</span>
+                        <span className="popover-status">開く</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="popover-section">
+                    <button type="button" className="popover-reset" onClick={resetDisplay}>
+                      おすすめに戻す
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -289,6 +538,8 @@ export default function GridView() {
               rowHeight={TILE_HEIGHT + GRID_GAP}
               width={gridWidth}
               overscanRowCount={2}
+              itemData={sortedTickers}
+              itemKey={itemKey}
               onItemsRendered={onItemsRendered}
               initialScrollTop={gridScrollTop}
               onScroll={({ scrollTop }) => setGridScrollTop(scrollTop)}
@@ -310,7 +561,7 @@ export default function GridView() {
                       signals={item.metrics?.signals ?? []}
                       trendStrength={item.metrics?.trendStrength ?? null}
                       exhaustionRisk={item.metrics?.exhaustionRisk ?? null}
-                      onDoubleClick={() => navigate(`/detail/${item.ticker.code}`)}
+                      onOpenDetail={handleOpenDetail}
                     />
                   </div>
                 );

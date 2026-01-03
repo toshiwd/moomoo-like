@@ -713,18 +713,22 @@ def _compute_screener_metrics(
     weekly = _drop_incomplete_weekly(weekly, last_daily)
     weekly_closes = [item["c"] for item in weekly]
     chg1w = _pct_change(weekly_closes[-1], weekly_closes[-2]) if len(weekly_closes) >= 2 else None
+    prev_week_chg = _pct_change(weekly_closes[-2], weekly_closes[-3]) if len(weekly_closes) >= 3 else None
 
     confirmed_monthly = _drop_incomplete_monthly(monthly_rows, last_daily)
     monthly_closes = [float(row[4]) for row in confirmed_monthly if len(row) >= 5 and row[4] is not None]
     chg1m = _pct_change(monthly_closes[-1], monthly_closes[-2]) if len(monthly_closes) >= 2 else None
+    prev_month_chg = _pct_change(monthly_closes[-2], monthly_closes[-3]) if len(monthly_closes) >= 3 else None
 
     quarterly = _build_quarterly_bars(confirmed_monthly)
     quarterly_closes = [item["c"] for item in quarterly]
     chg1q = _pct_change(quarterly_closes[-1], quarterly_closes[-2]) if len(quarterly_closes) >= 2 else None
+    prev_quarter_chg = _pct_change(quarterly_closes[-2], quarterly_closes[-3]) if len(quarterly_closes) >= 3 else None
 
     yearly = _build_yearly_bars(confirmed_monthly)
     yearly_closes = [item["c"] for item in yearly]
     chg1y = _pct_change(yearly_closes[-1], yearly_closes[-2]) if len(yearly_closes) >= 2 else None
+    prev_year_chg = _pct_change(yearly_closes[-2], yearly_closes[-3]) if len(yearly_closes) >= 3 else None
 
     ma7_series = _build_ma_series(closes, 7)
     ma20_series = _build_ma_series(closes, 20)
@@ -841,6 +845,10 @@ def _compute_screener_metrics(
         "chg1M": chg1m,
         "chg1Q": chg1q,
         "chg1Y": chg1y,
+        "prevWeekChg": prev_week_chg,
+        "prevMonthChg": prev_month_chg,
+        "prevQuarterChg": prev_quarter_chg,
+        "prevYearChg": prev_year_chg,
         "ma7": ma7,
         "ma20": ma20,
         "ma60": ma60,

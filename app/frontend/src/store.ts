@@ -13,6 +13,10 @@ export type Ticker = {
   chg1M?: number | null;
   chg1Q?: number | null;
   chg1Y?: number | null;
+  prevWeekChg?: number | null;
+  prevMonthChg?: number | null;
+  prevQuarterChg?: number | null;
+  prevYearChg?: number | null;
   counts?: {
     up7?: number | null;
     down7?: number | null;
@@ -141,6 +145,10 @@ export type SortKey =
   | "chg1M"
   | "chg1Q"
   | "chg1Y"
+  | "prevWeekChg"
+  | "prevMonthChg"
+  | "prevQuarterChg"
+  | "prevYearChg"
   | "upScore"
   | "downScore"
   | "overheatUp"
@@ -320,7 +328,7 @@ const getInitialTimeframe = (): Settings["gridTimeframe"] => {
 };
 
 const getInitialSortKey = (): SortKey => {
-  if (typeof window === "undefined") return "code";
+  if (typeof window === "undefined") return "chg1D";
   const saved = window.localStorage.getItem("sortKey");
   const options: SortKey[] = [
     "code",
@@ -330,19 +338,23 @@ const getInitialSortKey = (): SortKey => {
     "chg1M",
     "chg1Q",
     "chg1Y",
+    "prevWeekChg",
+    "prevMonthChg",
+    "prevQuarterChg",
+    "prevYearChg",
     "upScore",
     "downScore",
     "overheatUp",
     "overheatDown",
     "boxState"
   ];
-  return options.includes(saved as SortKey) ? (saved as SortKey) : "code";
+  return options.includes(saved as SortKey) ? (saved as SortKey) : "chg1D";
 };
 
 const getInitialSortDir = (): SortDir => {
-  if (typeof window === "undefined") return "asc";
+  if (typeof window === "undefined") return "desc";
   const saved = window.localStorage.getItem("sortDir");
-  return saved === "desc" ? "desc" : "asc";
+  return saved === "asc" ? "asc" : "desc";
 };
 
 export const useStore = create<StoreState>((set, get) => ({
@@ -388,6 +400,10 @@ export const useStore = create<StoreState>((set, get) => ({
         chg1M: item.chg1M ?? null,
         chg1Q: item.chg1Q ?? null,
         chg1Y: item.chg1Y ?? null,
+        prevWeekChg: item.prevWeekChg ?? null,
+        prevMonthChg: item.prevMonthChg ?? null,
+        prevQuarterChg: item.prevQuarterChg ?? null,
+        prevYearChg: item.prevYearChg ?? null,
         counts: item.counts,
         boxState: item.boxState,
         scores: item.scores,

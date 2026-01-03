@@ -2,11 +2,12 @@
 import { Ticker, useStore } from "../store";
 import type { SignalChip } from "../utils/signals";
 import ThumbnailCanvas from "./ThumbnailCanvas";
+import { buildThumbnailCacheKey, getThumbnailCache } from "./thumbnailCache";
 
 const StockTile = memo(function StockTile({
   ticker,
   timeframe,
-  onDoubleClick,
+  onOpenDetail,
   signals,
   trendStrength,
   exhaustionRisk
@@ -16,7 +17,7 @@ const StockTile = memo(function StockTile({
   signals?: SignalChip[];
   trendStrength?: number | null;
   exhaustionRisk?: number | null;
-  onDoubleClick: () => void;
+  onOpenDetail: (code: string) => void;
 }) {
   const barsPayload = useStore((state) => {
     const map = state.barsCache?.[timeframe] ?? {};
@@ -40,6 +41,8 @@ const StockTile = memo(function StockTile({
       : map.monthly ?? [];
   });
   const showBoxes = useStore((state) => state.settings.showBoxes);
+  const cacheKey = buildThumbnailCacheKey(ticker.code, timeframe, showBoxes, maSettings);
+  const cachedThumb = getThumbnailCache(cacheKey);
 
   const stageLabel = ticker.stage || "UNKNOWN";
   const stageClass = stageLabel.toLowerCase();
@@ -51,7 +54,11 @@ const StockTile = memo(function StockTile({
     typeof exhaustionRisk === "number" ? `ER:${Math.round(exhaustionRisk)}` : null;
 
   return (
-    <button className="tile" type="button" onDoubleClick={onDoubleClick}>
+    <button
+      className="tile"
+      type="button"
+      onDoubleClick={() => onOpenDetail(ticker.code)}
+    >
       <div className="tile-header">
         <div>
           <div className="tile-code">{ticker.code}</div>
@@ -95,7 +102,12 @@ const StockTile = memo(function StockTile({
             boxes={boxes}
             showBoxes={showBoxes}
             maSettings={maSettings}
+            cacheKey={cacheKey}
           />
+        ) : cachedThumb ? (
+          <div className="thumb-canvas">
+            <img className="thumb-canvas-image" src={cachedThumb} alt="" />
+          </div>
         ) : (
           <div className="tile-loading">
             {barsStatus === "error"

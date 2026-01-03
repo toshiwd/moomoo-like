@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { BarsPayload, Box, MaSetting } from "../store";
 import { getBodyRangeFromBars, getBoxFill, getBoxStroke } from "../utils/boxes";
+import { setThumbnailCache } from "./thumbnailCache";
 
 const COLORS = {
   up: "#ef4444",
@@ -199,16 +200,20 @@ export default function ThumbnailCanvas({
   payload,
   boxes,
   showBoxes,
-  maSettings
+  maSettings,
+  cacheKey
 }: {
   payload: BarsPayload;
   boxes: Box[];
   showBoxes: boolean;
   maSettings: MaSetting[];
+  cacheKey?: string;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastKeyRef = useRef<string>("");
+  const rafRef = useRef<number | null>(null);
+  const lastSnapshotRef = useRef<string>("");
 
   const renderKey = useMemo(() => {
     const bars = payload.bars;
@@ -220,44 +225,71 @@ export default function ThumbnailCanvas({
     return `${bars.length}-${bars[0]?.[0]}-${last?.[0]}-${last?.[4]}-${boxes.length}-${firstBox?.startTime ?? "none"}-${showBoxes}-${settingsKey}`;
   }, [payload, boxes, showBoxes, maSettings]);
 
-  useEffect(() => {
-    if (!containerRef.current || !canvasRef.current) return;
+  const draw = useCallback(() => {
+    if (!containerRef.current || !canvasRef.current) return false;
+    const width = Math.floor(containerRef.current.clientWidth || 0);
+    const height = Math.max(MIN_HEIGHT, Math.floor(containerRef.current.clientHeight || 0));
+    if (width <= 0 || height <= 0) return false;
     const canvas = canvasRef.current;
-    const resize = () => {
-      const width = Math.floor(containerRef.current?.clientWidth || 0);
-      const height = Math.max(MIN_HEIGHT, Math.floor(containerRef.current?.clientHeight || 0));
-      const ratio = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(width * ratio);
-      canvas.height = Math.floor(height * ratio);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(width * ratio);
+    canvas.height = Math.floor(height * ratio);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+    drawChart(canvas, payload, boxes, showBoxes, maSettings, width, height);
+    if (cacheKey) {
+      const snapshotKey = `${cacheKey}:${renderKey}:${width}x${height}`;
+      if (lastSnapshotRef.current !== snapshotKey) {
+        lastSnapshotRef.current = snapshotKey;
+        try {
+          setThumbnailCache(cacheKey, canvas.toDataURL("image/png"));
+        } catch {
+          // ignore snapshot failures
+        }
       }
-      drawChart(canvas, payload, boxes, showBoxes, maSettings, width, height);
-    };
+    }
+    return true;
+  }, [payload, boxes, showBoxes, maSettings, renderKey, cacheKey]);
 
-    resize();
-    const observer = new ResizeObserver(() => resize());
-    observer.observe(containerRef.current);
-    return () => observer.disconnect();
-  }, [payload, boxes, showBoxes, maSettings, renderKey]);
+  const scheduleDraw = useCallback(() => {
+    if (rafRef.current !== null) {
+      window.cancelAnimationFrame(rafRef.current);
+    }
+    rafRef.current = window.requestAnimationFrame(() => {
+      rafRef.current = null;
+      const ok = draw();
+      if (!ok) {
+        rafRef.current = window.requestAnimationFrame(() => {
+          rafRef.current = null;
+          draw();
+        });
+      }
+    });
+  }, [draw]);
 
   useEffect(() => {
-    if (!canvasRef.current || !containerRef.current) return;
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver(() => scheduleDraw());
+    observer.observe(containerRef.current);
+    scheduleDraw();
+    return () => {
+      observer.disconnect();
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [scheduleDraw]);
+
+  useEffect(() => {
     if (lastKeyRef.current === renderKey) return;
     lastKeyRef.current = renderKey;
-    drawChart(
-      canvasRef.current,
-      payload,
-      boxes,
-      showBoxes,
-      maSettings,
-      canvasRef.current.clientWidth,
-      Math.max(MIN_HEIGHT, canvasRef.current.clientHeight)
-    );
-  }, [payload, boxes, showBoxes, maSettings, renderKey]);
+    scheduleDraw();
+  }, [renderKey, scheduleDraw]);
 
   return (
     <div ref={containerRef} className="thumb-canvas">

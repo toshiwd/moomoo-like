@@ -9,6 +9,18 @@ type PositionOverlayProps = {
   showOverlay: boolean;
   showPnL: boolean;
   hoverTime: number | null;
+  bars: {
+    time: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+  }[];
+  volume: {
+    time: number;
+    value: number;
+  }[];
+  showMarkers?: boolean;
 };
 
 const formatNumber = (value: number) => {
@@ -16,9 +28,31 @@ const formatNumber = (value: number) => {
   return Math.round(value).toLocaleString();
 };
 
+const formatSignedNumber = (value: number) => {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Math.round(value);
+  const prefix = rounded > 0 ? "+" : "";
+  return `${prefix}${rounded.toLocaleString()}`;
+};
+
+const formatPercent = (value: number) => {
+  if (!Number.isFinite(value)) return "0%";
+  const rounded = Math.round(value * 100) / 100;
+  const prefix = rounded > 0 ? "+" : "";
+  return `${prefix}${rounded.toFixed(2)}%`;
+};
+
+const formatDate = (time: number) => {
+  const date = new Date(time * 1000);
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
 const findClosest = (positions: DailyPosition[], time: number | null) => {
   if (!positions.length) return null;
-  if (time == null) return positions[positions.length - 1];
+  if (time == null) return null;
   let left = 0;
   let right = positions.length - 1;
   while (left <= right) {
@@ -32,6 +66,29 @@ const findClosest = (positions: DailyPosition[], time: number | null) => {
     }
   }
   return positions[Math.max(0, Math.min(positions.length - 1, right))] ?? null;
+};
+
+const findClosestIndex = (bars: PositionOverlayProps["bars"], time: number | null) => {
+  if (!bars.length || time == null) return null;
+  let left = 0;
+  let right = bars.length - 1;
+  while (left <= right) {
+    const mid = Math.floor((left + right) / 2);
+    const midTime = bars[mid].time;
+    if (midTime === time) return mid;
+    if (midTime < time) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
+    }
+  }
+  const lowerIndex = Math.max(0, Math.min(bars.length - 1, right));
+  const upperIndex = Math.max(0, Math.min(bars.length - 1, left));
+  const lower = bars[lowerIndex];
+  const upper = bars[upperIndex];
+  if (!lower) return upperIndex ?? null;
+  if (!upper) return lowerIndex ?? null;
+  return Math.abs(time - lower.time) <= Math.abs(upper.time - time) ? lowerIndex : upperIndex;
 };
 
 const formatTrade = (trade: TradeEvent) => {
@@ -48,11 +105,20 @@ export default function PositionOverlay({
   tradeMarkers,
   showOverlay,
   showPnL,
-  hoverTime
+  hoverTime,
+  bars,
+  volume,
+  showMarkers = true
 }: PositionOverlayProps) {
   const lastMarkersKeyRef = useRef<string>("");
+  const volumeMap = useMemo(
+    () => new Map(volume.map((item) => [item.time, item.value])),
+    [volume]
+  );
+  const activeIndex = useMemo(() => findClosestIndex(bars, hoverTime), [bars, hoverTime]);
 
   const markers = useMemo(() => {
+    if (!showMarkers) return [];
     const positionMap = new Map(dailyPositions.map((pos) => [pos.time, pos.posText]));
     return tradeMarkers.map((marker) => {
       const text = positionMap.get(marker.time) ?? "";
@@ -65,11 +131,11 @@ export default function PositionOverlay({
         text
       };
     });
-  }, [tradeMarkers, dailyPositions]);
+  }, [tradeMarkers, dailyPositions, showMarkers]);
 
   useEffect(() => {
     if (!candleSeries) return;
-    if (!showOverlay) {
+    if (!showOverlay || !showMarkers) {
       candleSeries.setMarkers([]);
       lastMarkersKeyRef.current = "";
       return;
@@ -78,41 +144,81 @@ export default function PositionOverlay({
     if (lastMarkersKeyRef.current === key) return;
     lastMarkersKeyRef.current = key;
     candleSeries.setMarkers(markers);
-  }, [candleSeries, markers, showOverlay]);
+  }, [candleSeries, markers, showOverlay, showMarkers]);
 
-  if (!showOverlay) {
-    return null;
-  }
+  if (activeIndex == null) return null;
 
-  const activePosition = findClosest(dailyPositions, hoverTime);
+  const activeBar = bars[activeIndex];
+  if (!activeBar) return null;
+
+  const volumeValue = volumeMap.get(activeBar.time);
+  const volumeText = Number.isFinite(volumeValue) ? formatNumber(volumeValue ?? 0) : "-";
+
+  const prevBar = activeIndex > 0 ? bars[activeIndex - 1] : null;
+  const delta = prevBar ? activeBar.close - prevBar.close : null;
+  const percent =
+    prevBar && prevBar.close !== 0 ? ((activeBar.close - prevBar.close) / prevBar.close) * 100 : null;
+  const deltaClass = delta && delta > 0 ? "up" : delta && delta < 0 ? "down" : "";
+
+  const showPositionInfo = showOverlay || showPnL;
+  const activePosition = showPositionInfo ? findClosest(dailyPositions, activeBar.time) : null;
   const activeTrades = activePosition
     ? tradeMarkers.find((trade) => trade.time === activePosition.time)
     : null;
 
-  if (!activePosition) return null;
-
   return (
     <div className="position-overlay-panel">
-      <div className="position-overlay-title">
-        {activePosition.date} / Close {formatNumber(activePosition.close)}
+      <div className="position-overlay-header">
+        <div className="position-overlay-date">{formatDate(activeBar.time)}</div>
+        {delta != null && percent != null && (
+          <div className={`position-overlay-change ${deltaClass}`}>
+            Chg {formatSignedNumber(delta)} ({formatPercent(percent)})
+          </div>
+        )}
       </div>
-      <div className="position-overlay-row">
-        Position {activePosition.posText} (Sell-Buy)
+      <div className="position-overlay-grid">
+        <div className="position-overlay-label">O</div>
+        <div className="position-overlay-value">{formatNumber(activeBar.open)}</div>
+        <div className="position-overlay-label">H</div>
+        <div className="position-overlay-value">{formatNumber(activeBar.high)}</div>
+        <div className="position-overlay-label">L</div>
+        <div className="position-overlay-value">{formatNumber(activeBar.low)}</div>
+        <div className="position-overlay-label">C</div>
+        <div className="position-overlay-value">{formatNumber(activeBar.close)}</div>
+        <div className="position-overlay-label">Vol</div>
+        <div className="position-overlay-value">{volumeText}</div>
       </div>
-      {showPnL && (
-        <>
+      {showPositionInfo && activePosition && (
+        <div className="position-overlay-block">
           <div className="position-overlay-row">
-            Unrealized {formatNumber(activePosition.unrealizedPnL)}
+            <span className="position-overlay-label">Position</span>
+            <span className="position-overlay-value">{activePosition.posText} (Sell-Buy)</span>
           </div>
-          <div className="position-overlay-row">
-            Realized {formatNumber(activePosition.realizedPnL)}
-          </div>
-          <div className="position-overlay-row total">
-            Total {formatNumber(activePosition.totalPnL)}
-          </div>
-        </>
+          {showPnL && (
+            <>
+              <div className="position-overlay-row">
+                <span className="position-overlay-label">Unrealized</span>
+                <span className="position-overlay-value">
+                  {formatNumber(activePosition.unrealizedPnL)}
+                </span>
+              </div>
+              <div className="position-overlay-row">
+                <span className="position-overlay-label">Realized</span>
+                <span className="position-overlay-value">
+                  {formatNumber(activePosition.realizedPnL)}
+                </span>
+              </div>
+              <div className="position-overlay-row total">
+                <span className="position-overlay-label">Total</span>
+                <span className="position-overlay-value">
+                  {formatNumber(activePosition.totalPnL)}
+                </span>
+              </div>
+            </>
+          )}
+        </div>
       )}
-      {activeTrades && (
+      {showOverlay && showMarkers && activeTrades && (
         <div className="position-overlay-trades">
           {activeTrades.trades.map((trade, index) => (
             <div key={`${trade.date}-${trade.kind ?? "trade"}-${index}`}>

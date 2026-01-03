@@ -2,7 +2,7 @@
 import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
-import type { MaSetting, SortMode } from "../store";
+import type { MaSetting, SortDir, SortKey } from "../store";
 import { useStore } from "../store";
 import StockTile from "../components/StockTile";
 import { computeSignalMetrics } from "../utils/signals";
@@ -55,8 +55,10 @@ export default function GridView() {
   const setGridTimeframe = useStore((state) => state.setGridTimeframe);
   const showBoxes = useStore((state) => state.settings.showBoxes);
   const setShowBoxes = useStore((state) => state.setShowBoxes);
-  const sortMode = useStore((state) => state.settings.sortMode);
-  const setSortMode = useStore((state) => state.setSortMode);
+  const sortKey = useStore((state) => state.settings.sortKey);
+  const sortDir = useStore((state) => state.settings.sortDir);
+  const setSortKey = useStore((state) => state.setSortKey);
+  const setSortDir = useStore((state) => state.setSortDir);
   const maSettings = useStore((state) => state.maSettings);
   const updateMaSetting = useStore((state) => state.updateMaSetting);
   const resetMaSettings = useStore((state) => state.resetMaSettings);
@@ -93,41 +95,61 @@ export default function GridView() {
 
   const sortedTickers = useMemo(() => {
     const items = [...scoredTickers];
-    const mode = sortMode;
+    const boxOrder: Record<string, number> = {
+      BREAKOUT_UP: 3,
+      IN_BOX: 2,
+      BREAKOUT_DOWN: 1,
+      NONE: 0
+    };
+    const getSortValue = (ticker: typeof scoredTickers[number]["ticker"]) => {
+      if ((sortKey === "upScore" || sortKey === "downScore") && ticker.statusLabel === "UNKNOWN") {
+        return null;
+      }
+      if (sortKey === "code") return ticker.code;
+      if (sortKey === "name") return ticker.name ?? "";
+      if (sortKey === "chg1D") return ticker.chg1D ?? null;
+      if (sortKey === "chg1W") return ticker.chg1W ?? null;
+      if (sortKey === "chg1M") return ticker.chg1M ?? null;
+      if (sortKey === "chg1Q") return ticker.chg1Q ?? null;
+      if (sortKey === "chg1Y") return ticker.chg1Y ?? null;
+      if (sortKey === "upScore") return ticker.scores?.upScore ?? null;
+      if (sortKey === "downScore") return ticker.scores?.downScore ?? null;
+      if (sortKey === "overheatUp") return ticker.scores?.overheatUp ?? null;
+      if (sortKey === "overheatDown") return ticker.scores?.overheatDown ?? null;
+      if (sortKey === "boxState") {
+        const state = ticker.boxState ?? "NONE";
+        return boxOrder[state] ?? 0;
+      }
+      return null;
+    };
     const compare = (a: typeof scoredTickers[number], b: typeof scoredTickers[number]) => {
-      const aMetrics = a.metrics;
-      const bMetrics = b.metrics;
-      const aTrend = aMetrics?.trendStrength;
-      const bTrend = bMetrics?.trendStrength;
-      const aRisk = aMetrics?.exhaustionRisk;
-      const bRisk = bMetrics?.exhaustionRisk;
-
-      if (mode === "trend-up") {
-        const av = Number.isFinite(aTrend) ? aTrend : -Infinity;
-        const bv = Number.isFinite(bTrend) ? bTrend : -Infinity;
-        if (bv !== av) return bv - av;
-        return a.index - b.index;
+      const av = getSortValue(a.ticker);
+      const bv = getSortValue(b.ticker);
+      const aMissing =
+        av === null ||
+        av === undefined ||
+        (typeof av === "number" && !Number.isFinite(av)) ||
+        (typeof av === "string" && av.trim() === "");
+      const bMissing =
+        bv === null ||
+        bv === undefined ||
+        (typeof bv === "number" && !Number.isFinite(bv)) ||
+        (typeof bv === "string" && bv.trim() === "");
+      if (aMissing && bMissing) return a.ticker.code.localeCompare(b.ticker.code);
+      if (aMissing) return 1;
+      if (bMissing) return -1;
+      let result = 0;
+      if (typeof av === "string" || typeof bv === "string") {
+        result = String(av).localeCompare(String(bv));
+      } else {
+        result = Number(av) - Number(bv);
       }
-      if (mode === "trend-down") {
-        const av = Number.isFinite(aTrend) ? aTrend : Infinity;
-        const bv = Number.isFinite(bTrend) ? bTrend : Infinity;
-        if (av !== bv) return av - bv;
-        return a.index - b.index;
-      }
-      if (mode === "trend-abs") {
-        const av = Number.isFinite(aTrend) ? Math.abs(aTrend) : -Infinity;
-        const bv = Number.isFinite(bTrend) ? Math.abs(bTrend) : -Infinity;
-        if (bv !== av) return bv - av;
-        return a.index - b.index;
-      }
-      const av = Number.isFinite(aRisk) ? aRisk : -Infinity;
-      const bv = Number.isFinite(bRisk) ? bRisk : -Infinity;
-      if (bv !== av) return bv - av;
-      return a.index - b.index;
+      if (result === 0) return a.ticker.code.localeCompare(b.ticker.code);
+      return sortDir === "desc" ? -result : result;
     };
     items.sort(compare);
     return items;
-  }, [scoredTickers, sortMode]);
+  }, [scoredTickers, sortKey, sortDir]);
 
   const gridHeight = Math.max(200, size.height);
   const gridWidth = Math.max(0, size.width);
@@ -196,14 +218,33 @@ export default function GridView() {
           />
           <select
             className="sort-select"
-            value={sortMode}
-            onChange={(event) => setSortMode(event.target.value as SortMode)}
+            value={sortKey}
+            onChange={(event) => setSortKey(event.target.value as SortKey)}
           >
-            <option value="trend-up">Trend up</option>
-            <option value="trend-down">Trend down</option>
-            <option value="trend-abs">Trend strong</option>
-            <option value="exhaustion">Exhaustion</option>
+            <option value="code">Code</option>
+            <option value="name">Name</option>
+            <option value="chg1D">Chg 1D</option>
+            <option value="chg1W">Chg 1W</option>
+            <option value="chg1M">Chg 1M</option>
+            <option value="chg1Q">Chg 1Q</option>
+            <option value="chg1Y">Chg 1Y</option>
+            <option value="upScore">Up Score</option>
+            <option value="downScore">Down Score</option>
+            <option value="overheatUp">Overheat Up</option>
+            <option value="overheatDown">Overheat Down</option>
+            <option value="boxState">Box State</option>
           </select>
+          <div className="segmented">
+            {(["asc", "desc"] as SortDir[]).map((dir) => (
+              <button
+                key={dir}
+                className={sortDir === dir ? "active" : ""}
+                onClick={() => setSortDir(dir)}
+              >
+                {dir.toUpperCase()}
+              </button>
+            ))}
+          </div>
           <button
             className={showBoxes ? "indicator-button active" : "indicator-button"}
             onClick={() => setShowBoxes(!showBoxes)}

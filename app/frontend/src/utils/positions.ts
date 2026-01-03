@@ -126,16 +126,9 @@ export const buildDailyPositions = (bars: Candle[], trades: TradeEvent[]) => {
         return;
       }
       if (kind === "INBOUND") {
-        const nextLots = longLots + lots;
-        const effectivePrice = price > 0 ? price : bar.close;
-        avgLongPrice =
-          nextLots > 0 ? (avgLongPrice * longLots + effectivePrice * lots) / nextLots : 0;
-        longLots = nextLots;
         return;
       }
       if (kind === "OUTBOUND") {
-        longLots = Math.max(0, longLots - lots);
-        if (longLots === 0) avgLongPrice = 0;
         return;
       }
 

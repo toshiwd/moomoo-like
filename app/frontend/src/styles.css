@@ -556,25 +556,106 @@ body {
   min-height: 160px;
 }
 
-.position-overlay-panel {
+.detail-chart-focusable {
+  cursor: zoom-in;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.detail-chart-focusable:hover {
+  border-color: rgba(148, 163, 184, 0.6);
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.3);
+}
+
+.detail-chart-focused {
+  border-color: rgba(37, 99, 235, 0.45);
+  cursor: zoom-out;
+}
+
+.detail-focus-back {
   position: absolute;
   top: 12px;
   right: 12px;
+  z-index: 8;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(8, 12, 24, 0.85);
+  color: #e2e8f0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.detail-focus-back:hover {
+  border-color: rgba(148, 163, 184, 0.7);
+}
+
+.position-overlay-panel {
+  position: absolute;
+  top: 12px;
+  left: 12px;
   z-index: 6;
-  background: rgba(8, 12, 24, 0.92);
+  background: rgba(8, 12, 24, 0.88);
   border: 1px solid rgba(148, 163, 184, 0.25);
   border-radius: 10px;
   padding: 8px 10px;
   font-size: 12px;
   color: #e2e8f0;
   display: grid;
-  gap: 4px;
-  min-width: 160px;
+  gap: 6px;
+  min-width: 180px;
+  max-width: 240px;
 }
 
-.position-overlay-title {
+.position-overlay-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.position-overlay-date {
   font-weight: 600;
   color: #f8fafc;
+}
+
+.position-overlay-change {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.position-overlay-change.up {
+  color: #ef4444;
+}
+
+.position-overlay-change.down {
+  color: #22c55e;
+}
+
+.position-overlay-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+}
+
+.position-overlay-label {
+  color: #94a3b8;
+}
+
+.position-overlay-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.position-overlay-block {
+  display: grid;
+  gap: 4px;
+}
+
+.position-overlay-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .position-overlay-row.total {

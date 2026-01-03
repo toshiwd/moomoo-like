@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+﻿from datetime import datetime, timedelta
 import csv
 import os
 import re
@@ -16,9 +16,11 @@ DEFAULT_TRADE_CSV_PATH = os.path.abspath(
 )
 TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH") or DEFAULT_TRADE_CSV_PATH
 USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
+DEFAULT_DB_PATH = os.getenv("STOCKS_DB_PATH", os.path.join(os.path.dirname(__file__), "stocks.duckdb"))
 
 
 _trade_cache = {"mtime": None, "path": None, "rows": [], "warnings": []}
+_screener_cache = {"mtime": None, "rows": []}
 
 
 def find_code_txt_path(data_dir: str) -> str | None:
@@ -50,7 +52,7 @@ def _parse_trade_csv() -> dict:
     warnings: list[dict] = []
     path = TRADE_CSV_PATH
     if not os.path.isfile(path):
-        warnings.append({"message": f"trade_csv_missing:{path}"})
+        warnings.append({"type": "trade_csv_missing", "message": f"trade_csv_missing:{path}"})
         return {"rows": [], "warnings": warnings}
     mtime = os.path.getmtime(path)
     if _trade_cache["mtime"] == mtime and _trade_cache["path"] == path:
@@ -61,7 +63,7 @@ def _parse_trade_csv() -> dict:
     try:
         handle = open(path, "r", encoding="cp932", newline="")
     except OSError as exc:
-        warnings.append({"message": f"trade_csv_read_failed:{exc}"})
+        warnings.append({"type": "trade_csv_read_failed", "message": f"trade_csv_read_failed:{exc}"})
         return {"rows": [], "warnings": warnings}
 
     rows_all: list[list[str]] = []
@@ -76,9 +78,11 @@ def _parse_trade_csv() -> dict:
                 reader = csv.reader(fallback)
                 rows_all = list(reader)
                 encoding_used = "utf-8-sig"
-                warnings.append({"message": "trade_csv_encoding_fallback:utf-8-sig"})
+                warnings.append(
+                    {"type": "trade_csv_encoding_fallback", "message": "trade_csv_encoding_fallback:utf-8-sig"}
+                )
         except OSError as exc:
-            warnings.append({"message": f"trade_csv_read_failed:{exc}"})
+            warnings.append({"type": "trade_csv_read_failed", "message": f"trade_csv_read_failed:{exc}"})
             return {"rows": [], "warnings": warnings}
 
     header = rows_all[0] if rows_all else None
@@ -112,11 +116,10 @@ def _parse_trade_csv() -> dict:
     def normalize_text(value: str | None) -> str:
         if value is None:
             return ""
-        text = str(value)
-        if text.lower() == "nan":
+        text = str(value).replace("\ufeff", "")
+        if text.strip().lower() in ("nan", "none"):
             return ""
-        text = text.replace("\ufeff", "")
-        text = text.replace("　", "")
+        text = text.replace("\u3000", " ")
         return text.strip()
 
     def normalize_label(value: str | None) -> str:
@@ -168,7 +171,11 @@ def _parse_trade_csv() -> dict:
 
         if qty_shares % 100 != 0:
             warnings.append(
-                {"message": f"non_100_shares:{code}:{date_value}:{qty_shares}", "code": code}
+                {
+                    "type": "non_100_shares",
+                    "message": f"non_100_shares:{code}:{date_value}:{qty_shares}",
+                    "code": code
+                }
             )
 
         trade_type = normalize_label(type_raw)
@@ -229,12 +236,6 @@ def _parse_trade_csv() -> dict:
         if event_kind is None:
             sample = f"取引区分={trade_type or '(blank)'}, 売買区分={trade_kind or '(blank)'}"
             unknown_labels_by_code.setdefault(code, set()).add(sample)
-            warnings.append(
-                {
-                    "message": f"unrecognized_trade:{code}:{date_value}:{sample}",
-                    "code": code
-                }
-            )
             continue
 
         dedup_key = "|".join(
@@ -285,7 +286,7 @@ def _parse_trade_csv() -> dict:
                 "action": action,
                 "kind": event_kind,
                 "qtyShares": qty_shares,
-                "units": qty_shares / 100,
+                "units": int(qty_shares // 100),
                 "price": price if price > 0 else None,
                 "_row_index": row_index,
                 "_event_order": event_order,
@@ -304,13 +305,16 @@ def _parse_trade_csv() -> dict:
         )
 
     for code, count in duplicate_counts.items():
-        warnings.append({"message": f"duplicate_rows:{code}:{count}", "code": code})
+        warnings.append(
+            {"type": "duplicate_rows", "message": f"duplicate_rows:{code}:{count}", "code": code}
+        )
 
     for code, samples_set in unknown_labels_by_code.items():
         samples = sorted(list(samples_set))[:5]
         warnings.append(
             {
-                "message": f"unrecognized_labels:{len(samples_set)}",
+                "type": "unrecognized_labels",
+                "count": len(samples_set),
                 "samples": samples,
                 "code": code
             }
@@ -359,9 +363,9 @@ def _build_daily_positions(trades: list[dict]) -> list[dict]:
             elif kind == "TAKE_DELIVERY":
                 continue
             elif kind == "INBOUND":
-                long_shares += qty_shares
+                continue
             elif kind == "OUTBOUND":
-                long_shares = max(0.0, long_shares - qty_shares)
+                continue
 
         positions.append(
             {
@@ -381,13 +385,567 @@ def _strip_internal(row: dict) -> dict:
     return {key: value for key, value in row.items() if not key.startswith("_")}
 
 
-def _format_warning(warning: dict) -> str:
-    message = warning.get("message", "")
-    samples = warning.get("samples")
-    if samples:
-        sample_text = ", ".join(samples)
-        return f"{message} samples=[{sample_text}]"
-    return message
+def _build_warning_payload(warnings: list[dict], code: str | None = None) -> dict:
+    items: list[str] = []
+    unrecognized_count = 0
+    unrecognized_samples: list[str] = []
+
+    for warning in warnings:
+        warning_code = warning.get("code")
+        if code is not None and warning_code not in (None, code):
+            continue
+        if warning.get("type") == "unrecognized_labels":
+            count = int(warning.get("count") or 0)
+            samples = warning.get("samples") or []
+            unrecognized_count += count
+            for sample in samples:
+                if sample in unrecognized_samples:
+                    continue
+                unrecognized_samples.append(sample)
+                if len(unrecognized_samples) >= 5:
+                    break
+        else:
+            message = warning.get("message") or warning.get("type") or ""
+            if message:
+                items.append(message)
+
+    payload = {"items": items}
+    if unrecognized_count:
+        payload["unrecognized_labels"] = {
+            "count": unrecognized_count,
+            "samples": unrecognized_samples
+        }
+    return payload
+
+
+def _parse_daily_date(value: int | str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        raw = str(int(value)).zfill(8)
+        year = int(raw[:4])
+        month = int(raw[4:6])
+        day = int(raw[6:8])
+        return datetime(year, month, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_month_value(value: int | str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        raw = str(int(value)).zfill(6)
+        year = int(raw[:4])
+        month = int(raw[4:6])
+        return datetime(year, month, 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_month_label(value: int | str | None) -> str | None:
+    month = _parse_month_value(value)
+    if not month:
+        return None
+    return f"{month.year:04d}-{month.month:02d}"
+
+
+def _pct_change(latest: float | None, prev: float | None) -> float | None:
+    if latest is None or prev is None:
+        return None
+    if prev == 0:
+        return None
+    return (latest - prev) / prev * 100
+
+
+def _build_weekly_bars(daily_rows: list[tuple]) -> list[dict]:
+    items: list[dict] = []
+    current_key = None
+    for row in daily_rows:
+        if len(row) < 5:
+            continue
+        date_value, open_, high, low, close = row[:5]
+        if open_ is None or high is None or low is None or close is None:
+            continue
+        dt = _parse_daily_date(date_value)
+        if not dt:
+            continue
+        week_start = (dt - timedelta(days=dt.weekday())).date()
+        if current_key != week_start:
+            items.append(
+                {
+                    "week_start": week_start,
+                    "o": float(open_),
+                    "h": float(high),
+                    "l": float(low),
+                    "c": float(close),
+                    "last_date": dt.date()
+                }
+            )
+            current_key = week_start
+        else:
+            current = items[-1]
+            current["h"] = max(current["h"], float(high))
+            current["l"] = min(current["l"], float(low))
+            current["c"] = float(close)
+            current["last_date"] = dt.date()
+    return items
+
+
+def _drop_incomplete_weekly(weekly: list[dict], last_daily: datetime | None) -> list[dict]:
+    if not weekly or not last_daily:
+        return weekly
+    last_week_start = (last_daily - timedelta(days=last_daily.weekday())).date()
+    if weekly[-1]["week_start"] == last_week_start and last_daily.weekday() < 4:
+        return weekly[:-1]
+    return weekly
+
+
+def _drop_incomplete_monthly(monthly_rows: list[tuple], last_daily: datetime | None) -> list[tuple]:
+    if not monthly_rows or not last_daily:
+        return monthly_rows
+    last_month = _parse_month_value(monthly_rows[-1][0] if monthly_rows else None)
+    if last_month and last_month.year == last_daily.year and last_month.month == last_daily.month:
+        return monthly_rows[:-1]
+    return monthly_rows
+
+
+def _build_quarterly_bars(monthly_rows: list[tuple]) -> list[dict]:
+    items: list[dict] = []
+    current_key: tuple[int, int] | None = None
+    for row in monthly_rows:
+        if len(row) < 5:
+            continue
+        month_value, open_, high, low, close = row[:5]
+        dt = _parse_month_value(month_value)
+        if not dt:
+            continue
+        quarter = (dt.month - 1) // 3 + 1
+        key = (dt.year, quarter)
+        if current_key != key:
+            items.append(
+                {
+                    "year": dt.year,
+                    "quarter": quarter,
+                    "o": float(open_),
+                    "h": float(high),
+                    "l": float(low),
+                    "c": float(close)
+                }
+            )
+            current_key = key
+        else:
+            current = items[-1]
+            current["h"] = max(current["h"], float(high))
+            current["l"] = min(current["l"], float(low))
+            current["c"] = float(close)
+    return items
+
+
+def _build_yearly_bars(monthly_rows: list[tuple]) -> list[dict]:
+    items: list[dict] = []
+    current_year = None
+    for row in monthly_rows:
+        if len(row) < 5:
+            continue
+        month_value, open_, high, low, close = row[:5]
+        dt = _parse_month_value(month_value)
+        if not dt:
+            continue
+        if current_year != dt.year:
+            items.append(
+                {
+                    "year": dt.year,
+                    "o": float(open_),
+                    "h": float(high),
+                    "l": float(low),
+                    "c": float(close)
+                }
+            )
+            current_year = dt.year
+        else:
+            current = items[-1]
+            current["h"] = max(current["h"], float(high))
+            current["l"] = min(current["l"], float(low))
+            current["c"] = float(close)
+    return items
+
+
+def _build_ma_series(values: list[float], period: int) -> list[float | None]:
+    if period <= 0:
+        return [None for _ in values]
+    result: list[float | None] = []
+    total = 0.0
+    for index, value in enumerate(values):
+        total += value
+        if index >= period:
+            total -= values[index - period]
+        if index >= period - 1:
+            result.append(total / period)
+        else:
+            result.append(None)
+    return result
+
+
+def _count_streak(
+    values: list[float],
+    averages: list[float | None],
+    direction: str
+) -> int | None:
+    count = 0
+    opposite = 0
+    has_values = False
+    for value, avg in zip(values, averages):
+        if avg is None:
+            continue
+        has_values = True
+        if direction == "up":
+            if value > avg:
+                count += 1
+                opposite = 0
+            elif value < avg:
+                opposite += 1
+                if opposite >= 2:
+                    count = 0
+            else:
+                opposite = 0
+        else:
+            if value < avg:
+                count += 1
+                opposite = 0
+            elif value > avg:
+                opposite += 1
+                if opposite >= 2:
+                    count = 0
+            else:
+                opposite = 0
+    return None if not has_values else count
+
+
+def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> tuple[dict | None, str]:
+    if not monthly_rows:
+        return None, "NONE"
+    boxes = detect_boxes(monthly_rows)
+    if not boxes:
+        return None, "NONE"
+
+    bars = []
+    for row in monthly_rows:
+        if len(row) < 5:
+            continue
+        month_value, open_, high, low, close = row[:5]
+        if open_ is None or close is None:
+            continue
+        bars.append(
+            {
+                "month": month_value,
+                "open": float(open_),
+                "close": float(close)
+            }
+        )
+
+    active_box = None
+    for box in boxes:
+        months = box["endIndex"] - box["startIndex"] + 1
+        if months < 3:
+            continue
+        active_box = {**box, "months": months}
+
+    if not active_box:
+        return None, "NONE"
+
+    start_index = active_box["startIndex"]
+    end_index = active_box["endIndex"]
+    body_low = None
+    body_high = None
+    for bar in bars[start_index : end_index + 1]:
+        low = min(bar["open"], bar["close"])
+        high = max(bar["open"], bar["close"])
+        body_low = low if body_low is None else min(body_low, low)
+        body_high = high if body_high is None else max(body_high, high)
+
+    if body_low is None or body_high is None:
+        return None, "NONE"
+
+    base = max(abs(body_low), 1e-9)
+    range_pct = (body_high - body_low) / base
+    start_label = _format_month_label(active_box["startTime"])
+    end_label = _format_month_label(active_box["endTime"])
+
+    box_state = "NONE"
+    if last_close is not None:
+        if last_close > body_high:
+            box_state = "BREAKOUT_UP"
+        elif last_close < body_low:
+            box_state = "BREAKOUT_DOWN"
+        else:
+            box_state = "IN_BOX"
+
+    payload = {
+        "startDate": start_label,
+        "endDate": end_label,
+        "bodyLow": body_low,
+        "bodyHigh": body_high,
+        "months": active_box["months"],
+        "rangePct": range_pct,
+        "isActive": box_state == "IN_BOX"
+    }
+    return payload, box_state
+
+
+def _compute_screener_metrics(
+    daily_rows: list[tuple],
+    monthly_rows: list[tuple]
+) -> dict:
+    reasons: list[str] = []
+    daily_rows = sorted(daily_rows, key=lambda item: item[0])
+    monthly_rows = sorted(monthly_rows, key=lambda item: item[0])
+
+    last_daily = _parse_daily_date(daily_rows[-1][0]) if daily_rows else None
+    closes = [float(row[4]) for row in daily_rows if len(row) >= 5 and row[4] is not None]
+    last_close = closes[-1] if closes else None
+    if last_close is None:
+        reasons.append("missing_last_close")
+
+    chg1d = _pct_change(closes[-1], closes[-2]) if len(closes) >= 2 else None
+
+    weekly = _build_weekly_bars(daily_rows)
+    weekly = _drop_incomplete_weekly(weekly, last_daily)
+    weekly_closes = [item["c"] for item in weekly]
+    chg1w = _pct_change(weekly_closes[-1], weekly_closes[-2]) if len(weekly_closes) >= 2 else None
+
+    confirmed_monthly = _drop_incomplete_monthly(monthly_rows, last_daily)
+    monthly_closes = [float(row[4]) for row in confirmed_monthly if len(row) >= 5 and row[4] is not None]
+    chg1m = _pct_change(monthly_closes[-1], monthly_closes[-2]) if len(monthly_closes) >= 2 else None
+
+    quarterly = _build_quarterly_bars(confirmed_monthly)
+    quarterly_closes = [item["c"] for item in quarterly]
+    chg1q = _pct_change(quarterly_closes[-1], quarterly_closes[-2]) if len(quarterly_closes) >= 2 else None
+
+    yearly = _build_yearly_bars(confirmed_monthly)
+    yearly_closes = [item["c"] for item in yearly]
+    chg1y = _pct_change(yearly_closes[-1], yearly_closes[-2]) if len(yearly_closes) >= 2 else None
+
+    ma7_series = _build_ma_series(closes, 7)
+    ma20_series = _build_ma_series(closes, 20)
+    ma60_series = _build_ma_series(closes, 60)
+    ma100_series = _build_ma_series(closes, 100)
+
+    ma7 = ma7_series[-1] if ma7_series else None
+    ma20 = ma20_series[-1] if ma20_series else None
+    ma60 = ma60_series[-1] if ma60_series else None
+    ma100 = ma100_series[-1] if ma100_series else None
+
+    prev_ma20 = ma20_series[-2] if len(ma20_series) >= 2 else None
+    slope20 = ma20 - prev_ma20 if ma20 is not None and prev_ma20 is not None else None
+
+    up7 = _count_streak(closes, ma7_series, "up")
+    down7 = _count_streak(closes, ma7_series, "down")
+    up20 = _count_streak(closes, ma20_series, "up")
+    down20 = _count_streak(closes, ma20_series, "down")
+    up60 = _count_streak(closes, ma60_series, "up")
+    down60 = _count_streak(closes, ma60_series, "down")
+    up100 = _count_streak(closes, ma100_series, "up")
+    down100 = _count_streak(closes, ma100_series, "down")
+
+    if ma20 is None:
+        reasons.append("missing_ma20")
+    if ma60 is None:
+        reasons.append("missing_ma60")
+    if ma100 is None:
+        reasons.append("missing_ma100")
+    if chg1m is None:
+        reasons.append("missing_chg1m")
+    if chg1q is None:
+        reasons.append("missing_chg1q")
+    if chg1y is None:
+        reasons.append("missing_chg1y")
+
+    box_monthly, box_state = _build_box_metrics(monthly_rows, last_close)
+
+    status_label = "UNKNOWN"
+    essential_missing = last_close is None or ma20 is None or ma60 is None
+    if not essential_missing:
+        if last_close > ma20 and ma20 > ma60:
+            status_label = "UP"
+        elif last_close < ma20 and ma20 < ma60:
+            status_label = "DOWN"
+        else:
+            status_label = "RANGE"
+
+    up_score = None
+    down_score = None
+    overheat_up = None
+    overheat_down = None
+
+    if status_label != "UNKNOWN" and last_close is not None and ma20 is not None and ma60 is not None:
+        up_score = 0
+        down_score = 0
+
+        if last_close > ma20:
+            up_score += 10
+        if ma20 > ma60:
+            up_score += 10
+        if slope20 is not None and slope20 > 0:
+            up_score += 10
+
+        if up7 is not None:
+            if up7 >= 14:
+                up_score += 20
+            elif up7 >= 7:
+                up_score += 10
+
+        if box_state == "BREAKOUT_UP":
+            up_score += 30
+        elif box_state == "IN_BOX" and box_monthly and box_monthly.get("months", 0) >= 3:
+            up_score += 10
+
+        if chg1m is not None and chg1m > 0:
+            up_score += 10
+        if chg1q is not None and chg1q > 0:
+            up_score += 10
+
+        if last_close < ma20:
+            down_score += 10
+        if ma20 < ma60:
+            down_score += 10
+        if slope20 is not None and slope20 < 0:
+            down_score += 10
+
+        if down7 is not None:
+            if down7 >= 14:
+                down_score += 20
+            elif down7 >= 7:
+                down_score += 10
+
+        if box_state == "BREAKOUT_DOWN":
+            down_score += 30
+
+        if chg1m is not None and chg1m < 0:
+            down_score += 10
+        if chg1q is not None and chg1q < 0:
+            down_score += 10
+
+        up_score = min(100, max(0, up_score))
+        down_score = min(100, max(0, down_score))
+
+        if up20 is not None:
+            overheat_up = min(1.0, max(0.0, (up20 - 16) / 4))
+        if down20 is not None:
+            overheat_down = min(1.0, max(0.0, (down20 - 16) / 4))
+
+    return {
+        "lastClose": last_close,
+        "chg1D": chg1d,
+        "chg1W": chg1w,
+        "chg1M": chg1m,
+        "chg1Q": chg1q,
+        "chg1Y": chg1y,
+        "ma7": ma7,
+        "ma20": ma20,
+        "ma60": ma60,
+        "ma100": ma100,
+        "slope20": slope20,
+        "counts": {
+            "up7": up7,
+            "down7": down7,
+            "up20": up20,
+            "down20": down20,
+            "up60": up60,
+            "down60": down60,
+            "up100": up100,
+            "down100": down100
+        },
+        "boxMonthly": box_monthly,
+        "boxState": box_state,
+        "scores": {
+            "upScore": up_score,
+            "downScore": down_score,
+            "overheatUp": overheat_up,
+            "overheatDown": overheat_down
+        },
+        "statusLabel": status_label,
+        "reasons": reasons
+    }
+
+
+def _build_screener_rows() -> list[dict]:
+    with get_conn() as conn:
+        codes = [row[0] for row in conn.execute("SELECT DISTINCT code FROM daily_bars ORDER BY code").fetchall()]
+        meta_rows = conn.execute(
+            "SELECT code, name, stage, score, reason FROM stock_meta"
+        ).fetchall()
+        daily_rows = conn.execute(
+            """
+            SELECT code, date, o, h, l, c, v
+            FROM (
+                SELECT
+                    code,
+                    date,
+                    o,
+                    h,
+                    l,
+                    c,
+                    v,
+                    ROW_NUMBER() OVER (PARTITION BY code ORDER BY date DESC) AS rn
+                FROM daily_bars
+            )
+            WHERE rn <= 260
+            ORDER BY code, date
+            """
+        ).fetchall()
+        monthly_rows = conn.execute(
+            """
+            SELECT code, month, o, h, l, c
+            FROM monthly_bars
+            ORDER BY code, month
+            """
+        ).fetchall()
+
+    meta_map = {row[0]: row for row in meta_rows}
+    daily_map: dict[str, list[tuple]] = {}
+    monthly_map: dict[str, list[tuple]] = {}
+
+    for row in daily_rows:
+        code = row[0]
+        daily_map.setdefault(code, []).append(row[1:])
+
+    for row in monthly_rows:
+        code = row[0]
+        monthly_map.setdefault(code, []).append(row[1:])
+
+    items: list[dict] = []
+    for code in codes:
+        meta = meta_map.get(code) or (code, code, "UNKNOWN", 0.0, "TXT_ONLY")
+        name = meta[1] or code
+        stage = meta[2] or "UNKNOWN"
+        score = meta[3] if meta[3] is not None else 0.0
+        reason = meta[4] or ""
+        metrics = _compute_screener_metrics(daily_map.get(code, []), monthly_map.get(code, []))
+        items.append(
+            {
+                "code": code,
+                "name": name,
+                "stage": stage,
+                "score": score,
+                "reason": reason,
+                **metrics
+            }
+        )
+    return items
+
+
+def _get_screener_rows() -> list[dict]:
+    mtime = None
+    if os.path.isfile(DEFAULT_DB_PATH):
+        mtime = os.path.getmtime(DEFAULT_DB_PATH)
+    if _screener_cache["mtime"] == mtime and _screener_cache["rows"]:
+        return _screener_cache["rows"]
+
+    rows = _build_screener_rows()
+    _screener_cache["mtime"] = mtime
+    _screener_cache["rows"] = rows
+    return rows
 
 
 def get_txt_status() -> dict:
@@ -435,50 +993,64 @@ def health():
 
 @app.get("/api/trades/{code}")
 def trades_by_code(code: str):
-    parsed = _parse_trade_csv()
-    items = [row for row in parsed["rows"] if row.get("code") == code]
-    events = [_strip_internal(row) for row in items]
-    warnings = [
-        _format_warning(warning)
-        for warning in parsed["warnings"]
-        if warning.get("code") in (None, code)
-    ]
-    daily_positions = _build_daily_positions(items)
-    current_position = daily_positions[-1] if daily_positions else None
-    return JSONResponse(
-        content={
-            "events": events,
-            "dailyPositions": daily_positions,
-            "currentPosition": current_position,
-            "warnings": warnings
-        }
-    )
+    try:
+        parsed = _parse_trade_csv()
+        items = [row for row in parsed["rows"] if row.get("code") == code]
+        events = [_strip_internal(row) for row in items]
+        warnings = _build_warning_payload(parsed["warnings"], code)
+        daily_positions = _build_daily_positions(items)
+        current_position = daily_positions[-1] if daily_positions else None
+        return JSONResponse(
+            content={
+                "events": events,
+                "dailyPositions": daily_positions,
+                "currentPosition": current_position,
+                "warnings": warnings,
+                "errors": []
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            content={
+                "events": [],
+                "dailyPositions": [],
+                "currentPosition": None,
+                "warnings": {"items": []},
+                "errors": [f"trades_by_code_failed:{exc}"]
+            }
+        )
 
 
 @app.get("/api/trades")
 def trades(code: str | None = None):
-    parsed = _parse_trade_csv()
-    items = parsed["rows"]
-    if code:
-        items = [row for row in items if row.get("code") == code]
-        warnings = [
-            _format_warning(warning)
-            for warning in parsed["warnings"]
-            if warning.get("code") in (None, code)
-        ]
-    else:
-        warnings = [_format_warning(warning) for warning in parsed["warnings"]]
-    events = [_strip_internal(row) for row in items]
-    daily_positions = _build_daily_positions(items)
-    current_position = daily_positions[-1] if daily_positions else None
-    return JSONResponse(
-        content={
-            "events": events,
-            "dailyPositions": daily_positions,
-            "currentPosition": current_position,
-            "warnings": warnings
-        }
-    )
+    try:
+        parsed = _parse_trade_csv()
+        items = parsed["rows"]
+        if code:
+            items = [row for row in items if row.get("code") == code]
+        warnings = _build_warning_payload(parsed["warnings"], code)
+        events = [_strip_internal(row) for row in items]
+        daily_positions = _build_daily_positions(items)
+        current_position = daily_positions[-1] if daily_positions else None
+        return JSONResponse(
+            content={
+                "events": events,
+                "dailyPositions": daily_positions,
+                "currentPosition": current_position,
+                "warnings": warnings,
+                "errors": []
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            content={
+                "events": [],
+                "dailyPositions": [],
+                "currentPosition": None,
+                "warnings": {"items": []},
+                "errors": [f"trades_failed:{exc}"]
+            }
+        )
 
 
 @app.get("/api/list")
@@ -497,6 +1069,15 @@ def list_tickers():
             """
         ).fetchall()
     return JSONResponse(content=rows)
+
+
+@app.get("/api/screener")
+def screener():
+    try:
+        rows = _get_screener_rows()
+        return JSONResponse(content={"items": rows, "errors": []})
+    except Exception as exc:
+        return JSONResponse(content={"items": [], "errors": [f"screener_failed:{exc}"]})
 
 
 @app.post("/api/batch_bars")
@@ -626,47 +1207,50 @@ def daily(code: str, limit: int = 400):
         FROM tail
         ORDER BY date
     """
+    errors: list[str] = []
     try:
         with get_conn() as conn:
             rows = conn.execute(query_with_ma, [code, limit]).fetchall()
-        return JSONResponse(content=rows)
+        return JSONResponse(content={"data": rows, "errors": []})
     except Exception as exc:
+        errors.append(f"daily_query_failed:{exc}")
         try:
             with get_conn() as conn:
                 rows = conn.execute(query_basic, [code, limit]).fetchall()
-            return JSONResponse(content=rows)
+            return JSONResponse(content={"data": rows, "errors": []})
         except Exception as fallback_exc:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "daily_query_failed", "detail": str(fallback_exc)}
-            )
+            errors.append(f"daily_query_fallback_failed:{fallback_exc}")
+            return JSONResponse(content={"data": [], "errors": errors})
 
 
 @app.get("/api/ticker/monthly")
 def monthly(code: str, limit: int = 240):
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            WITH base AS (
-                SELECT
-                    month,
-                    o,
-                    h,
-                    l,
-                    c
-                FROM monthly_bars
-                WHERE code = ?
-                ORDER BY month DESC
-                LIMIT ?
-            )
-            SELECT month, o, h, l, c
-            FROM base
-            ORDER BY month
-            """,
-            [code, limit]
-        ).fetchall()
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                """
+                WITH base AS (
+                    SELECT
+                        month,
+                        o,
+                        h,
+                        l,
+                        c
+                    FROM monthly_bars
+                    WHERE code = ?
+                    ORDER BY month DESC
+                    LIMIT ?
+                )
+                SELECT month, o, h, l, c
+                FROM base
+                ORDER BY month
+                """,
+                [code, limit]
+            ).fetchall()
 
-    return JSONResponse(content=rows)
+        return JSONResponse(content={"data": rows, "errors": []})
+    except Exception as exc:
+        return JSONResponse(content={"data": [], "errors": [f"monthly_query_failed:{exc}"]})
 
 
 @app.get("/api/ticker/boxes")

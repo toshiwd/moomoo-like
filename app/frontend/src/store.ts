@@ -7,6 +7,31 @@ export type Ticker = {
   stage: string;
   score: number;
   reason: string;
+  lastClose?: number | null;
+  chg1D?: number | null;
+  chg1W?: number | null;
+  chg1M?: number | null;
+  chg1Q?: number | null;
+  chg1Y?: number | null;
+  counts?: {
+    up7?: number | null;
+    down7?: number | null;
+    up20?: number | null;
+    down20?: number | null;
+    up60?: number | null;
+    down60?: number | null;
+    up100?: number | null;
+    down100?: number | null;
+  };
+  boxState?: "NONE" | "IN_BOX" | "BREAKOUT_UP" | "BREAKOUT_DOWN";
+  scores?: {
+    upScore?: number | null;
+    downScore?: number | null;
+    overheatUp?: number | null;
+    overheatDown?: number | null;
+  };
+  statusLabel?: string;
+  reasons?: string[];
 };
 
 export type MaTimeframe = "daily" | "weekly" | "monthly";
@@ -76,7 +101,8 @@ type Settings = {
   gridScrollTop: number;
   gridTimeframe: "monthly" | "weekly" | "daily";
   showBoxes: boolean;
-  sortMode: SortMode;
+  sortKey: SortKey;
+  sortDir: SortDir;
 };
 
 type StoreState = {
@@ -101,12 +127,27 @@ type StoreState = {
   setGridScrollTop: (value: number) => void;
   setGridTimeframe: (value: Settings["gridTimeframe"]) => void;
   setShowBoxes: (value: boolean) => void;
-  setSortMode: (value: SortMode) => void;
+  setSortKey: (value: SortKey) => void;
+  setSortDir: (value: SortDir) => void;
   updateMaSetting: (timeframe: MaTimeframe, index: number, patch: Partial<MaSetting>) => void;
   resetMaSettings: (timeframe: MaTimeframe) => void;
 };
 
-export type SortMode = "trend-up" | "trend-down" | "trend-abs" | "exhaustion";
+export type SortKey =
+  | "code"
+  | "name"
+  | "chg1D"
+  | "chg1W"
+  | "chg1M"
+  | "chg1Q"
+  | "chg1Y"
+  | "upScore"
+  | "downScore"
+  | "overheatUp"
+  | "overheatDown"
+  | "boxState";
+
+export type SortDir = "asc" | "desc";
 
 const MA_COLORS = ["#ef4444", "#22c55e", "#3b82f6", "#a855f7", "#f59e0b"];
 const THUMB_BARS = 30;
@@ -278,6 +319,32 @@ const getInitialTimeframe = (): Settings["gridTimeframe"] => {
   return saved === "daily" || saved === "weekly" ? (saved as Settings["gridTimeframe"]) : "monthly";
 };
 
+const getInitialSortKey = (): SortKey => {
+  if (typeof window === "undefined") return "code";
+  const saved = window.localStorage.getItem("sortKey");
+  const options: SortKey[] = [
+    "code",
+    "name",
+    "chg1D",
+    "chg1W",
+    "chg1M",
+    "chg1Q",
+    "chg1Y",
+    "upScore",
+    "downScore",
+    "overheatUp",
+    "overheatDown",
+    "boxState"
+  ];
+  return options.includes(saved as SortKey) ? (saved as SortKey) : "code";
+};
+
+const getInitialSortDir = (): SortDir => {
+  if (typeof window === "undefined") return "asc";
+  const saved = window.localStorage.getItem("sortDir");
+  return saved === "desc" ? "desc" : "asc";
+};
+
 export const useStore = create<StoreState>((set, get) => ({
   tickers: [],
   barsCache: { monthly: {}, weekly: {}, daily: {} },
@@ -296,12 +363,39 @@ export const useStore = create<StoreState>((set, get) => ({
     gridScrollTop: 0,
     gridTimeframe: getInitialTimeframe(),
     showBoxes: true,
-    sortMode: "trend-up"
+    sortKey: getInitialSortKey(),
+    sortDir: getInitialSortDir()
   },
   loadList: async () => {
     if (get().loadingList) return;
     set({ loadingList: true });
     try {
+      const res = await api.get("/screener");
+      const payload = res.data as { items?: Ticker[] } | Ticker[];
+      const items = Array.isArray(payload) ? payload : payload.items ?? [];
+      if (!items.length) {
+        throw new Error("Empty screener payload");
+      }
+      const tickers = items.map((item) => ({
+        code: item.code,
+        name: item.name ?? item.code,
+        stage: item.stage ?? item.statusLabel ?? "UNKNOWN",
+        score: Number.isFinite(item.score) ? item.score : 0,
+        reason: item.reason ?? "",
+        lastClose: item.lastClose ?? null,
+        chg1D: item.chg1D ?? null,
+        chg1W: item.chg1W ?? null,
+        chg1M: item.chg1M ?? null,
+        chg1Q: item.chg1Q ?? null,
+        chg1Y: item.chg1Y ?? null,
+        counts: item.counts,
+        boxState: item.boxState,
+        scores: item.scores,
+        statusLabel: item.statusLabel,
+        reasons: item.reasons
+      }));
+      set({ tickers });
+    } catch {
       const res = await api.get("/list");
       const items = (res.data || []) as [string, string, string, number, string][];
       const tickers = items.map(([code, name, stage, score, reason]) => ({
@@ -528,8 +622,17 @@ export const useStore = create<StoreState>((set, get) => ({
   setShowBoxes: (value) => {
     set((state) => ({ settings: { ...state.settings, showBoxes: value } }));
   },
-  setSortMode: (value) => {
-    set((state) => ({ settings: { ...state.settings, sortMode: value } }));
+  setSortKey: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("sortKey", value);
+    }
+    set((state) => ({ settings: { ...state.settings, sortKey: value } }));
+  },
+  setSortDir: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("sortDir", value);
+    }
+    set((state) => ({ settings: { ...state.settings, sortDir: value } }));
   },
   updateMaSetting: (timeframe, index, patch) => {
     set((state) => {

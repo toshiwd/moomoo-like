@@ -47,6 +47,7 @@ type DetailChartProps = {
     showOverlay: boolean;
     showPnL: boolean;
     hoverTime: number | null;
+    showMarkers?: boolean;
   };
   onCrosshairMove?: (time: number | null) => void;
 };
@@ -455,7 +456,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     <div className="detail-chart-wrapper" ref={wrapperRef}>
       <div className="detail-chart-inner" ref={containerRef} />
       <canvas className="detail-chart-overlay" ref={overlayRef} />
-      {positionOverlay && (positionOverlay.showOverlay || positionOverlay.showPnL) && (
+      {positionOverlay && (
         <PositionOverlay
           candleSeries={overlayTargets.candleSeries}
           dailyPositions={positionOverlay.dailyPositions}
@@ -463,6 +464,9 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           showOverlay={positionOverlay.showOverlay}
           showPnL={positionOverlay.showPnL}
           hoverTime={positionOverlay.hoverTime}
+          showMarkers={positionOverlay.showMarkers}
+          bars={candles}
+          volume={volume}
         />
       )}
     </div>

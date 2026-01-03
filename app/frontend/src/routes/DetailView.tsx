@@ -38,6 +38,16 @@ type FetchState = {
   errorMessage: string | null;
 };
 
+type ApiWarnings = {
+  items: string[];
+  unrecognized_labels?: { count: number; samples: string[] };
+};
+
+type BarsResponse = {
+  data?: number[][];
+  errors?: string[];
+};
+
 const DEFAULT_LIMITS = {
   daily: 2000,
   monthly: 240
@@ -267,8 +277,10 @@ export default function DetailView() {
   const [monthlyData, setMonthlyData] = useState<number[][]>([]);
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [trades, setTrades] = useState<TradeEvent[]>([]);
-  const [tradeWarnings, setTradeWarnings] = useState<string[]>([]);
-  const [tradeError, setTradeError] = useState<string | null>(null);
+  const [tradeWarnings, setTradeWarnings] = useState<ApiWarnings>({ items: [] });
+  const [tradeErrors, setTradeErrors] = useState<string[]>([]);
+  const [dailyErrors, setDailyErrors] = useState<string[]>([]);
+  const [monthlyErrors, setMonthlyErrors] = useState<string[]>([]);
   const [dailyFetch, setDailyFetch] = useState<FetchState>({
     status: "idle",
     responseCount: 0,
@@ -314,20 +326,20 @@ export default function DetailView() {
   useEffect(() => {
     if (!code) return;
     setLoadingDaily(true);
+    setDailyErrors([]);
     setDailyFetch((prev) => ({ ...prev, status: "loading", errorMessage: null }));
     api
       .get("/ticker/daily", { params: { code, limit: dailyLimit } })
       .then((res) => {
-        if (!Array.isArray(res.data)) {
-          throw new Error("JSON parse failed: daily response is not an array");
-        }
-        const rows = res.data as number[][];
+        const { rows, errors } = parseBarsResponse(res.data as BarsResponse | number[][], "daily");
         setDailyData(rows);
+        setDailyErrors(errors);
         setHasMoreDaily(rows.length >= dailyLimit);
         setDailyFetch({ status: "success", responseCount: rows.length, errorMessage: null });
       })
       .catch((error) => {
         const message = error?.message || "Daily fetch failed";
+        setDailyErrors([message]);
         setDailyFetch((prev) => ({
           status: "error",
           responseCount: prev.responseCount,
@@ -340,20 +352,20 @@ export default function DetailView() {
   useEffect(() => {
     if (!code) return;
     setLoadingMonthly(true);
+    setMonthlyErrors([]);
     setMonthlyFetch((prev) => ({ ...prev, status: "loading", errorMessage: null }));
     api
       .get("/ticker/monthly", { params: { code, limit: monthlyLimit } })
       .then((res) => {
-        if (!Array.isArray(res.data)) {
-          throw new Error("JSON parse failed: monthly response is not an array");
-        }
-        const rows = res.data as number[][];
+        const { rows, errors } = parseBarsResponse(res.data as BarsResponse | number[][], "monthly");
         setMonthlyData(rows);
+        setMonthlyErrors(errors);
         setHasMoreMonthly(rows.length >= monthlyLimit);
         setMonthlyFetch({ status: "success", responseCount: rows.length, errorMessage: null });
       })
       .catch((error) => {
         const message = error?.message || "Monthly fetch failed";
+        setMonthlyErrors([message]);
         setMonthlyFetch((prev) => ({
           status: "error",
           responseCount: prev.responseCount,
@@ -378,26 +390,29 @@ export default function DetailView() {
 
   useEffect(() => {
     if (!code) return;
-    setTradeError(null);
+    setTradeErrors([]);
+    setTradeWarnings({ items: [] });
     api
       .get(`/trades/${code}`)
       .then((res) => {
         const payload = res.data as {
           events?: TradeEvent[];
-          warnings?: string[];
+          warnings?: ApiWarnings;
+          errors?: string[];
           currentPosition?: { buyUnits: number; sellUnits: number; text?: string };
         };
         if (!payload || !Array.isArray(payload.events)) {
           throw new Error("Trades response is invalid");
         }
         setTrades(payload.events ?? []);
-        setTradeWarnings(payload.warnings ?? []);
+        setTradeWarnings(normalizeWarnings(payload.warnings));
+        setTradeErrors(Array.isArray(payload.errors) ? payload.errors : []);
       })
       .catch((error) => {
         const message = error?.message || "Trades fetch failed";
-        setTradeError(message);
+        setTradeErrors([message]);
         setTrades([]);
-        setTradeWarnings([]);
+        setTradeWarnings({ items: [] });
       });
   }, [code]);
 
@@ -449,8 +464,8 @@ export default function DetailView() {
   const monthlyHasParsedZero = monthlyParse.stats.parsed === 0 && monthlyParse.stats.total > 0;
 
   const dailyError =
-    dailyFetch.status === "error"
-      ? dailyFetch.errorMessage
+    dailyErrors.length > 0
+      ? dailyErrors[0]
       : dailyHasEmpty
       ? "No data"
       : dailyHasParsedZero
@@ -458,8 +473,8 @@ export default function DetailView() {
       : null;
 
   const monthlyError =
-    monthlyFetch.status === "error"
-      ? monthlyFetch.errorMessage
+    monthlyErrors.length > 0
+      ? monthlyErrors[0]
       : monthlyHasEmpty
       ? "No data"
       : monthlyHasParsedZero
@@ -467,56 +482,38 @@ export default function DetailView() {
       : null;
 
   const weeklyHasEmpty = weeklyCandles.length === 0 && dailyCandles.length > 0;
-  const dailyIssue =
-    dailyFetch.status === "error" ||
-    dailyHasEmpty ||
-    dailyHasParsedZero ||
-    dailyInvalidCount > 0 ||
-    !!tradeError ||
-    tradeWarnings.length > 0;
-  const weeklyIssue = dailyFetch.status === "error" || weeklyHasEmpty;
-  const monthlyIssue =
-    monthlyFetch.status === "error" ||
-    monthlyHasEmpty ||
-    monthlyHasParsedZero ||
-    monthlyInvalidCount > 0;
-  const hasIssues = dailyIssue || weeklyIssue || monthlyIssue;
+  const tradeWarningItems = tradeWarnings.items ?? [];
+  const unrecognizedCount = tradeWarnings.unrecognized_labels?.count ?? 0;
+  const errors = [...dailyErrors, ...monthlyErrors, ...tradeErrors];
+  const otherWarningsCount = tradeWarningItems.length;
+  const hasIssues = errors.length > 0 || unrecognizedCount > 0 || otherWarningsCount > 0;
 
-  const debugMode = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    return new URLSearchParams(window.location.search).get("debug") === "1";
-  }, []);
   const [debugOpen, setDebugOpen] = useState(false);
 
   const debugSummary = useMemo(() => {
     const parts: string[] = [];
-    if (dailyFetch.status === "error") parts.push("Daily fetch error");
+    if (errors.length) parts.push(`Errors ${errors.slice(0, 2).join(", ")}`);
+    if (unrecognizedCount) parts.push(`Unrecognized labels ${unrecognizedCount}`);
+    if (otherWarningsCount) parts.push(`Warnings ${otherWarningsCount}`);
     if (dailyHasEmpty) parts.push("Daily 0 bars");
     if (dailyHasParsedZero) parts.push("Daily parsed 0");
     if (dailyInvalidCount > 0) parts.push(`Daily invalid ${dailyInvalidCount}`);
-    if (weeklyHasEmpty && dailyFetch.status !== "error") parts.push("Weekly 0 bars");
-    if (monthlyFetch.status === "error") parts.push("Monthly fetch error");
+    if (weeklyHasEmpty) parts.push("Weekly 0 bars");
     if (monthlyHasEmpty) parts.push("Monthly 0 bars");
     if (monthlyHasParsedZero) parts.push("Monthly parsed 0");
     if (monthlyInvalidCount > 0) parts.push(`Monthly invalid ${monthlyInvalidCount}`);
-    if (tradeError) parts.push("Trades error");
-    if (tradeWarnings.length) {
-      const preview = tradeWarnings.slice(0, 2).join(", ");
-      parts.push(preview ? `Trades warning: ${preview}` : "Trades warning");
-    }
     return parts;
   }, [
-    dailyFetch.status,
+    errors,
+    unrecognizedCount,
+    otherWarningsCount,
     dailyHasEmpty,
     dailyHasParsedZero,
     dailyInvalidCount,
     weeklyHasEmpty,
-    monthlyFetch.status,
     monthlyHasEmpty,
     monthlyHasParsedZero,
-    monthlyInvalidCount,
-    tradeError,
-    tradeWarnings.length
+    monthlyInvalidCount
   ]);
 
   const dailyMaLines = useMemo(() => {
@@ -629,6 +626,32 @@ export default function DetailView() {
 
   const toggleRange = (months: number) => {
     setRangeMonths((prev) => (prev === months ? null : months));
+  };
+
+  const parseBarsResponse = (payload: BarsResponse | number[][], label: string) => {
+    if (Array.isArray(payload)) {
+      return { rows: payload, errors: [] as string[] };
+    }
+    if (payload && Array.isArray(payload.data)) {
+      return {
+        rows: payload.data,
+        errors: Array.isArray(payload.errors) ? payload.errors : []
+      };
+    }
+    return { rows: [], errors: [`${label}_response_invalid`] };
+  };
+
+  const normalizeWarnings = (value: unknown): ApiWarnings => {
+    if (Array.isArray(value)) return { items: value.filter((item) => typeof item === "string") };
+    if (!value || typeof value !== "object") return { items: [] };
+    const payload = value as ApiWarnings;
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const unrecognized = payload.unrecognized_labels;
+    if (!unrecognized || typeof unrecognized.count !== "number") {
+      return { items };
+    }
+    const samples = Array.isArray(unrecognized.samples) ? unrecognized.samples : [];
+    return { items, unrecognized_labels: { count: unrecognized.count, samples } };
   };
 
   const updateSetting = (timeframe: Timeframe, index: number, patch: Partial<MaSetting>) => {
@@ -761,9 +784,7 @@ export default function DetailView() {
                     showOverlay: showTradesOverlay,
                     showMarkers: true,
                     showPnL: showPnLPanel,
-                    hoverTime,
-                    bars: dailyCandles,
-                    volume: dailyVolume
+                    hoverTime
                   }}
                   onCrosshairMove={handleDailyCrosshair}
                 />
@@ -784,9 +805,7 @@ export default function DetailView() {
                     showOverlay: showTradesOverlay,
                     showMarkers: false,
                     showPnL: showPnLPanel,
-                    hoverTime,
-                    bars: weeklyCandles,
-                    volume: weeklyVolume
+                    hoverTime
                   }}
                   onCrosshairMove={handleWeeklyCrosshair}
                 />
@@ -807,9 +826,7 @@ export default function DetailView() {
                     showOverlay: showTradesOverlay,
                     showMarkers: false,
                     showPnL: showPnLPanel,
-                    hoverTime,
-                    bars: monthlyCandles,
-                    volume: monthlyVolume
+                    hoverTime
                   }}
                   onCrosshairMove={handleMonthlyCrosshair}
                 />
@@ -855,9 +872,7 @@ export default function DetailView() {
                     showOverlay: showTradesOverlay,
                     showMarkers: true,
                     showPnL: showPnLPanel,
-                    hoverTime,
-                    bars: dailyCandles,
-                    volume: dailyVolume
+                    hoverTime
                   }}
                   onCrosshairMove={handleDailyCrosshair}
                 />
@@ -945,18 +960,14 @@ export default function DetailView() {
           Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
         </div>
       </div>
-      {(hasIssues || debugMode) && (
-        <div className={`detail-debug-banner ${hasIssues ? "warning" : "info"}`}>
+      {hasIssues && (
+        <div className="detail-debug-banner warning">
           <button
             type="button"
             className="detail-debug-toggle"
             onClick={() => setDebugOpen((prev) => !prev)}
           >
-            {hasIssues
-              ? `Data issue detected${
-                  debugSummary.length ? ` (${debugSummary.join(", ")})` : ""
-                }`
-              : "Show debug info"}
+            {`Data issue detected${debugSummary.length ? ` (${debugSummary.join(", ")})` : ""}`}
           </button>
           {debugOpen && (
             <div className="detail-debug-panel">
@@ -980,8 +991,17 @@ export default function DetailView() {
                 <div>
                   Monthly({monthlyFetch.status}) API {monthlyFetch.responseCount} | Parsed {monthlyParse.stats.parsed} | Range {monthlyRangeCount} | InvalidRow {monthlyParse.stats.invalidRow} | InvalidTime {monthlyParse.stats.invalidTime} | InvalidValue {monthlyParse.stats.invalidValue} | Error {monthlyError ?? "-"}
                 </div>
-                {tradeWarnings.length > 0 && (
-                  <div>Trades warnings: {tradeWarnings.slice(0, 5).join(", ")}</div>
+                {tradeWarningItems.length > 0 && (
+                  <div>Trades warnings: {tradeWarningItems.slice(0, 5).join(", ")}</div>
+                )}
+                {tradeWarnings.unrecognized_labels && (
+                  <div>
+                    Unrecognized labels {tradeWarnings.unrecognized_labels.count} samples:{" "}
+                    {tradeWarnings.unrecognized_labels.samples.join(", ")}
+                  </div>
+                )}
+                {tradeErrors.length > 0 && (
+                  <div>Trades errors: {tradeErrors.slice(0, 3).join(", ")}</div>
                 )}
               </div>
             </div>

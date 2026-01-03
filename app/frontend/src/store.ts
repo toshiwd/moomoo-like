@@ -38,6 +38,8 @@ export type Ticker = {
   reasons?: string[];
 };
 
+type GridTimeframe = "monthly" | "weekly" | "daily";
+
 export type MaTimeframe = "daily" | "weekly" | "monthly";
 
 export type MaSetting = {
@@ -103,7 +105,7 @@ type Settings = {
   columns: 2 | 3 | 4;
   search: string;
   gridScrollTop: number;
-  gridTimeframe: "monthly" | "weekly" | "daily";
+  gridTimeframe: GridTimeframe;
   showBoxes: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
@@ -126,12 +128,17 @@ type StoreState = {
   replaceFavorites: (codes: string[]) => void;
   setFavoriteLocal: (code: string, isFavorite: boolean) => void;
   loadBarsBatch: (
-    timeframe: Settings["gridTimeframe"],
+    timeframe: GridTimeframe,
     codes: string[],
-    limitOverride?: number
+    limitOverride?: number,
+    reason?: string
   ) => Promise<void>;
   loadBoxesBatch: (codes: string[]) => Promise<void>;
-  ensureBarsForVisible: (timeframe: Settings["gridTimeframe"], codes: string[]) => Promise<void>;
+  ensureBarsForVisible: (
+    timeframe: GridTimeframe,
+    codes: string[],
+    reason?: string
+  ) => Promise<void>;
   setColumns: (columns: Settings["columns"]) => void;
   setSearch: (search: string) => void;
   setGridScrollTop: (value: number) => void;
@@ -168,6 +175,23 @@ const THUMB_BARS = 60;
 const MIN_BATCH_LIMIT = 60;
 const MAX_BATCH_LIMIT = 2000;
 const WEEKLY_DAILY_FACTOR = 7;
+const BATCH_TTL_MS = 60_000;
+const inFlightBatchRequests = new Map<
+  string,
+  { promise: Promise<void>; controller: AbortController }
+>();
+const recentBatchRequests = new Map<string, number>();
+const lastEnsureKeyByTimeframe: Record<GridTimeframe, string | null> = {
+  monthly: null,
+  weekly: null,
+  daily: null
+};
+const barsFetchedLimit: Record<GridTimeframe, Record<string, number>> = {
+  monthly: {},
+  weekly: {},
+  daily: {}
+};
+let batchRequestCount = 0;
 const DEFAULT_PERIODS: Record<MaTimeframe, number[]> = {
   daily: [3, 10, 20, 60, 100],
   weekly: [3, 10, 20, 60, 100],
@@ -183,6 +207,40 @@ const makeDefaultSettings = (timeframe: MaTimeframe): MaSetting[] =>
     color: MA_COLORS[index] ?? "#94a3b8",
     lineWidth: 1
   }));
+
+const buildBatchKey = (timeframe: GridTimeframe, limit: number, codes: string[]) => {
+  const sorted = [...new Set(codes.filter((code) => code))].sort();
+  return `${timeframe}|${limit}|${sorted.join(",")}`;
+};
+
+const isAbortError = (error: unknown) => {
+  if (!error || typeof error !== "object") return false;
+  const err = error as { name?: string; code?: string };
+  return err.name === "CanceledError" || err.code === "ERR_CANCELED";
+};
+
+const markFetchedLimit = (timeframe: GridTimeframe, code: string, limit: number) => {
+  const current = barsFetchedLimit[timeframe][code] ?? 0;
+  barsFetchedLimit[timeframe][code] = Math.max(current, limit);
+};
+
+const getFetchedLimit = (timeframe: GridTimeframe, code: string) =>
+  barsFetchedLimit[timeframe][code] ?? 0;
+
+const abortInFlightForTimeframe = (timeframe: GridTimeframe) => {
+  const keysToAbort: string[] = [];
+  for (const key of inFlightBatchRequests.keys()) {
+    if (key.startsWith(`${timeframe}|`)) {
+      keysToAbort.push(key);
+    }
+  }
+  keysToAbort.forEach((key) => {
+    const entry = inFlightBatchRequests.get(key);
+    if (!entry) return;
+    entry.controller.abort();
+    inFlightBatchRequests.delete(key);
+  });
+};
 
 const normalizeColor = (value: unknown, fallback: string) => {
   if (typeof value !== "string") return fallback;
@@ -470,10 +528,11 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ loadingList: false });
     }
   },
-  loadBarsBatch: async (timeframe, codes, limitOverride) => {
+  loadBarsBatch: async (timeframe, codes, limitOverride, reason) => {
     const state = get();
     const loadingMap = state.barsLoading[timeframe];
-    const trimmed = codes.filter((code) => !loadingMap[code]);
+    const uniqueCodes = [...new Set(codes.filter((code) => code))];
+    const trimmed = uniqueCodes.filter((code) => !loadingMap[code]);
     if (!trimmed.length) return;
 
     if (timeframe === "weekly") {
@@ -481,6 +540,8 @@ export const useStore = create<StoreState>((set, get) => ({
         limitOverride ?? 0,
         getDailyLimitForWeekly(get().maSettings.weekly)
       );
+      const weeklyRequired = getRequiredBars(get().maSettings.weekly);
+      const reasonLabel = reason ? `${reason}:weekly` : "weekly";
       try {
         const dailyCache = get().barsCache.daily;
         const dailyMissing = trimmed.filter((code) => {
@@ -488,7 +549,7 @@ export const useStore = create<StoreState>((set, get) => ({
           return !payload || payload.bars.length < dailyLimit;
         });
         if (dailyMissing.length) {
-          await get().loadBarsBatch("daily", dailyMissing, dailyLimit);
+          await get().loadBarsBatch("daily", dailyMissing, dailyLimit, reasonLabel);
         }
       } catch (error) {
         set((prev) => ({
@@ -517,6 +578,7 @@ export const useStore = create<StoreState>((set, get) => ({
           };
           weeklyBoxes[code] = prev.boxesCache.daily[code] ?? [];
         });
+        trimmed.forEach((code) => markFetchedLimit("weekly", code, weeklyRequired));
         return {
           barsCache: {
             ...prev.barsCache,
@@ -542,97 +604,133 @@ export const useStore = create<StoreState>((set, get) => ({
       return;
     }
 
-    const nextLoading = { ...state.barsLoading[timeframe] };
-    trimmed.forEach((code) => {
-      nextLoading[code] = true;
-    });
-    set({
-      barsLoading: { ...state.barsLoading, [timeframe]: nextLoading },
-      barsStatus: {
-        ...state.barsStatus,
-        [timeframe]: {
-          ...state.barsStatus[timeframe],
-          ...trimmed.reduce((acc, code) => {
-            acc[code] = "loading";
-            return acc;
-          }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
-        }
-      }
+    const maSettings =
+      timeframe === "daily" ? get().maSettings.daily : get().maSettings.monthly;
+    const limit = Math.max(limitOverride ?? 0, getRequiredBars(maSettings));
+    const requestCodes = [...new Set(trimmed)].sort();
+    const requestKey = buildBatchKey(timeframe, limit, requestCodes);
+    const cachedAt = recentBatchRequests.get(requestKey);
+    if (cachedAt && Date.now() - cachedAt < BATCH_TTL_MS) return;
+
+    const inFlight = inFlightBatchRequests.get(requestKey);
+    if (inFlight) return inFlight.promise;
+
+    batchRequestCount += 1;
+    console.debug("[batch_bars]", {
+      count: batchRequestCount,
+      key: requestKey,
+      reason: reason ?? "unknown",
+      timeframe,
+      limit,
+      codes: requestCodes.length
     });
 
-    try {
-      const maSettings =
-        timeframe === "daily" ? get().maSettings.daily : get().maSettings.monthly;
-      const limit = Math.max(limitOverride ?? 0, getRequiredBars(maSettings));
-      const payload = { url: "/api/batch_bars", timeframe, codes: trimmed, limit };
-      console.debug("[batch_bars] request", payload);
-      const res = await api.post("/batch_bars", {
-        timeframe,
-        codes: trimmed,
-        limit
-      });
-      console.debug("[batch_bars] response", res.status, res.data);
-      if (res.status !== 200) {
-        throw new Error(`batch_bars failed with status ${res.status}`);
-      }
-      const items = (res.data?.items || {}) as Record<string, BarsPayload>;
-      const boxesMonthly: Record<string, Box[]> = {};
-      const boxesDaily: Record<string, Box[]> = {};
-      Object.entries(items).forEach(([code, payload]) => {
-        const boxes = payload.boxes ?? [];
-        boxesMonthly[code] = boxes;
-        boxesDaily[code] = boxes;
-      });
-      set((prev) => ({
-        barsCache: {
-          ...prev.barsCache,
-          [timeframe]: { ...prev.barsCache[timeframe], ...items }
-        },
-        boxesCache: {
-          monthly: { ...prev.boxesCache.monthly, ...boxesMonthly },
-          daily: { ...prev.boxesCache.daily, ...boxesDaily }
-        },
-        barsStatus: {
-          ...prev.barsStatus,
-          [timeframe]: {
-            ...prev.barsStatus[timeframe],
-            ...trimmed.reduce((acc, code) => {
-              const payload = items[code];
-              acc[code] = payload && payload.bars.length ? "success" : "empty";
-              return acc;
-            }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
-          }
-        }
-      }));
-    } catch (error) {
-      set((prev) => ({
-        barsStatus: {
-          ...prev.barsStatus,
-          [timeframe]: {
-            ...prev.barsStatus[timeframe],
-            ...trimmed.reduce((acc, code) => {
-              acc[code] = "error";
-              return acc;
-            }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
-          }
-        }
-      }));
-      throw error;
-    } finally {
+    const controller = new AbortController();
+    const requestPromise = (async () => {
       set((prev) => {
-        const cleared = { ...prev.barsLoading[timeframe] };
-        trimmed.forEach((code) => {
-          delete cleared[code];
+        const nextLoading = { ...prev.barsLoading[timeframe] };
+        requestCodes.forEach((code) => {
+          nextLoading[code] = true;
         });
-        return { barsLoading: { ...prev.barsLoading, [timeframe]: cleared } };
+        return {
+          barsLoading: { ...prev.barsLoading, [timeframe]: nextLoading },
+          barsStatus: {
+            ...prev.barsStatus,
+            [timeframe]: {
+              ...prev.barsStatus[timeframe],
+              ...requestCodes.reduce((acc, code) => {
+                acc[code] = "loading";
+                return acc;
+              }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
+            }
+          }
+        };
       });
-    }
+
+      try {
+        const res = await api.post(
+          "/batch_bars",
+          {
+            timeframe,
+            codes: requestCodes,
+            limit
+          },
+          { signal: controller.signal }
+        );
+        if (res.status !== 200) {
+          throw new Error(`batch_bars failed with status ${res.status}`);
+        }
+        const items = (res.data?.items || {}) as Record<string, BarsPayload>;
+        const boxesMonthly: Record<string, Box[]> = {};
+        const boxesDaily: Record<string, Box[]> = {};
+        Object.entries(items).forEach(([code, payload]) => {
+          const boxes = payload.boxes ?? [];
+          boxesMonthly[code] = boxes;
+          boxesDaily[code] = boxes;
+        });
+        requestCodes.forEach((code) => markFetchedLimit(timeframe, code, limit));
+        recentBatchRequests.set(requestKey, Date.now());
+        set((prev) => ({
+          barsCache: {
+            ...prev.barsCache,
+            [timeframe]: { ...prev.barsCache[timeframe], ...items }
+          },
+          boxesCache: {
+            monthly: { ...prev.boxesCache.monthly, ...boxesMonthly },
+            daily: { ...prev.boxesCache.daily, ...boxesDaily }
+          },
+          barsStatus: {
+            ...prev.barsStatus,
+            [timeframe]: {
+              ...prev.barsStatus[timeframe],
+              ...requestCodes.reduce((acc, code) => {
+                const payload = items[code];
+                acc[code] = payload && payload.bars.length ? "success" : "empty";
+                return acc;
+              }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
+            }
+          }
+        }));
+      } catch (error) {
+        if (isAbortError(error)) return;
+        set((prev) => ({
+          barsStatus: {
+            ...prev.barsStatus,
+            [timeframe]: {
+              ...prev.barsStatus[timeframe],
+              ...requestCodes.reduce((acc, code) => {
+                acc[code] = "error";
+                return acc;
+              }, {} as Record<string, "idle" | "loading" | "success" | "empty" | "error">)
+            }
+          }
+        }));
+        throw error;
+      } finally {
+        set((prev) => {
+          const cleared = { ...prev.barsLoading[timeframe] };
+          requestCodes.forEach((code) => {
+            delete cleared[code];
+          });
+          return { barsLoading: { ...prev.barsLoading, [timeframe]: cleared } };
+        });
+      }
+    })();
+
+    inFlightBatchRequests.set(requestKey, { promise: requestPromise, controller });
+    requestPromise.finally(() => {
+      const entry = inFlightBatchRequests.get(requestKey);
+      if (entry?.controller === controller) {
+        inFlightBatchRequests.delete(requestKey);
+      }
+    });
+    return requestPromise;
   },
   loadBoxesBatch: async (codes) => {
     if (!codes.length) return;
-    await get().loadBarsBatch("monthly", codes);
+    await get().loadBarsBatch("monthly", codes, undefined, "boxes");
   },
-  ensureBarsForVisible: async (timeframe, codes) => {
+  ensureBarsForVisible: async (timeframe, codes, reason) => {
     const state = get();
     const cache = state.barsCache[timeframe];
     const maSettings = state.maSettings;
@@ -644,13 +742,19 @@ export const useStore = create<StoreState>((set, get) => ({
         : getRequiredBars(maSettings.monthly);
     const dailyLimitForWeekly =
       timeframe === "weekly" ? getDailyLimitForWeekly(maSettings.weekly) : null;
-    const missing = codes.filter((code) => {
+    const uniqueCodes = [...new Set(codes.filter((code) => code))];
+    const listKey = buildBatchKey(timeframe, requiredBars, uniqueCodes);
+    if (lastEnsureKeyByTimeframe[timeframe] !== listKey) {
+      abortInFlightForTimeframe(timeframe);
+      lastEnsureKeyByTimeframe[timeframe] = listKey;
+    }
+    const missing = uniqueCodes.filter((code) => {
       const payload = cache[code];
-      if (!payload) return true;
-      if (timeframe === "weekly") {
-        return payload.bars.length < requiredBars;
-      }
-      return payload.bars.length < requiredBars;
+      const fetchedLimit = getFetchedLimit(timeframe, code);
+      if (!payload) return fetchedLimit < requiredBars;
+      if (payload.bars.length >= requiredBars) return false;
+      if (fetchedLimit >= requiredBars) return false;
+      return true;
     });
     if (!missing.length) return;
 
@@ -660,7 +764,8 @@ export const useStore = create<StoreState>((set, get) => ({
       await get().loadBarsBatch(
         timeframe,
         batch,
-        timeframe === "weekly" ? dailyLimitForWeekly ?? undefined : requiredBars
+        timeframe === "weekly" ? dailyLimitForWeekly ?? undefined : requiredBars,
+        reason
       );
     }
   },

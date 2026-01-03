@@ -316,13 +316,13 @@ export default function GridView() {
     }
     lastVisibleCodesRef.current = codes;
     lastVisibleRangeRef.current = { start, stop };
-    ensureBarsForVisible(gridTimeframe, codes);
+    ensureBarsForVisible(gridTimeframe, codes, "scroll");
   };
 
   useEffect(() => {
     if (!backendReady) return;
     if (!lastVisibleCodesRef.current.length) return;
-    ensureBarsForVisible(gridTimeframe, lastVisibleCodesRef.current);
+    ensureBarsForVisible(gridTimeframe, lastVisibleCodesRef.current, "timeframe-change");
   }, [backendReady, gridTimeframe, maSettings, ensureBarsForVisible]);
 
   useEffect(() => {
@@ -335,7 +335,7 @@ export default function GridView() {
       if (item) codes.push(item.ticker.code);
     }
     if (!codes.length) return;
-    ensureBarsForVisible(gridTimeframe, codes);
+    ensureBarsForVisible(gridTimeframe, codes, "sort-change");
   }, [backendReady, sortedTickers, gridTimeframe, ensureBarsForVisible]);
 
   const itemKey = useCallback(

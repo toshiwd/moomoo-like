@@ -9,6 +9,8 @@ type BackendReadyState = {
   message: string;
   error: string | null;
   errorDetails: string | null;
+  attemptCount: number;
+  elapsedMs: number;
   retry: () => void;
 };
 
@@ -16,6 +18,8 @@ const BackendReadyContext = createContext<BackendReadyState | null>(null);
 
 const BACKOFF_STEPS = [200, 500, 1000];
 const ERROR_THRESHOLD = 5;
+const ERROR_GRACE_MS = 60000;
+const HEALTH_TIMEOUT_MS = 5000;
 
 const getDefaultMessage = (phase: string) => {
   if (phase === "ingesting") return "データ準備中";
@@ -28,11 +32,14 @@ const useBackendReadyInternal = (): BackendReadyState => {
   const [message, setMessage] = useState(getDefaultMessage("starting"));
   const [error, setError] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
+  const [attemptCount, setAttemptCount] = useState(0);
+  const [elapsedMs, setElapsedMs] = useState(0);
   const attemptRef = useRef(0);
   const failureRef = useRef(0);
   const timerRef = useRef<number | null>(null);
   const inFlightRef = useRef(false);
   const readyRef = useRef(false);
+  const startRef = useRef(Date.now());
 
   const clearTimer = () => {
     if (timerRef.current !== null) {
@@ -59,9 +66,10 @@ const useBackendReadyInternal = (): BackendReadyState => {
     if (readyRef.current || inFlightRef.current) return;
     inFlightRef.current = true;
     attemptRef.current += 1;
+    setAttemptCount(attemptRef.current);
     try {
       const res = await api.get("/health", {
-        timeout: 2000,
+        timeout: HEALTH_TIMEOUT_MS,
         validateStatus: () => true
       });
       const data = res.data as {
@@ -94,7 +102,10 @@ const useBackendReadyInternal = (): BackendReadyState => {
 
       failureRef.current += 1;
       setNotReadyState(nextPhase, nextMessage);
-      if (failureRef.current >= ERROR_THRESHOLD) {
+      if (
+        failureRef.current >= ERROR_THRESHOLD &&
+        Date.now() - startRef.current >= ERROR_GRACE_MS
+      ) {
         setError("起動に失敗しました。");
         const details = data?.errors?.length ? data.errors.join("\n") : `status:${res.status}`;
         setErrorDetails(details);
@@ -107,7 +118,10 @@ const useBackendReadyInternal = (): BackendReadyState => {
       scheduleNext();
     } catch (err) {
       failureRef.current += 1;
-      if (failureRef.current >= ERROR_THRESHOLD) {
+      if (
+        failureRef.current >= ERROR_THRESHOLD &&
+        Date.now() - startRef.current >= ERROR_GRACE_MS
+      ) {
         const detail = err instanceof Error ? err.message : String(err);
         setError("起動に失敗しました。");
         setErrorDetails(detail);
@@ -129,6 +143,9 @@ const useBackendReadyInternal = (): BackendReadyState => {
     setErrorDetails(null);
     setNotReadyState("starting", getDefaultMessage("starting"));
     readyRef.current = false;
+    startRef.current = Date.now();
+    setAttemptCount(0);
+    setElapsedMs(0);
     clearTimer();
     void probe();
   };
@@ -138,7 +155,15 @@ const useBackendReadyInternal = (): BackendReadyState => {
     return () => clearTimer();
   }, []);
 
-  return { ready, phase, message, error, errorDetails, retry };
+  useEffect(() => {
+    if (ready) return;
+    const timer = window.setInterval(() => {
+      setElapsedMs(Date.now() - startRef.current);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [ready]);
+
+  return { ready, phase, message, error, errorDetails, attemptCount, elapsedMs, retry };
 };
 
 export function BackendReadyProvider({ children }: { children: ReactNode }) {
@@ -166,6 +191,8 @@ export function BackendReadyProvider({ children }: { children: ReactNode }) {
           subtitle={state.message}
           error={state.error}
           errorDetails={state.errorDetails}
+          attemptCount={state.attemptCount}
+          elapsedMs={state.elapsedMs}
           onRetry={state.retry}
         />
       )}
@@ -182,6 +209,8 @@ export function useBackendReadyState() {
       message: "準備完了",
       error: null,
       errorDetails: null,
+      attemptCount: 0,
+      elapsedMs: 0,
       retry: () => undefined
     } satisfies BackendReadyState;
   }

@@ -1,30 +1,29 @@
-Option Explicit
+﻿Option Explicit
 
 '============================================================
-' export_pan.vbs  (Pan ActiveMarket から TXT 書き出し)
+' export_pan.vbs (Pan ActiveMarket -> TXT)
 '
-' 出力形式（1行）:
+' Output line:
 '   code,YYYY/MM/DD,Open,High,Low,Close,Volume
 '
-' 重要:
-'   ActiveMarket が 32bit COM の環境が多いので、
-'   64bit WSH で起動された場合は SysWOW64 の cscript に自己リランチする。
+' Behavior:
+' - Fast incremental append using manifest (no full scan)
+' - Detect split/adjustment change (suspect) and skip append
 '============================================================
 
-' ===== Progress =====
 Const PROGRESS_INTERVAL = 500
+Const ADJUST_DIFF_THRESHOLD = 0.005
+Const ABS_DIFF_THRESHOLD = 0.01
+Const COM_CREATE_RETRY_COUNT = 15
+Const COM_CREATE_RETRY_SLEEP_MS = 1000
+Const USE_ADJUSTED_PRICE = True
+Const MANIFEST_NAME = "_manifest.csv"
+Const SPLIT_SUSPECTS_NAME = "_split_suspects.csv"
+Const TAIL_READ_BYTES = 4096
 
-' ===== FileSystemObject constants =====
 Const ForReading   = 1
 Const ForWriting   = 2
 Const ForAppending = 8
-
-' ===== Retry settings =====
-Const COM_CREATE_RETRY_COUNT = 15
-Const COM_CREATE_RETRY_SLEEP_MS = 1000
-
-' ===== Adjusted price switch =====
-Const USE_ADJUSTED_PRICE = True   ' True=調整後を試す / False=未調整のまま
 
 Dim fso
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -32,22 +31,26 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 Call Main()
 
 Sub Main()
-
     Ensure32BitCscriptHostOrRelaunch
 
     Dim baseFolder, codesFile, outFolder
     Dim cal, prices
     Dim tsCodes
-    Dim totalCount, okCount, errCount
+    Dim totalCount, okCount, errCount, splitCount
     Dim sLine, code
+    Dim manifestPath, splitPath
+    Dim manifest
 
     totalCount = 0
-    okCount    = 0
-    errCount   = 0
+    okCount = 0
+    errCount = 0
+    splitCount = 0
 
     baseFolder = fso.GetParentFolderName(WScript.ScriptFullName)
-    codesFile  = baseFolder & "\code.txt"
-    outFolder  = baseFolder & "\txt"
+    codesFile = baseFolder & "\code.txt"
+    outFolder = fso.GetAbsolutePathName(baseFolder & "\..\data\txt")
+    manifestPath = outFolder & "\" & MANIFEST_NAME
+    splitPath = outFolder & "\" & SPLIT_SUSPECTS_NAME
 
     If Not fso.FileExists(codesFile) Then
         SafeOut "ERROR: code.txt not found: " & codesFile
@@ -70,6 +73,7 @@ Sub Main()
         WScript.Quit 1
     End If
 
+    Set manifest = LoadManifest(manifestPath)
     Set tsCodes = fso.OpenTextFile(codesFile, ForReading, False)
 
     SafeOut "=== Pan Export Start ==="
@@ -79,50 +83,53 @@ Sub Main()
     SafeOut "HOST : " & WScript.FullName
 
     Do While Not tsCodes.AtEndOfStream
-
         sLine = Trim(RemoveBOM(tsCodes.ReadLine))
-
         If Len(sLine) > 0 Then
             If Left(sLine, 1) <> "#" And Left(sLine, 1) <> "'" Then
-
                 code = NormalizeCode(sLine)
-
                 If Len(code) > 0 Then
                     totalCount = totalCount + 1
-
-                    If ExportOneCode_Incremental(code, outFolder, cal, prices) Then
+                    Dim splitSuspected
+                    splitSuspected = False
+                    If ExportOneCode_Incremental(code, outFolder, cal, prices, manifest, splitPath, splitSuspected) Then
                         okCount = okCount + 1
                     Else
-                        errCount = errCount + 1
+                        If splitSuspected Then
+                            splitCount = splitCount + 1
+                        Else
+                            errCount = errCount + 1
+                        End If
                     End If
                 End If
-
             End If
         End If
-
     Loop
 
     tsCodes.Close
+    SaveManifest manifestPath, manifest
 
     SafeOut "=== Pan Export Done ==="
     SafeOut "TOTAL: " & totalCount
     SafeOut "OK   : " & okCount
     SafeOut "ERR  : " & errCount
+    SafeOut "SPLIT_SUSPECT: " & splitCount
+    SafeOut "SUMMARY: total=" & totalCount & " ok=" & okCount & " err=" & errCount & " split=" & splitCount
 
     If errCount > 0 Then
+        SafeOut "WARN: errors detected"
+    End If
+
+    If errCount > 0 And okCount = 0 Then
         WScript.Quit 2
     Else
         WScript.Quit 0
     End If
-
 End Sub
 
-
 '============================================================
-' 32bit cscript を強制（64bit OS で System32 側 WSH の場合は SysWOW64 に寄せる）
+' 32-bit cscript check (relaunch if needed)
 '============================================================
 Sub Ensure32BitCscriptHostOrRelaunch()
-
     Dim shell, env, sysRoot, hostPath
     Dim is64OS, isCscript, isSystem32Host
     Dim targetCscript, cmd, i
@@ -142,7 +149,6 @@ Sub Ensure32BitCscriptHostOrRelaunch()
 
     isSystem32Host = (InStr(hostPath, "\system32\") > 0)
 
-    ' 64bit OS かつ System32 側で動いていたら、SysWOW64 cscript に委譲
     If is64OS And isSystem32Host Then
         targetCscript = sysRoot & "\SysWOW64\cscript.exe"
         If fso.FileExists(targetCscript) Then
@@ -157,7 +163,6 @@ Sub Ensure32BitCscriptHostOrRelaunch()
         End If
     End If
 
-    ' wscript などで起動されていたら cscript に寄せる（bit数は上の分岐で寄せ済みのはず）
     If Not isCscript Then
         targetCscript = sysRoot & "\SysWOW64\cscript.exe"
         If Not fso.FileExists(targetCscript) Then
@@ -174,49 +179,35 @@ Sub Ensure32BitCscriptHostOrRelaunch()
         shell.Run cmd, 1, True
         WScript.Quit 0
     End If
-
 End Sub
 
-
 '============================================================
-' ActiveMarket オブジェクト生成（リトライ）
+' ActiveMarket objects
 '============================================================
 Function CreateActiveMarketObjectsWithRetry(ByRef cal, ByRef prices)
-
     Dim i
     CreateActiveMarketObjectsWithRetry = False
-
     For i = 1 To COM_CREATE_RETRY_COUNT
-
         On Error Resume Next
         Err.Clear
-
         Set cal = Nothing
         Set prices = Nothing
-
         Set cal = CreateObjectByCandidates(Array("ActiveMarket.Calendar", "ActiveMarket.Calendar.1"))
         Set prices = CreateObjectByCandidates(Array("ActiveMarket.Prices", "ActiveMarket.Prices.1"))
-
         If (Err.Number = 0) And (Not cal Is Nothing) And (Not prices Is Nothing) Then
             CreateActiveMarketObjectsWithRetry = True
             On Error GoTo 0
             Exit Function
         End If
-
         Err.Clear
         On Error GoTo 0
-
         WScript.Sleep COM_CREATE_RETRY_SLEEP_MS
     Next
-
 End Function
 
-
 Function CreateObjectByCandidates(ByVal progIds)
-
     Dim i, obj
     Set obj = Nothing
-
     On Error Resume Next
     For i = LBound(progIds) To UBound(progIds)
         Err.Clear
@@ -227,57 +218,50 @@ Function CreateObjectByCandidates(ByVal progIds)
         Set obj = Nothing
     Next
     On Error GoTo 0
-
     Set CreateObjectByCandidates = obj
-
 End Function
 
-
 '============================================================
-' 調整後価格モードを有効化（存在しない環境でも落とさない）
+' Adjusted price
 '============================================================
 Sub ConfigureAdjustedPriceIfAvailable(ByRef prices, ByVal code)
-
     If Not USE_ADJUSTED_PRICE Then Exit Sub
-
     On Error Resume Next
     Err.Clear
-
-    ' まず代表候補：AdjustExRights
     prices.AdjustExRights = True
     If Err.Number <> 0 Then
         Err.Clear
         prices.AdjustExRights = 1
     End If
-
     If Err.Number <> 0 Then
-        ' 環境差の可能性があるので、ここで落とさず警告だけ出してRAW続行
         SafeOut "WARN : " & code & " : AdjustExRights not supported -> continue RAW"
         Err.Clear
     End If
-
     On Error GoTo 0
-
 End Sub
-
 
 '============================================================
 ' Export 1 code incrementally
 '============================================================
-Function ExportOneCode_Incremental(ByVal code, ByVal outFolder, ByRef cal, ByRef prices)
-
+Function ExportOneCode_Incremental(ByVal code, ByVal outFolder, ByRef cal, ByRef prices, ByRef manifest, ByVal splitPath, ByRef splitSuspected)
     Dim beginPos, endPos, pos
     Dim rawName, safeName, outPath
-    Dim canAppend, lastDate
-    Dim tsOut
+    Dim canAppend, lastDate, lastDateStr, lastClose
+    Dim firstDate, firstClose
     Dim d, o, h, l, c, v
     Dim sDate, outLine
-    Dim writtenCount
+    Dim writtenCount, lastWrittenDate
+    Dim panFirstDate, panFirstClose
+    Dim splitReason
 
     ExportOneCode_Incremental = False
+    splitSuspected = False
     writtenCount = 0
-    canAppend = False
+    lastWrittenDate = ""
     lastDate = Empty
+    lastDateStr = ""
+    firstDate = ""
+    firstClose = ""
 
     SafeOut "START: " & code
 
@@ -331,90 +315,292 @@ Function ExportOneCode_Incremental(ByVal code, ByVal outFolder, ByRef cal, ByRef
     outPath = outFolder & "\" & code & "_" & safeName & ".txt"
 
     If fso.FileExists(outPath) Then
-        canAppend = True
-        lastDate = GetLastDateFromCsv(outPath)
-
-        On Error Resume Next
-        Err.Clear
-        Set tsOut = fso.OpenTextFile(outPath, ForAppending, True)
-        If Err.Number <> 0 Then
-            SafeOut "ERROR: " & code & " : open append failed : " & Err.Description
-            Err.Clear
-            On Error GoTo 0
+        If Not GetFirstRowInfo(outPath, firstDate, firstClose) Then
+            SafeOut "ERROR: " & code & " : read first line failed"
             Exit Function
         End If
-        On Error GoTo 0
-    Else
-        canAppend = False
 
+        panFirstDate = ""
+        panFirstClose = 0
         On Error Resume Next
         Err.Clear
-        Set tsOut = fso.OpenTextFile(outPath, ForWriting, True)
-        If Err.Number <> 0 Then
-            SafeOut "ERROR: " & code & " : open write failed : " & Err.Description
-            Err.Clear
-            On Error GoTo 0
+        d = cal.Date(beginPos)
+        If Err.Number = 0 Then
+            panFirstDate = FormatYYYYMMDD(d)
+            panFirstClose = ToDouble(prices.Close(beginPos))
+        End If
+        Err.Clear
+        On Error GoTo 0
+
+        splitReason = ""
+        If IsSplitSuspect(firstDate, firstClose, panFirstDate, panFirstClose, splitReason) Then
+            splitSuspected = True
+            AppendSplitSuspect splitPath, code, firstDate, firstClose, panFirstDate, panFirstClose, splitReason
+            SafeOut "SPLIT : " & code & " : " & splitReason
             Exit Function
         End If
-        On Error GoTo 0
     End If
 
-    For pos = beginPos To endPos
+    If fso.FileExists(outPath) Then
+        If manifest.Exists(code) Then
+            Dim rec
+            Set rec = manifest(code)
+            If rec.Exists("lastDate") Then lastDateStr = CStr(rec("lastDate"))
+            If rec.Exists("firstDate") And Len(firstDate) = 0 Then firstDate = CStr(rec("firstDate"))
+            If rec.Exists("firstClose") And Len(firstClose) = 0 Then firstClose = CStr(rec("firstClose"))
+        End If
 
+        If Len(lastDateStr) = 0 Then
+            If Not ReadLastRowDateFast(outPath, lastDateStr, lastClose) Then
+                SafeOut "ERROR: " & code & " : last date not found"
+                Exit Function
+            End If
+        End If
+
+        lastDate = ParseYYYYMMDDToDate(lastDateStr)
+        If Not IsDate(lastDate) Then
+            SafeOut "ERROR: " & code & " : invalid last date"
+            Exit Function
+        End If
+        canAppend = True
+    Else
+        canAppend = False
+    End If
+
+    Dim tsOut
+    On Error Resume Next
+    Err.Clear
+    If canAppend Then
+        Set tsOut = fso.OpenTextFile(outPath, ForAppending, True)
+    Else
+        Set tsOut = fso.OpenTextFile(outPath, ForWriting, True)
+    End If
+    If Err.Number <> 0 Then
+        SafeOut "ERROR: " & code & " : open write failed : " & Err.Description
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    For pos = beginPos To endPos
         On Error Resume Next
         Err.Clear
-
         If Not prices.IsClosed(pos) Then
-
             d = cal.Date(pos)
             If Err.Number = 0 Then
-
                 If (Not canAppend) Or IsEmpty(lastDate) Or (CDate(d) > CDate(lastDate)) Then
-
                     o = prices.Open(pos)
                     h = prices.High(pos)
                     l = prices.Low(pos)
                     c = prices.Close(pos)
                     v = prices.Volume(pos)
 
-                    sDate = Right("0000" & CStr(Year(d)), 4) & "/" & _
-                            Right("0" & CStr(Month(d)), 2) & "/" & _
-                            Right("0" & CStr(Day(d)), 2)
-
+                    sDate = FormatYYYYMMDD(d)
                     outLine = code & "," & sDate & "," & CStr(o) & "," & CStr(h) & "," & CStr(l) & "," & CStr(c) & "," & CStr(v)
                     tsOut.WriteLine outLine
 
+                    If writtenCount = 0 And (Not canAppend) Then
+                        firstDate = sDate
+                        firstClose = CStr(c)
+                    End If
+
                     writtenCount = writtenCount + 1
+                    lastWrittenDate = sDate
                     If (writtenCount Mod PROGRESS_INTERVAL) = 0 Then
                         SafeOut "  " & code & " ... " & writtenCount & " lines"
                     End If
-
                 End If
-
             Else
                 Err.Clear
             End If
-
         End If
-
         On Error GoTo 0
     Next
 
     tsOut.Close
 
-    SafeOut "OK   : " & code & " : +" & writtenCount
-    ExportOneCode_Incremental = True
+    Dim updatedAt
+    updatedAt = FormatTimestamp(Now)
+    Dim rec2
+    Set rec2 = GetOrCreateManifestRecord(manifest, code)
+    rec2("filePath") = outPath
+    If Len(firstDate) > 0 Then rec2("firstDate") = firstDate
+    If Len(firstClose) > 0 Then rec2("firstClose") = CStr(firstClose)
+    If Len(lastWrittenDate) > 0 Then
+        rec2("lastDate") = lastWrittenDate
+    Else
+        rec2("lastDate") = lastDateStr
+    End If
+    rec2("updatedAt") = updatedAt
 
+    If writtenCount > 0 Then
+        SafeOut "OK   : " & code & " : +" & writtenCount
+    Else
+        SafeOut "OK   : " & code & " : +0"
+    End If
+
+    ExportOneCode_Incremental = True
 End Function
 
+'============================================================
+' Manifest
+'============================================================
+Function LoadManifest(ByVal path)
+    Dim dict
+    Set dict = CreateObject("Scripting.Dictionary")
+    If Not fso.FileExists(path) Then
+        Set LoadManifest = dict
+        Exit Function
+    End If
+
+    Dim ts, line, parts
+    On Error Resume Next
+    Set ts = fso.OpenTextFile(path, ForReading, False)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Set LoadManifest = dict
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    If Not ts.AtEndOfStream Then
+        ts.ReadLine
+    End If
+
+    Do While Not ts.AtEndOfStream
+        line = Trim(ts.ReadLine)
+        If Len(line) > 0 Then
+            parts = Split(line, ",")
+            If UBound(parts) >= 5 Then
+                Dim code, rec
+                code = Trim(parts(0))
+                If Len(code) > 0 Then
+                    Set rec = CreateObject("Scripting.Dictionary")
+                    rec.Add "lastDate", Trim(parts(1))
+                    rec.Add "firstDate", Trim(parts(2))
+                    rec.Add "firstClose", Trim(parts(3))
+                    rec.Add "filePath", Trim(parts(4))
+                    rec.Add "updatedAt", Trim(parts(5))
+                    dict(code) = rec
+                End If
+            End If
+        End If
+    Loop
+    ts.Close
+
+    Set LoadManifest = dict
+End Function
+
+Sub SaveManifest(ByVal path, ByRef dict)
+    Dim ts, code, rec
+    On Error Resume Next
+    Set ts = fso.OpenTextFile(path, ForWriting, True)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    ts.WriteLine "code,lastDate,firstDate,firstClose,filePath,updatedAt"
+    For Each code In dict.Keys
+        Set rec = dict(code)
+        ts.WriteLine CleanCsv(code) & "," & CleanCsv(GetRecValue(rec, "lastDate")) & "," & _
+                     CleanCsv(GetRecValue(rec, "firstDate")) & "," & _
+                     CleanCsv(GetRecValue(rec, "firstClose")) & "," & _
+                     CleanCsv(GetRecValue(rec, "filePath")) & "," & _
+                     CleanCsv(GetRecValue(rec, "updatedAt"))
+    Next
+    ts.Close
+End Sub
+
+Function GetOrCreateManifestRecord(ByRef dict, ByVal code)
+    If dict.Exists(code) Then
+        Set GetOrCreateManifestRecord = dict(code)
+    Else
+        Dim rec
+        Set rec = CreateObject("Scripting.Dictionary")
+        rec.Add "lastDate", ""
+        rec.Add "firstDate", ""
+        rec.Add "firstClose", ""
+        rec.Add "filePath", ""
+        rec.Add "updatedAt", ""
+        dict.Add code, rec
+        Set GetOrCreateManifestRecord = rec
+    End If
+End Function
+
+Function GetRecValue(ByRef rec, ByVal key)
+    If rec.Exists(key) Then
+        GetRecValue = rec(key)
+    Else
+        GetRecValue = ""
+    End If
+End Function
+
+Function CleanCsv(ByVal value)
+    Dim s
+    s = CStr(value)
+    s = Replace(s, ",", "_")
+    s = Replace(s, vbCrLf, " ")
+    s = Replace(s, vbLf, " ")
+    CleanCsv = s
+End Function
 
 '============================================================
-' Get last date from CSV (code,YYYY/MM/DD,...)
+' Split detection
 '============================================================
-Function GetLastDateFromCsv(ByVal filePath)
+Function IsSplitSuspect(ByVal fileFirstDate, ByVal fileFirstClose, ByVal panFirstDate, ByVal panFirstClose, ByRef reason)
+    reason = ""
+    If Len(fileFirstDate) = 0 Or Len(panFirstDate) = 0 Then
+        reason = "missing_date"
+        IsSplitSuspect = True
+        Exit Function
+    End If
+    If fileFirstDate <> panFirstDate Then
+        reason = "date_mismatch"
+        IsSplitSuspect = True
+        Exit Function
+    End If
+    If panFirstClose = 0 Then
+        reason = "pan_close_zero"
+        IsSplitSuspect = True
+        Exit Function
+    End If
+    Dim diffAbs, diffRel
+    diffAbs = Abs(ToDouble(fileFirstClose) - ToDouble(panFirstClose))
+    diffRel = diffAbs / panFirstClose
+    If diffAbs >= ABS_DIFF_THRESHOLD Or diffRel >= ADJUST_DIFF_THRESHOLD Then
+        reason = "close_diff"
+        IsSplitSuspect = True
+        Exit Function
+    End If
+    IsSplitSuspect = False
+End Function
 
-    Dim ts, line, lastLine, parts, dt
-    GetLastDateFromCsv = Empty
+Sub AppendSplitSuspect(ByVal path, ByVal code, ByVal fileFirstDate, ByVal fileFirstClose, ByVal panFirstDate, ByVal panFirstClose, ByVal reason)
+    Dim ts, line
+    If Not fso.FileExists(path) Then
+        Set ts = fso.OpenTextFile(path, ForWriting, True)
+        ts.WriteLine "code,fileFirstDate,fileFirstClose,panFirstDate,panFirstClose,reason,detectedAt"
+        ts.Close
+    End If
+    Set ts = fso.OpenTextFile(path, ForAppending, True)
+    line = CleanCsv(code) & "," & CleanCsv(fileFirstDate) & "," & CleanCsv(fileFirstClose) & "," & _
+           CleanCsv(panFirstDate) & "," & CleanCsv(panFirstClose) & "," & CleanCsv(reason) & "," & _
+           CleanCsv(FormatTimestamp(Now))
+    ts.WriteLine line
+    ts.Close
+End Sub
+
+'============================================================
+' Fast read helpers
+'============================================================
+Function GetFirstRowInfo(ByVal filePath, ByRef firstDate, ByRef firstClose)
+    Dim ts, line, parts
+    GetFirstRowInfo = False
+    firstDate = ""
+    firstClose = ""
 
     On Error Resume Next
     Set ts = fso.OpenTextFile(filePath, ForReading, False)
@@ -424,56 +610,130 @@ Function GetLastDateFromCsv(ByVal filePath)
     End If
     On Error GoTo 0
 
-    lastLine = ""
     Do While Not ts.AtEndOfStream
         line = Trim(ts.ReadLine)
-        If Len(line) > 0 Then lastLine = line
+        If Len(line) > 0 Then
+            parts = Split(line, ",")
+            If UBound(parts) >= 5 Then
+                firstDate = Trim(parts(1))
+                firstClose = Trim(parts(5))
+                GetFirstRowInfo = True
+                Exit Do
+            End If
+        End If
     Loop
     ts.Close
-
-    If Len(lastLine) = 0 Then Exit Function
-
-    parts = Split(lastLine, ",")
-    If UBound(parts) < 1 Then Exit Function
-
-    dt = ParseYYYYMMDDToDate(parts(1))
-    If IsDate(dt) Then
-        GetLastDateFromCsv = dt
-    End If
-
 End Function
 
+Function ReadLastRowDateFast(ByVal filePath, ByRef lastDateStr, ByRef lastClose)
+    Dim stream, size, startPos, bytes
+    Dim textStream, text, lines, i, line, parts
 
-Function ParseYYYYMMDDToDate(ByVal sDate)
-
-    Dim parts, y, mm, dd
-    ParseYYYYMMDDToDate = Empty
-
-    sDate = Trim(sDate)
-    If Len(sDate) = 0 Then Exit Function
-
-    parts = Split(sDate, "/")
-    If UBound(parts) <> 2 Then Exit Function
+    ReadLastRowDateFast = False
+    lastDateStr = ""
+    lastClose = 0
 
     On Error Resume Next
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = 1
+    stream.Open
+    stream.LoadFromFile filePath
+    size = stream.Size
+    If size <= 0 Then
+        stream.Close
+        Exit Function
+    End If
+    If size > TAIL_READ_BYTES Then
+        startPos = size - TAIL_READ_BYTES
+    Else
+        startPos = 0
+    End If
+    stream.Position = startPos
+    bytes = stream.Read(size - startPos)
+    stream.Close
+
+    Set textStream = CreateObject("ADODB.Stream")
+    textStream.Type = 1
+    textStream.Open
+    textStream.Write bytes
+    textStream.Position = 0
+    textStream.Type = 2
+    textStream.Charset = "us-ascii"
+    text = textStream.ReadText
+    textStream.Close
+    On Error GoTo 0
+
+    text = Replace(text, vbCrLf, vbLf)
+    lines = Split(text, vbLf)
+    For i = UBound(lines) To 0 Step -1
+        line = Trim(lines(i))
+        If Len(line) > 0 Then
+            parts = Split(line, ",")
+            If UBound(parts) >= 5 Then
+                lastDateStr = Trim(parts(1))
+                lastClose = ToDouble(parts(5))
+                ReadLastRowDateFast = True
+                Exit Function
+            End If
+        End If
+    Next
+End Function
+
+'============================================================
+' Utils
+'============================================================
+Function FormatYYYYMMDD(ByVal d)
+    FormatYYYYMMDD = Right("0000" & CStr(Year(d)), 4) & "/" & _
+                     Right("0" & CStr(Month(d)), 2) & "/" & _
+                     Right("0" & CStr(Day(d)), 2)
+End Function
+
+Function FormatTimestamp(ByVal d)
+    FormatTimestamp = Right("0000" & CStr(Year(d)), 4) & "-" & _
+                      Right("0" & CStr(Month(d)), 2) & "-" & _
+                      Right("0" & CStr(Day(d)), 2) & " " & _
+                      Right("0" & CStr(Hour(d)), 2) & ":" & _
+                      Right("0" & CStr(Minute(d)), 2) & ":" & _
+                      Right("0" & CStr(Second(d)), 2)
+End Function
+
+Function ToDouble(ByVal value)
+    Dim s
+    s = Trim(CStr(value))
+    s = Replace(s, ",", "")
+    On Error Resume Next
     Err.Clear
-    y  = CLng(parts(0))
+    ToDouble = CDbl(s)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ToDouble = 0
+    End If
+    On Error GoTo 0
+End Function
+
+Function ParseYYYYMMDDToDate(ByVal sDate)
+    Dim parts, y, mm, dd
+    ParseYYYYMMDDToDate = Empty
+    sDate = Trim(sDate)
+    If Len(sDate) = 0 Then Exit Function
+    parts = Split(sDate, "/")
+    If UBound(parts) <> 2 Then Exit Function
+    On Error Resume Next
+    Err.Clear
+    y = CLng(parts(0))
     mm = CLng(parts(1))
     dd = CLng(parts(2))
     If Err.Number <> 0 Then
         Err.Clear
         Exit Function
     End If
-
     ParseYYYYMMDDToDate = DateSerial(y, mm, dd)
     If Err.Number <> 0 Then
         Err.Clear
         ParseYYYYMMDDToDate = Empty
     End If
     On Error GoTo 0
-
 End Function
-
 
 Function RemoveBOM(ByVal s)
     If Len(s) > 0 Then
@@ -489,33 +749,25 @@ Function RemoveBOM(ByVal s)
     End If
 End Function
 
-
 Function NormalizeCode(ByVal s)
-
     Dim x, a, i, ch, res
-
     x = Trim(s)
-
     If InStr(x, ",") > 0 Then
         a = Split(x, ",")
         x = Trim(a(0))
     End If
-
     If InStr(x, vbTab) > 0 Then
         a = Split(x, vbTab)
         x = Trim(a(0))
     End If
-
     If InStr(x, "_") > 0 Then
         a = Split(x, "_")
         x = Trim(a(0))
     End If
-
     If InStr(x, " ") > 0 Then
         a = Split(x, " ")
         x = Trim(a(0))
     End If
-
     res = ""
     For i = 1 To Len(x)
         ch = Mid(x, i, 1)
@@ -527,38 +779,26 @@ Function NormalizeCode(ByVal s)
             Exit For
         End If
     Next
-
     NormalizeCode = UCase(res)
-
 End Function
 
-
 Function SanitizeFileName(ByVal s)
-
     Dim badChars, i
     s = Trim(s)
-
     If Len(s) = 0 Then
         SanitizeFileName = ""
         Exit Function
     End If
-
-    ' バックスラッシュは Chr(92) を使って「文字列が壊れる系」を避ける
     badChars = Array(Chr(92), "/", ":", "*", "?", Chr(34), "<", ">", "|")
-
     For i = 0 To UBound(badChars)
         s = Replace(s, CStr(badChars(i)), "_")
     Next
-
     s = Trim(s)
     Do While Len(s) > 0 And (Right(s, 1) = "." Or Right(s, 1) = " ")
         s = Left(s, Len(s) - 1)
     Loop
-
     SanitizeFileName = s
-
 End Function
-
 
 Sub SafeOut(ByVal msg)
     On Error Resume Next
@@ -569,7 +809,6 @@ Sub SafeOut(ByVal msg)
     End If
     On Error GoTo 0
 End Sub
-
 
 Function Q(ByVal s)
     Q = Chr(34) & Replace(CStr(s), Chr(34), Chr(34) & Chr(34)) & Chr(34)

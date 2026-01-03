@@ -6,6 +6,7 @@ import { useBackendReadyState } from "../backendReady";
 import type { MaSetting, SortDir, SortKey } from "../store";
 import { useStore } from "../store";
 import StockTile from "../components/StockTile";
+import Toast from "../components/Toast";
 import TopNav from "../components/TopNav";
 import { computeSignalMetrics } from "../utils/signals";
 
@@ -49,6 +50,7 @@ export default function GridView() {
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
   const loadingList = useStore((state) => state.loadingList);
+  const resetBarsCache = useStore((state) => state.resetBarsCache);
   const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const barsCache = useStore((state) => state.barsCache);
   const columns = useStore((state) => state.settings.columns);
@@ -73,9 +75,13 @@ export default function GridView() {
   const [showIndicators, setShowIndicators] = useState(false);
   const [sortOpen, setSortOpen] = useState(false);
   const [displayOpen, setDisplayOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [isSorting, setIsSorting] = useState(false);
+  const [isUpdatingTxt, setIsUpdatingTxt] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const sortRef = useRef<HTMLDivElement | null>(null);
   const displayRef = useRef<HTMLDivElement | null>(null);
+  const moreRef = useRef<HTMLDivElement | null>(null);
   const lastVisibleCodesRef = useRef<string[]>([]);
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
 
@@ -92,17 +98,19 @@ export default function GridView() {
   }, [backendReady]);
 
   useEffect(() => {
-    if (!sortOpen && !displayOpen) return;
+    if (!sortOpen && !displayOpen && !moreOpen) return;
     const handleClick = (event: MouseEvent) => {
       const target = event.target as Node;
       if (sortRef.current && sortRef.current.contains(target)) return;
       if (displayRef.current && displayRef.current.contains(target)) return;
+      if (moreRef.current && moreRef.current.contains(target)) return;
       setSortOpen(false);
       setDisplayOpen(false);
+      setMoreOpen(false);
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [sortOpen, displayOpen]);
+  }, [sortOpen, displayOpen, moreOpen]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -116,6 +124,7 @@ export default function GridView() {
       if (event.key === "Escape") {
         setSortOpen(false);
         setDisplayOpen(false);
+        setMoreOpen(false);
       } else if (event.key === "1") {
         setGridTimeframe("monthly");
       } else if (event.key === "2") {
@@ -367,16 +376,138 @@ export default function GridView() {
     resetMaSettings(frame);
   };
 
+  type UpdateSummary = {
+    total?: number;
+    ok?: number;
+    err?: number;
+    split?: number;
+  };
+
+  type UpdateTxtPayload = {
+    ok?: boolean;
+    error?: string;
+    last_updated_at?: string;
+    summary?: UpdateSummary;
+  };
+
+  const formatUpdatedAt = (value: string | null | undefined) => {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    const pad = (num: number) => String(num).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+      date.getHours()
+    )}:${pad(date.getMinutes())}`;
+  };
+
+  const lastUpdatedLabel = formatUpdatedAt(health?.last_updated);
+
+  const formatUpdateSummary = (summary?: UpdateSummary) => {
+    if (!summary) return null;
+    const parts: string[] = [];
+    if (typeof summary.ok === "number") {
+      parts.push(`成功 ${summary.ok}`);
+    }
+    if (typeof summary.err === "number" && summary.err > 0) {
+      parts.push(`エラー ${summary.err}`);
+    }
+    if (typeof summary.split === "number" && summary.split > 0) {
+      parts.push(`分割疑い ${summary.split}`);
+    }
+    return parts.length > 0 ? parts.join(" / ") : null;
+  };
+
+  const formatUpdateToast = (message: string, summary?: UpdateSummary) => {
+    const suffix = formatUpdateSummary(summary);
+    return suffix ? `${message}（${suffix}）` : message;
+  };
+
+  const handleUpdateError = (payload?: UpdateTxtPayload) => {
+    const error = payload?.error ?? "unknown";
+    if (error === "already_updated_today") {
+      const lastUpdated = formatUpdatedAt(payload?.last_updated_at);
+      setToastMessage(
+        lastUpdated
+          ? `本日はTXT更新済みです（最終 ${lastUpdated}）`
+          : "本日はTXT更新済みです。"
+      );
+      return;
+    }
+    if (error === "update_in_progress") {
+      setToastMessage("TXT更新は実行中です。");
+      return;
+    }
+    if (error.startsWith("vbs_failed")) {
+      setToastMessage(formatUpdateToast("TXT更新でエラーが発生しました。", payload?.summary));
+      return;
+    }
+    if (error.startsWith("ingest_failed")) {
+      setToastMessage(formatUpdateToast("TXT取り込みでエラーが発生しました。", payload?.summary));
+      return;
+    }
+    if (error.startsWith("vbs_not_found")) {
+      setToastMessage("TXT更新スクリプトが見つかりません。");
+      return;
+    }
+    setToastMessage("TXT更新に失敗しました。");
+  };
+
+  const handleUpdateTxt = useCallback(async () => {
+    if (isUpdatingTxt || !backendReady) return;
+    setIsUpdatingTxt(true);
+    setToastMessage("TXT更新を開始しました。");
+    try {
+      const res = await api.post("/update_txt");
+      const payload = res.data as UpdateTxtPayload;
+      if (payload.ok) {
+        resetBarsCache();
+        await loadList();
+        setToastMessage(formatUpdateToast("TXT更新が完了しました。", payload.summary));
+        try {
+          const healthRes = await api.get("/health");
+          setHealth(healthRes.data as HealthStatus);
+        } catch {
+          // Keep last known health when refresh fails.
+        }
+      } else {
+        handleUpdateError(payload);
+      }
+    } catch (error) {
+      let payload: UpdateTxtPayload | null = null;
+      if (typeof error === "object" && error && "response" in error) {
+        const response = (error as { response?: { data?: UpdateTxtPayload } }).response;
+        payload = response?.data ?? null;
+      }
+      if (payload) {
+        handleUpdateError(payload);
+      } else {
+        setToastMessage("TXT更新に失敗しました。");
+      }
+    } finally {
+      setIsUpdatingTxt(false);
+    }
+  }, [
+    isUpdatingTxt,
+    backendReady,
+    resetBarsCache,
+    loadList,
+    formatUpdatedAt,
+    formatUpdateToast,
+    handleUpdateError
+  ]);
+
   return (
     <div className="app-shell">
       <header className="top-bar">
-        <div className="top-bar-heading">
-          <div className="title">Moomoo-like Screener</div>
-          <div className="subtitle">Fast grid with canvas sparklines</div>
+        <div className="top-bar-row top-bar-row-nav">
+          <div className="app-brand">
+            <div className="title">Moomoo-like Screener</div>
+            <div className="subtitle">Fast grid with canvas sparklines</div>
+          </div>
           <TopNav />
         </div>
-        <div className="top-bar-controls">
-          <div className="top-bar-left">
+        <div className="top-bar-row top-bar-row-tools">
+          <div className="toolbar-left">
             <div className="segmented timeframe-segment">
               {(["monthly", "weekly", "daily"] as const).map((value) => (
                 <button
@@ -402,7 +533,7 @@ export default function GridView() {
               )}
             </div>
           </div>
-          <div className="top-bar-right">
+          <div className="toolbar-right">
             <div className="popover-anchor" ref={sortRef}>
               <button
                 type="button"
@@ -410,6 +541,7 @@ export default function GridView() {
                 onClick={() => {
                   setSortOpen((prev) => !prev);
                   setDisplayOpen(false);
+                  setMoreOpen(false);
                 }}
               >
                 並び替え：{sortLabel}・{sortDirLabel}
@@ -471,6 +603,7 @@ export default function GridView() {
                 onClick={() => {
                   setDisplayOpen((prev) => !prev);
                   setSortOpen(false);
+                  setMoreOpen(false);
                 }}
               >
                 表示
@@ -520,6 +653,44 @@ export default function GridView() {
                     <button type="button" className="popover-reset" onClick={resetDisplay}>
                       おすすめに戻す
                     </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="popover-anchor" ref={moreRef}>
+              <button
+                type="button"
+                className="more-button"
+                aria-label="その他"
+                onClick={() => {
+                  setMoreOpen((prev) => !prev);
+                  setSortOpen(false);
+                  setDisplayOpen(false);
+                }}
+              >
+                ⋯
+              </button>
+              {moreOpen && (
+                <div className="popover-panel">
+                  <div className="popover-section">
+                    <button
+                      type="button"
+                      className="popover-item"
+                      onClick={() => {
+                        setMoreOpen(false);
+                        handleUpdateTxt();
+                      }}
+                      disabled={!backendReady || isUpdatingTxt}
+                    >
+                      <span>TXT更新（取り込み）</span>
+                      <span className="popover-status">
+                        {isUpdatingTxt && <span className="menu-spinner" aria-hidden="true" />}
+                        {isUpdatingTxt ? "更新中..." : "実行"}
+                      </span>
+                    </button>
+                    <div className="popover-note">
+                      最終更新：{lastUpdatedLabel ?? "--"}
+                    </div>
                   </div>
                 </div>
               )}
@@ -649,6 +820,7 @@ export default function GridView() {
           </div>
         </div>
       )}
+      <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
     </div>
   );
 }

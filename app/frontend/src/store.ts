@@ -148,6 +148,7 @@ type StoreState = {
   setSortDir: (value: SortDir) => void;
   updateMaSetting: (timeframe: MaTimeframe, index: number, patch: Partial<MaSetting>) => void;
   resetMaSettings: (timeframe: MaTimeframe) => void;
+  resetBarsCache: () => void;
 };
 
 export type SortKey =
@@ -826,5 +827,23 @@ export const useStore = create<StoreState>((set, get) => ({
       persistSettings(timeframe, next);
       return { maSettings: { ...state.maSettings, [timeframe]: next } };
     });
+  },
+  resetBarsCache: () => {
+    abortInFlightForTimeframe("daily");
+    abortInFlightForTimeframe("weekly");
+    abortInFlightForTimeframe("monthly");
+    recentBatchRequests.clear();
+    barsFetchedLimit.daily = {};
+    barsFetchedLimit.weekly = {};
+    barsFetchedLimit.monthly = {};
+    lastEnsureKeyByTimeframe.daily = null;
+    lastEnsureKeyByTimeframe.weekly = null;
+    lastEnsureKeyByTimeframe.monthly = null;
+    set(() => ({
+      barsCache: { monthly: {}, weekly: {}, daily: {} },
+      boxesCache: { monthly: {}, weekly: {}, daily: {} },
+      barsStatus: { monthly: {}, weekly: {}, daily: {} },
+      barsLoading: { monthly: {}, weekly: {}, daily: {} }
+    }));
   }
 }));

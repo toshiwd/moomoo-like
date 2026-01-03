@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 
 from fastapi import Body, FastAPI
@@ -24,12 +26,26 @@ RANK_CONFIG_PATH = os.getenv("RANK_CONFIG_PATH", os.path.join(os.path.dirname(__
 FAVORITES_DB_PATH = os.getenv(
     "FAVORITES_DB_PATH", os.path.join(os.path.dirname(__file__), "favorites.sqlite")
 )
+UPDATE_VBS_PATH = os.getenv(
+    "UPDATE_VBS_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools", "export_pan.vbs"))
+)
+INGEST_SCRIPT_PATH = os.getenv(
+    "INGEST_SCRIPT_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "ingest_txt.py"))
+)
+UPDATE_STATE_PATH = os.getenv(
+    "UPDATE_STATE_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "update_state.json"))
+)
+SPLIT_SUSPECTS_PATH = os.path.abspath(os.path.join(DATA_DIR, "_split_suspects.csv"))
 
 
 _trade_cache = {"mtime": None, "path": None, "rows": [], "warnings": []}
 _screener_cache = {"mtime": None, "rows": []}
 _rank_cache = {"mtime": None, "config_mtime": None, "weekly": {}, "monthly": {}}
 _rank_config_cache = {"mtime": None, "config": None}
+_update_txt_running = False
 
 
 def _get_favorites_conn():
@@ -1874,6 +1890,134 @@ def get_txt_status() -> dict:
         "code_txt_missing": code_txt_missing,
         "last_updated": last_updated
     }
+
+
+def _run_command(cmd: list[str], timeout: int) -> tuple[int, str]:
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+    output = "\n".join([result.stdout or "", result.stderr or ""]).strip()
+    if len(output) > 8000:
+        output = output[-8000:]
+    return result.returncode, output
+
+
+def _load_update_state() -> dict:
+    if not os.path.isfile(UPDATE_STATE_PATH):
+        return {}
+    try:
+        with open(UPDATE_STATE_PATH, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_update_state(state: dict) -> None:
+    try:
+        with open(UPDATE_STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _parse_vbs_summary(output: str) -> dict:
+    summary: dict[str, int] = {}
+    for line in output.splitlines():
+        if line.startswith("SUMMARY:"):
+            for key, value in re.findall(r"(\\w+)=(\\d+)", line):
+                summary[key] = int(value)
+    return summary
+
+
+@app.post("/api/update_txt")
+def update_txt():
+    global _update_txt_running
+    if _update_txt_running:
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "error": "update_in_progress"}
+        )
+    state = _load_update_state()
+    today = datetime.now().date().isoformat()
+    last_date = state.get("last_txt_update_date")
+    if last_date == today:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": False,
+                "error": "already_updated_today",
+                "last_updated_at": state.get("last_txt_update_at")
+            }
+        )
+    _update_txt_running = True
+    try:
+        if not os.path.isfile(UPDATE_VBS_PATH):
+            return JSONResponse(
+                status_code=404,
+                content={"ok": False, "error": f"vbs_not_found:{UPDATE_VBS_PATH}"}
+            )
+        sys_root = os.environ.get("SystemRoot") or "C:\\Windows"
+        cscript = os.path.join(sys_root, "SysWOW64", "cscript.exe")
+        if not os.path.isfile(cscript):
+            cscript = os.path.join(sys_root, "System32", "cscript.exe")
+        vbs_code, vbs_output = _run_command([cscript, "//nologo", UPDATE_VBS_PATH], timeout=3600)
+        summary = _parse_vbs_summary(vbs_output)
+        if vbs_code != 0:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": False,
+                    "error": f"vbs_failed:{vbs_code}",
+                    "vbs_output": vbs_output,
+                    "summary": summary
+                }
+            )
+
+        if not os.path.isfile(INGEST_SCRIPT_PATH):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": False,
+                    "error": f"ingest_not_found:{INGEST_SCRIPT_PATH}",
+                    "vbs_output": vbs_output
+                }
+            )
+
+        ingest_code, ingest_output = _run_command([sys.executable, INGEST_SCRIPT_PATH], timeout=3600)
+        if ingest_code != 0:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": False,
+                    "error": f"ingest_failed:{ingest_code}",
+                    "vbs_output": vbs_output,
+                    "ingest_output": ingest_output,
+                    "summary": summary
+                }
+            )
+        state["last_txt_update_date"] = today
+        state["last_txt_update_at"] = datetime.now().isoformat()
+        _save_update_state(state)
+        return JSONResponse(
+            content={
+                "ok": True,
+                "vbs_output": vbs_output,
+                "ingest_output": ingest_output,
+                "summary": summary,
+                "split_suspects_path": SPLIT_SUSPECTS_PATH,
+                "last_updated_at": state.get("last_txt_update_at")
+            }
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "error": f"update_txt_failed:{exc}"}
+        )
+    finally:
+        _update_txt_running = False
 
 
 @app.get("/api/health")

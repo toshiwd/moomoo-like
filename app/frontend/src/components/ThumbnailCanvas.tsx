@@ -109,6 +109,10 @@ function drawChart(
   }
 
   const pad = 6;
+  const rightPad = showAxes ? 46 : pad;
+  const bottomPad = showAxes ? 18 : pad;
+  const plotWidth = Math.max(1, width - rightPad);
+  const plotHeight = Math.max(1, height - bottomPad);
   const hi = Math.max(...bars.map((b) => b[2]));
   const lo = Math.min(...bars.map((b) => b[3]));
   let min = lo;
@@ -133,14 +137,49 @@ function drawChart(
   const range = Math.max(1e-6, max - min);
 
   const toY = (value: number) => {
-    return pad + (height - pad * 2) * (1 - (value - min) / range);
+    const top = pad;
+    const bottom = plotHeight - pad;
+    return top + (bottom - top) * (1 - (value - min) / range);
   };
 
   ctx.clearRect(0, 0, width, height);
   ctx.lineWidth = 1;
 
-  const step = width / bars.length;
+  const step = plotWidth / bars.length;
   const candleWidth = Math.max(1, Math.min(6, step * 0.6));
+
+  let timeTickIndexes: number[] = [];
+  let priceTicks: number[] = [];
+  if (showAxes) {
+    const timeTickCount = Math.max(3, Math.min(6, Math.round(plotWidth / 140)));
+    timeTickIndexes = Array.from({ length: timeTickCount }, (_, i) =>
+      Math.round((bars.length - 1) * (i / Math.max(1, timeTickCount - 1)))
+    );
+    const priceTickCount = Math.max(3, Math.min(6, Math.round(plotHeight / 80)));
+    priceTicks = Array.from({ length: priceTickCount }, (_, i) => {
+      const ratio = priceTickCount === 1 ? 0 : i / (priceTickCount - 1);
+      return max - range * ratio;
+    });
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.15)";
+    ctx.lineWidth = 1;
+    priceTicks.forEach((value) => {
+      const y = toY(value);
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(plotWidth, y);
+      ctx.stroke();
+    });
+    timeTickIndexes.forEach((index) => {
+      const x = step * index + step / 2;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, plotHeight);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
 
   bars.forEach((bar, index) => {
     const [t, o, h, l, c] = bar;
@@ -255,23 +294,34 @@ function drawChart(
     ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    const priceTicks = [max, (max + min) / 2, min];
     priceTicks.forEach((value) => {
       const y = toY(value);
       ctx.fillText(formatPrice(value), width - 4, y);
     });
 
-    const leftTime = bars[0]?.[0];
-    const midTime = bars[Math.floor(bars.length / 2)]?.[0];
-    const rightTime = bars[bars.length - 1]?.[0];
     const labelY = height - 4;
-    ctx.textAlign = "left";
-    ctx.textBaseline = "bottom";
-    if (leftTime) ctx.fillText(formatDateShort(leftTime), 4, labelY);
     ctx.textAlign = "center";
-    if (midTime) ctx.fillText(formatDateShort(midTime), width / 2, labelY);
-    ctx.textAlign = "right";
-    if (rightTime) ctx.fillText(formatDateShort(rightTime), width - 4, labelY);
+    ctx.textBaseline = "bottom";
+    timeTickIndexes.forEach((index, idx) => {
+      const time = bars[index]?.[0];
+      if (!time) return;
+      const x = step * index + step / 2;
+      if (idx === 0) ctx.textAlign = "left";
+      else if (idx === timeTickIndexes.length - 1) ctx.textAlign = "right";
+      else ctx.textAlign = "center";
+      ctx.fillText(formatDateShort(time), x, labelY);
+    });
+
+    const lastClose = bars[bars.length - 1]?.[4];
+    if (Number.isFinite(lastClose)) {
+      const y = toY(lastClose);
+      ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
+      ctx.fillRect(plotWidth, y - 8, rightPad - 2, 16);
+      ctx.fillStyle = "#e2e8f0";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(formatPrice(lastClose), width - 4, y);
+    }
     ctx.restore();
   }
 }

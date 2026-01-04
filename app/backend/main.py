@@ -6,6 +6,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 from fastapi import Body, FastAPI
@@ -15,7 +16,21 @@ from fastapi.responses import JSONResponse
 from db import get_conn, init_schema
 from box_detector import detect_boxes
 
-DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "txt"))
+
+def resolve_data_dir() -> str:
+    env = os.getenv("TXT_DATA_DIR")
+    if env:
+        return os.path.abspath(env)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    app_data = os.path.join(repo_root, "app", "data", "txt")
+    app_code = os.path.join(repo_root, "app", "data", "code.txt")
+    root_data = os.path.join(repo_root, "data", "txt")
+    if os.path.isfile(app_code) or os.path.isdir(app_data):
+        return app_data
+    return root_data
+
+
+DATA_DIR = resolve_data_dir()
 DEFAULT_TRADE_CSV_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "楽天証券取引履歴.csv")
 )
@@ -28,7 +43,7 @@ FAVORITES_DB_PATH = os.getenv(
 )
 UPDATE_VBS_PATH = os.getenv(
     "UPDATE_VBS_PATH",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools", "export_pan.vbs"))
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "tools", "pan", "export_pan.vbs"))
 )
 INGEST_SCRIPT_PATH = os.getenv(
     "INGEST_SCRIPT_PATH",
@@ -45,7 +60,19 @@ _trade_cache = {"mtime": None, "path": None, "rows": [], "warnings": []}
 _screener_cache = {"mtime": None, "rows": []}
 _rank_cache = {"mtime": None, "config_mtime": None, "weekly": {}, "monthly": {}}
 _rank_config_cache = {"mtime": None, "config": None}
-_update_txt_running = False
+_update_txt_lock = threading.Lock()
+_update_txt_status = {
+    "running": False,
+    "phase": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "processed": 0,
+    "total": 0,
+    "summary": {},
+    "error": None,
+    "stdout_tail": [],
+    "last_updated_at": None
+}
 
 
 def _get_favorites_conn():
@@ -109,6 +136,10 @@ def find_code_txt_path(data_dir: str) -> str | None:
     parent = os.path.join(os.path.dirname(data_dir), "code.txt")
     if os.path.exists(parent):
         return parent
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    tools_path = os.path.join(repo_root, "tools", "code.txt")
+    if os.path.exists(tools_path):
+        return tools_path
     return None
 
 app = FastAPI()
@@ -1893,16 +1924,94 @@ def get_txt_status() -> dict:
 
 
 def _run_command(cmd: list[str], timeout: int) -> tuple[int, str]:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        timeout=timeout
+        timeout=timeout,
+        creationflags=creationflags
     )
     output = "\n".join([result.stdout or "", result.stderr or ""]).strip()
     if len(output) > 8000:
         output = output[-8000:]
     return result.returncode, output
+
+
+def _read_text_lines(path: str) -> list[str]:
+    for encoding in ("utf-8", "cp932"):
+        try:
+            with open(path, "r", encoding=encoding, errors="ignore") as handle:
+                return handle.read().splitlines()
+        except OSError:
+            break
+    return []
+
+
+def _count_codes(path: str) -> int:
+    count = 0
+    for line in _read_text_lines(path):
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("#") or text.startswith("'"):
+            continue
+        count += 1
+    return count
+
+
+def _append_stdout_tail(line: str) -> None:
+    with _update_txt_lock:
+        tail = list(_update_txt_status.get("stdout_tail") or [])
+        tail.append(line)
+        if len(tail) > 20:
+            tail = tail[-20:]
+        _update_txt_status["stdout_tail"] = tail
+
+
+def _set_update_status(**kwargs) -> None:
+    with _update_txt_lock:
+        _update_txt_status.update(kwargs)
+
+
+def _get_update_status_snapshot() -> dict:
+    with _update_txt_lock:
+        return dict(_update_txt_status)
+
+
+def _run_streaming_command(cmd: list[str], timeout: int, on_line) -> tuple[int, str]:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags
+    )
+    output_lines: list[str] = []
+    start = time.time()
+    while True:
+        if process.stdout is None:
+            break
+        line = process.stdout.readline()
+        if line:
+            text = line.rstrip()
+            output_lines.append(text)
+            on_line(text)
+        if process.poll() is not None:
+            break
+        if time.time() - start > timeout:
+            process.kill()
+            break
+    if process.stdout is not None:
+        remaining = process.stdout.read()
+        if remaining:
+            for extra in remaining.splitlines():
+                output_lines.append(extra)
+                on_line(extra)
+    return process.wait(), "\n".join(output_lines).strip()
 
 
 def _load_update_state() -> dict:
@@ -1932,18 +2041,99 @@ def _parse_vbs_summary(output: str) -> dict:
     return summary
 
 
-@app.post("/api/update_txt")
-def update_txt():
-    global _update_txt_running
-    if _update_txt_running:
-        return JSONResponse(
-            status_code=409,
-            content={"ok": False, "error": "update_in_progress"}
+def _run_txt_update_job(code_path: str, out_dir: str) -> None:
+    processed = 0
+
+    def on_line(line: str) -> None:
+        nonlocal processed
+        _append_stdout_tail(line)
+        if line.startswith(("OK   :", "ERROR:", "SPLIT :")):
+            processed += 1
+            _set_update_status(processed=processed)
+
+    try:
+        sys_root = os.environ.get("SystemRoot") or "C:\\Windows"
+        cscript = os.path.join(sys_root, "SysWOW64", "cscript.exe")
+        if not os.path.isfile(cscript):
+            cscript = os.path.join(sys_root, "System32", "cscript.exe")
+        vbs_cmd = [cscript, "//nologo", UPDATE_VBS_PATH, code_path, out_dir]
+        vbs_code, vbs_output = _run_streaming_command(vbs_cmd, timeout=3600, on_line=on_line)
+        summary = _parse_vbs_summary(vbs_output)
+        _set_update_status(summary=summary)
+        if vbs_code != 0:
+            _set_update_status(
+                running=False,
+                phase="error",
+                error=f"vbs_failed:{vbs_code}",
+                finished_at=datetime.now().isoformat()
+            )
+            return
+
+        _set_update_status(phase="ingesting")
+        ingest_code, ingest_output = _run_command([sys.executable, INGEST_SCRIPT_PATH], timeout=3600)
+        for line in ingest_output.splitlines():
+            _append_stdout_tail(line)
+        if ingest_code != 0:
+            _set_update_status(
+                running=False,
+                phase="error",
+                error=f"ingest_failed:{ingest_code}",
+                finished_at=datetime.now().isoformat(),
+                summary=summary
+            )
+            return
+
+        state = _load_update_state()
+        state["last_txt_update_date"] = datetime.now().date().isoformat()
+        state["last_txt_update_at"] = datetime.now().isoformat()
+        _save_update_state(state)
+        _set_update_status(
+            running=False,
+            phase="done",
+            error=None,
+            finished_at=datetime.now().isoformat(),
+            summary=summary,
+            last_updated_at=state.get("last_txt_update_at"),
+            processed=processed
         )
+    except Exception as exc:
+        _append_stdout_tail(str(exc))
+        _set_update_status(
+            running=False,
+            phase="error",
+            error=f"update_txt_failed:{exc}",
+            finished_at=datetime.now().isoformat()
+        )
+
+
+def _start_txt_update(code_path: str, out_dir: str, total: int) -> dict:
+    started_at = datetime.now().isoformat()
+    with _update_txt_lock:
+        if _update_txt_status.get("running"):
+            return {}
+        _update_txt_status.update(
+            {
+                "running": True,
+                "phase": "running",
+                "started_at": started_at,
+                "finished_at": None,
+                "processed": 0,
+                "total": total,
+                "summary": {},
+                "error": None,
+                "stdout_tail": []
+            }
+        )
+    thread = threading.Thread(target=_run_txt_update_job, args=(code_path, out_dir), daemon=True)
+    thread.start()
+    return {"ok": True, "started": True, "started_at": started_at, "total": total}
+
+
+@app.post("/api/txt_update/run")
+def txt_update_run():
     state = _load_update_state()
     today = datetime.now().date().isoformat()
-    last_date = state.get("last_txt_update_date")
-    if last_date == today:
+    if state.get("last_txt_update_date") == today:
         return JSONResponse(
             status_code=200,
             content={
@@ -1952,101 +2142,123 @@ def update_txt():
                 "last_updated_at": state.get("last_txt_update_at")
             }
         )
-    _update_txt_running = True
+
+    if not os.path.isfile(UPDATE_VBS_PATH):
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": f"vbs_not_found:{UPDATE_VBS_PATH}"}
+        )
+
+    if not os.path.isfile(INGEST_SCRIPT_PATH):
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": f"ingest_not_found:{INGEST_SCRIPT_PATH}"}
+        )
+
+    code_path = find_code_txt_path(DATA_DIR)
+    if not code_path:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "code_txt_missing"})
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    total = _count_codes(code_path)
+    started = _start_txt_update(code_path, DATA_DIR, total)
+    if not started:
+        return JSONResponse(status_code=409, content={"ok": False, "error": "update_in_progress"})
+    return started
+
+
+@app.get("/api/txt_update/status")
+def txt_update_status():
+    snapshot = _get_update_status_snapshot()
+    if not snapshot.get("last_updated_at"):
+        state = _load_update_state()
+        snapshot["last_updated_at"] = state.get("last_txt_update_at")
+    elapsed_ms = None
+    if snapshot.get("started_at"):
+        try:
+            started = datetime.fromisoformat(snapshot["started_at"])
+            elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
+        except ValueError:
+            elapsed_ms = None
+    snapshot["elapsed_ms"] = elapsed_ms
+    return snapshot
+
+
+@app.get("/api/txt_update/split_suspects")
+def txt_update_split_suspects():
+    if not os.path.isfile(SPLIT_SUSPECTS_PATH):
+        return {"items": []}
+    items = []
     try:
-        if not os.path.isfile(UPDATE_VBS_PATH):
-            return JSONResponse(
-                status_code=404,
-                content={"ok": False, "error": f"vbs_not_found:{UPDATE_VBS_PATH}"}
-            )
-        sys_root = os.environ.get("SystemRoot") or "C:\\Windows"
-        cscript = os.path.join(sys_root, "SysWOW64", "cscript.exe")
-        if not os.path.isfile(cscript):
-            cscript = os.path.join(sys_root, "System32", "cscript.exe")
-        vbs_code, vbs_output = _run_command([cscript, "//nologo", UPDATE_VBS_PATH], timeout=3600)
-        summary = _parse_vbs_summary(vbs_output)
-        if vbs_code != 0:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": f"vbs_failed:{vbs_code}",
-                    "vbs_output": vbs_output,
-                    "summary": summary
+        for line in _read_text_lines(SPLIT_SUSPECTS_PATH):
+            if not line or line.lower().startswith("code,"):
+                continue
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 7:
+                continue
+            items.append(
+                {
+                    "code": parts[0],
+                    "file_date": parts[1],
+                    "file_close": parts[2],
+                    "pan_date": parts[3],
+                    "pan_close": parts[4],
+                    "diff_ratio": parts[5],
+                    "reason": parts[6],
+                    "detected_at": parts[7] if len(parts) > 7 else ""
                 }
             )
-
-        if not os.path.isfile(INGEST_SCRIPT_PATH):
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": f"ingest_not_found:{INGEST_SCRIPT_PATH}",
-                    "vbs_output": vbs_output
-                }
-            )
-
-        ingest_code, ingest_output = _run_command([sys.executable, INGEST_SCRIPT_PATH], timeout=3600)
-        if ingest_code != 0:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "ok": False,
-                    "error": f"ingest_failed:{ingest_code}",
-                    "vbs_output": vbs_output,
-                    "ingest_output": ingest_output,
-                    "summary": summary
-                }
-            )
-        state["last_txt_update_date"] = today
-        state["last_txt_update_at"] = datetime.now().isoformat()
-        _save_update_state(state)
-        return JSONResponse(
-            content={
-                "ok": True,
-                "vbs_output": vbs_output,
-                "ingest_output": ingest_output,
-                "summary": summary,
-                "split_suspects_path": SPLIT_SUSPECTS_PATH,
-                "last_updated_at": state.get("last_txt_update_at")
-            }
-        )
+        return {"items": items}
     except Exception as exc:
-        return JSONResponse(
-            status_code=200,
-            content={"ok": False, "error": f"update_txt_failed:{exc}"}
-        )
-    finally:
-        _update_txt_running = False
+        return JSONResponse(status_code=200, content={"items": [], "error": str(exc)})
+
+
+@app.post("/api/update_txt")
+def update_txt():
+    return txt_update_run()
 
 
 @app.get("/api/health")
 def health():
-    status = get_txt_status()
-    with get_conn() as conn:
-        code_count = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars").fetchone()[0]
-        daily_rows = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
-        monthly_rows = conn.execute("SELECT COUNT(*) FROM monthly_bars").fetchone()[0]
-    ready = True
-    phase = "ready"
-    message = "準備完了"
-    return {
-        "ok": True,
-        "status": "ok",
-        "ready": ready,
-        "phase": phase,
-        "message": message,
-        "stats": {
-            "tickers": code_count,
-            "daily_rows": daily_rows,
-            "monthly_rows": monthly_rows
-        },
-        "txt_count": status["txt_count"],
-        "code_count": code_count,
-        "last_updated": status["last_updated"],
-        "code_txt_missing": status["code_txt_missing"],
-        "errors": []
-    }
+    try:
+        status = get_txt_status()
+        with get_conn() as conn:
+            code_count = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars").fetchone()[0]
+            daily_rows = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+            monthly_rows = conn.execute("SELECT COUNT(*) FROM monthly_bars").fetchone()[0]
+        ready = True
+        phase = "ready"
+        message = "準備完了"
+        return {
+            "ok": True,
+            "status": "ok",
+            "ready": ready,
+            "phase": phase,
+            "message": message,
+            "stats": {
+                "tickers": code_count,
+                "daily_rows": daily_rows,
+                "monthly_rows": monthly_rows
+            },
+            "txt_count": status["txt_count"],
+            "code_count": code_count,
+            "last_updated": status["last_updated"],
+            "code_txt_missing": status["code_txt_missing"],
+            "errors": []
+        }
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "status": "starting",
+                "ready": False,
+                "phase": "starting",
+                "message": "起動中",
+                "retryAfterMs": 1000,
+                "errors": [str(exc)]
+            }
+        )
 
 
 @app.get("/api/trades/{code}")

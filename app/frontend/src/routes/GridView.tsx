@@ -75,13 +75,15 @@ export default function GridView() {
   const [showIndicators, setShowIndicators] = useState(false);
   const [sortOpen, setSortOpen] = useState(false);
   const [displayOpen, setDisplayOpen] = useState(false);
-  const [moreOpen, setMoreOpen] = useState(false);
   const [isSorting, setIsSorting] = useState(false);
-  const [isUpdatingTxt, setIsUpdatingTxt] = useState(false);
+  const [updateRequestInFlight, setUpdateRequestInFlight] = useState(false);
+  const [txtUpdateStatus, setTxtUpdateStatus] = useState<TxtUpdateStatus | null>(null);
+  const [splitSuspects, setSplitSuspects] = useState<SplitSuspect[]>([]);
+  const [showSplitSuspects, setShowSplitSuspects] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const sortRef = useRef<HTMLDivElement | null>(null);
   const displayRef = useRef<HTMLDivElement | null>(null);
-  const moreRef = useRef<HTMLDivElement | null>(null);
+  const prevUpdateRunningRef = useRef(false);
   const lastVisibleCodesRef = useRef<string[]>([]);
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
 
@@ -92,25 +94,28 @@ export default function GridView() {
 
   useEffect(() => {
     if (!backendReady) return;
-    api.get("/health").then((res) => {
-      setHealth(res.data as HealthStatus);
-    });
+    api
+      .get("/health", { validateStatus: () => true })
+      .then((res) => {
+        if (res.status >= 200 && res.status < 300) {
+          setHealth(res.data as HealthStatus);
+        }
+      })
+      .catch(() => undefined);
   }, [backendReady]);
 
   useEffect(() => {
-    if (!sortOpen && !displayOpen && !moreOpen) return;
+    if (!sortOpen && !displayOpen) return;
     const handleClick = (event: MouseEvent) => {
       const target = event.target as Node;
       if (sortRef.current && sortRef.current.contains(target)) return;
       if (displayRef.current && displayRef.current.contains(target)) return;
-      if (moreRef.current && moreRef.current.contains(target)) return;
       setSortOpen(false);
       setDisplayOpen(false);
-      setMoreOpen(false);
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [sortOpen, displayOpen, moreOpen]);
+  }, [sortOpen, displayOpen]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -124,7 +129,6 @@ export default function GridView() {
       if (event.key === "Escape") {
         setSortOpen(false);
         setDisplayOpen(false);
-        setMoreOpen(false);
       } else if (event.key === "1") {
         setGridTimeframe("monthly");
       } else if (event.key === "2") {
@@ -390,6 +394,31 @@ export default function GridView() {
     summary?: UpdateSummary;
   };
 
+  type TxtUpdateStatus = {
+    running?: boolean;
+    phase?: string;
+    started_at?: string;
+    finished_at?: string;
+    processed?: number;
+    total?: number;
+    summary?: UpdateSummary;
+    error?: string | null;
+    last_updated_at?: string | null;
+    stdout_tail?: string[];
+    elapsed_ms?: number | null;
+  };
+
+  type SplitSuspect = {
+    code: string;
+    file_date?: string;
+    file_close?: string;
+    pan_date?: string;
+    pan_close?: string;
+    diff_ratio?: string;
+    reason?: string;
+    detected_at?: string;
+  };
+
   const formatUpdatedAt = (value: string | null | undefined) => {
     if (!value) return null;
     const date = new Date(value);
@@ -400,7 +429,16 @@ export default function GridView() {
     )}:${pad(date.getMinutes())}`;
   };
 
-  const lastUpdatedLabel = formatUpdatedAt(health?.last_updated);
+  const lastUpdatedLabel = formatUpdatedAt(
+    (txtUpdateStatus?.last_updated_at as string | null | undefined) ?? health?.last_updated
+  );
+  const isUpdatingTxt = updateRequestInFlight || Boolean(txtUpdateStatus?.running);
+  const updateProgressLabel =
+    txtUpdateStatus?.running && typeof txtUpdateStatus.processed === "number" && txtUpdateStatus.total
+      ? `更新中 ${txtUpdateStatus.processed}/${txtUpdateStatus.total}`
+      : txtUpdateStatus?.running
+      ? "更新中"
+      : null;
 
   const formatUpdateSummary = (summary?: UpdateSummary) => {
     if (!summary) return null;
@@ -449,26 +487,50 @@ export default function GridView() {
       setToastMessage("TXT更新スクリプトが見つかりません。");
       return;
     }
+    if (error === "code_txt_missing") {
+      setToastMessage("code.txt が見つかりません。");
+      return;
+    }
+    if (error.startsWith("ingest_not_found")) {
+      setToastMessage("TXT取り込みスクリプトが見つかりません。");
+      return;
+    }
     setToastMessage("TXT更新に失敗しました。");
   };
 
+  const fetchTxtUpdateStatus = useCallback(async () => {
+    if (!backendReady) return;
+    try {
+      const res = await api.get("/txt_update/status");
+      setTxtUpdateStatus(res.data as TxtUpdateStatus);
+    } catch {
+      // Ignore status fetch errors while offline.
+    }
+  }, [backendReady]);
+
+  const fetchSplitSuspects = useCallback(async () => {
+    if (!backendReady) return [];
+    try {
+      const res = await api.get("/txt_update/split_suspects");
+      const items = (res.data?.items as SplitSuspect[]) ?? [];
+      setSplitSuspects(items);
+      return items;
+    } catch {
+      return [];
+    }
+  }, [backendReady]);
+
   const handleUpdateTxt = useCallback(async () => {
     if (isUpdatingTxt || !backendReady) return;
-    setIsUpdatingTxt(true);
+    setUpdateRequestInFlight(true);
+    setShowSplitSuspects(false);
+    setSplitSuspects([]);
     setToastMessage("TXT更新を開始しました。");
     try {
-      const res = await api.post("/update_txt");
+      const res = await api.post("/txt_update/run");
       const payload = res.data as UpdateTxtPayload;
       if (payload.ok) {
-        resetBarsCache();
-        await loadList();
-        setToastMessage(formatUpdateToast("TXT更新が完了しました。", payload.summary));
-        try {
-          const healthRes = await api.get("/health");
-          setHealth(healthRes.data as HealthStatus);
-        } catch {
-          // Keep last known health when refresh fails.
-        }
+        await fetchTxtUpdateStatus();
       } else {
         handleUpdateError(payload);
       }
@@ -484,17 +546,49 @@ export default function GridView() {
         setToastMessage("TXT更新に失敗しました。");
       }
     } finally {
-      setIsUpdatingTxt(false);
+      setUpdateRequestInFlight(false);
     }
-  }, [
-    isUpdatingTxt,
-    backendReady,
-    resetBarsCache,
-    loadList,
-    formatUpdatedAt,
-    formatUpdateToast,
-    handleUpdateError
-  ]);
+  }, [isUpdatingTxt, backendReady, fetchTxtUpdateStatus, handleUpdateError]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    fetchTxtUpdateStatus();
+  }, [backendReady, fetchTxtUpdateStatus]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    if (!txtUpdateStatus?.running) return;
+    const timer = window.setInterval(() => {
+      fetchTxtUpdateStatus();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [backendReady, txtUpdateStatus?.running, fetchTxtUpdateStatus]);
+
+  useEffect(() => {
+    const wasRunning = prevUpdateRunningRef.current;
+    const isRunning = Boolean(txtUpdateStatus?.running);
+    if (wasRunning && !isRunning) {
+      if (txtUpdateStatus?.phase === "done") {
+        const summary = txtUpdateStatus.summary;
+        resetBarsCache();
+        loadList();
+        setToastMessage(formatUpdateToast("TXT更新が完了しました。", summary));
+        fetchSplitSuspects().then((items) => {
+          if (items.length) {
+            setShowSplitSuspects(true);
+            setToastMessage(`分割疑い ${items.length}件。TXT削除→再更新してください。`);
+          }
+        });
+        api
+          .get("/health")
+          .then((res) => setHealth(res.data as HealthStatus))
+          .catch(() => undefined);
+      } else if (txtUpdateStatus?.phase === "error") {
+        setToastMessage("TXT更新に失敗しました。");
+      }
+    }
+    prevUpdateRunningRef.current = isRunning;
+  }, [txtUpdateStatus, resetBarsCache, loadList, formatUpdateToast, fetchSplitSuspects]);
 
   return (
     <div className="app-shell">
@@ -541,7 +635,6 @@ export default function GridView() {
                 onClick={() => {
                   setSortOpen((prev) => !prev);
                   setDisplayOpen(false);
-                  setMoreOpen(false);
                 }}
               >
                 並び替え：{sortLabel}・{sortDirLabel}
@@ -603,7 +696,6 @@ export default function GridView() {
                 onClick={() => {
                   setDisplayOpen((prev) => !prev);
                   setSortOpen(false);
-                  setMoreOpen(false);
                 }}
               >
                 表示
@@ -657,41 +749,19 @@ export default function GridView() {
                 </div>
               )}
             </div>
-            <div className="popover-anchor" ref={moreRef}>
+            <div className="txt-update-group">
               <button
                 type="button"
-                className="more-button"
-                aria-label="その他"
-                onClick={() => {
-                  setMoreOpen((prev) => !prev);
-                  setSortOpen(false);
-                  setDisplayOpen(false);
-                }}
+                className={`txt-update-button ${isUpdatingTxt ? "is-updating" : ""}`}
+                onClick={handleUpdateTxt}
+                disabled={!backendReady || isUpdatingTxt}
               >
-                ⋯
+                {isUpdatingTxt ? "TXT更新中..." : "TXT更新"}
               </button>
-              {moreOpen && (
-                <div className="popover-panel">
-                  <div className="popover-section">
-                    <button
-                      type="button"
-                      className="popover-item"
-                      onClick={() => {
-                        setMoreOpen(false);
-                        handleUpdateTxt();
-                      }}
-                      disabled={!backendReady || isUpdatingTxt}
-                    >
-                      <span>TXT更新（取り込み）</span>
-                      <span className="popover-status">
-                        {isUpdatingTxt && <span className="menu-spinner" aria-hidden="true" />}
-                        {isUpdatingTxt ? "更新中..." : "実行"}
-                      </span>
-                    </button>
-                    <div className="popover-note">
-                      最終更新：{lastUpdatedLabel ?? "--"}
-                    </div>
-                  </div>
+              {(updateProgressLabel || lastUpdatedLabel) && (
+                <div className="txt-update-meta">
+                  <span>{updateProgressLabel ?? "更新待ち"}</span>
+                  <span>最終更新：{lastUpdatedLabel ?? "--"}</span>
                 </div>
               )}
             </div>
@@ -706,6 +776,32 @@ export default function GridView() {
       {health && health.code_txt_missing && health.txt_count > 0 && (
         <div className="data-warning subtle">
           code.txt がありません。ファイル名から銘柄コードを推定しています（code.txt推奨）。
+        </div>
+      )}
+      {showSplitSuspects && splitSuspects.length > 0 && (
+        <div className="split-suspects-panel">
+          <div className="split-suspects-header">
+            <div className="split-suspects-title">分割疑い {splitSuspects.length}件</div>
+            <button type="button" onClick={() => setShowSplitSuspects(false)}>
+              閉じる
+            </button>
+          </div>
+          <div className="split-suspects-body">
+            <div className="split-suspects-note">
+              該当銘柄のTXTを削除してから再更新してください。
+            </div>
+            <div className="split-suspects-list">
+              {splitSuspects.slice(0, 50).map((item) => (
+                <div key={`${item.code}-${item.file_date}`} className="split-suspects-row">
+                  <span className="split-suspects-code">{item.code}</span>
+                  <span className="split-suspects-date">{item.file_date ?? "--"}</span>
+                  <span className="split-suspects-diff">
+                    差異 {item.diff_ratio ?? "--"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
       <div className="grid-shell" ref={ref}>

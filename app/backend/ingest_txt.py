@@ -6,7 +6,21 @@ import pandas as pd
 
 from db import get_conn, init_schema
 
-DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "txt"))
+
+def resolve_data_dir() -> str:
+    env = os.getenv("TXT_DATA_DIR")
+    if env:
+        return os.path.abspath(env)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    app_data = os.path.join(repo_root, "app", "data", "txt")
+    app_code = os.path.join(repo_root, "app", "data", "code.txt")
+    root_data = os.path.join(repo_root, "data", "txt")
+    if os.path.isfile(app_code) or os.path.isdir(app_data):
+        return app_data
+    return root_data
+
+
+DATA_DIR = resolve_data_dir()
 CODE_PATTERN_DEFAULT = r"^[0-9A-Za-z]{4,16}$"
 CODE_PATTERN = re.compile(os.getenv("CODE_PATTERN", CODE_PATTERN_DEFAULT))
 STRICT_CODE_VALIDATION = os.getenv("CODE_STRICT", "0") == "1"
@@ -20,6 +34,10 @@ def find_code_txt_path(data_dir: str) -> str | None:
     parent = os.path.join(os.path.dirname(data_dir), "code.txt")
     if os.path.exists(parent):
         return parent
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    tools_path = os.path.join(repo_root, "tools", "code.txt")
+    if os.path.exists(tools_path):
+        return tools_path
     return None
 
 

@@ -103,6 +103,7 @@ const StockTile = memo(function StockTile({
             showBoxes={showBoxes}
             maSettings={maSettings}
             cacheKey={cacheKey}
+            showAxes
           />
         ) : cachedThumb ? (
           <div className="thumb-canvas">

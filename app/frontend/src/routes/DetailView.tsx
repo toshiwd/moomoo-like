@@ -773,7 +773,7 @@ export default function DetailView() {
     focusPanel === "daily" ? "Daily (Focused)" : focusPanel === "weekly" ? "Weekly (Focused)" : "Monthly (Focused)";
 
   return (
-    <div className="detail-shell">
+    <div className={`detail-shell ${focusPanel ? "detail-shell-focus" : ""}`}>
       <div className="detail-header">
         <button className="back" onClick={() => navigate(-1)}>
           Back
@@ -799,10 +799,10 @@ export default function DetailView() {
             type="button"
             className={isFavorite ? "favorite-toggle active" : "favorite-toggle"}
             aria-pressed={isFavorite}
-            aria-label="お気に入り"
+            aria-label={isFavorite ? "お気に入り解除" : "お気に入り追加"}
             onClick={handleToggleFavorite}
           >
-            {isFavorite ? "❤️" : "♡"}
+            {isFavorite ? "♥" : "♡"}
           </button>
         </div>
         <div className="detail-controls">
@@ -1019,27 +1019,29 @@ export default function DetailView() {
           </>
         )}
       </div>
-      <div className="detail-footer">
-        <div className="detail-footer-left">
-          <button className="load-more" onClick={loadMoreDaily} disabled={loadingDaily || !hasMoreDaily}>
-            {loadingDaily ? "Loading daily..." : hasMoreDaily ? "Load more daily" : "Daily all loaded"}
-          </button>
-          <button
-            className="load-more"
-            onClick={loadMoreMonthly}
-            disabled={loadingMonthly || !hasMoreMonthly}
-          >
-            {loadingMonthly
-              ? "Loading monthly..."
-              : hasMoreMonthly
-              ? "Load more monthly"
-              : "Monthly all loaded"}
-          </button>
+      {!focusPanel && (
+        <div className="detail-footer">
+          <div className="detail-footer-left">
+            <button className="load-more" onClick={loadMoreDaily} disabled={loadingDaily || !hasMoreDaily}>
+              {loadingDaily ? "Loading daily..." : hasMoreDaily ? "Load more daily" : "Daily all loaded"}
+            </button>
+            <button
+              className="load-more"
+              onClick={loadMoreMonthly}
+              disabled={loadingMonthly || !hasMoreMonthly}
+            >
+              {loadingMonthly
+                ? "Loading monthly..."
+                : hasMoreMonthly
+                ? "Load more monthly"
+                : "Monthly all loaded"}
+            </button>
+          </div>
+          <div className="detail-hint">
+            Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
+          </div>
         </div>
-        <div className="detail-hint">
-          Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
-        </div>
-      </div>
+      )}
       {hasIssues && (
         <div className="detail-debug-banner warning">
           <button

@@ -7,6 +7,11 @@ import DetailChart from "../components/DetailChart";
 import Toast from "../components/Toast";
 import TopNav from "../components/TopNav";
 import { MaSetting, useStore } from "../store";
+import {
+  buildConsultationPack,
+  ConsultationSort,
+  ConsultationTimeframe
+} from "../utils/consultation";
 
 type RankItem = {
   code: string;
@@ -149,13 +154,17 @@ type RankChartCardProps = {
   index: number;
   onToggleFavorite: (code: string, isFavorite: boolean) => void;
   onOpenDetail: (code: string) => void;
+  selected: boolean;
+  onToggleSelect: (code: string) => void;
 };
 
 const RankChartCard = memo(function RankChartCard({
   item,
   index,
   onToggleFavorite,
-  onOpenDetail
+  onOpenDetail,
+  selected,
+  onToggleSelect
 }: RankChartCardProps) {
   const { ref, inView } = useInView();
   const [hoverTime, setHoverTime] = useState<number | null>(null);
@@ -207,20 +216,32 @@ const RankChartCard = memo(function RankChartCard({
   const scoreText = Number.isFinite(item.total_score ?? NaN) ? item.total_score?.toFixed(1) : "--";
   const badges = item.badges ?? [];
   const isFavorite = Boolean(item.is_favorite);
-
   return (
-    <button
+    <div
       ref={ref}
-      className="tile rank-tile"
-      type="button"
+      className={`tile rank-tile ${selected ? "is-selected" : ""}`}
+      role="button"
+      tabIndex={0}
       onClick={() => onOpenDetail(item.code)}
     >
       <div className="rank-tile-header">
         <div className="rank-tile-left">
           <span className="rank-badge">{index + 1}</span>
-          <div>
-            <div className="tile-code">{item.code}</div>
-            <div className="tile-name">{item.name ?? item.code}</div>
+          <div className="tile-id">
+            <label
+              className="tile-select-toggle"
+              onClick={(event) => event.stopPropagation()}
+              onDoubleClick={(event) => event.stopPropagation()}
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                onChange={() => onToggleSelect(item.code)}
+                aria-label={`${item.code} を選択`}
+              />
+              <span className="tile-code">{item.code}</span>
+            </label>
+            <span className="tile-name">{item.name ?? item.code}</span>
           </div>
         </div>
         <div className="rank-tile-right">
@@ -235,7 +256,7 @@ const RankChartCard = memo(function RankChartCard({
               onToggleFavorite(item.code, isFavorite);
             }}
           >
-            ♥
+            ?
           </button>
         </div>
       </div>
@@ -266,20 +287,39 @@ const RankChartCard = memo(function RankChartCard({
           </>
         )}
       </div>
-    </button>
+    </div>
   );
 });
+
 
 export default function RankingView() {
   const navigate = useNavigate();
   const { ready: backendReady } = useBackendReadyState();
   const setFavoriteLocal = useStore((state) => state.setFavoriteLocal);
+  const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
+  const barsCache = useStore((state) => state.barsCache);
+  const boxesCache = useStore((state) => state.boxesCache);
 
   const [dir, setDir] = useState<"up" | "down">("up");
   const [items, setItems] = useState<RankItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
+  const [consultVisible, setConsultVisible] = useState(false);
+  const [consultExpanded, setConsultExpanded] = useState(false);
+  const [consultTab, setConsultTab] = useState<"selection" | "position">("selection");
+  const [consultText, setConsultText] = useState("");
+  const [consultSort, setConsultSort] = useState<ConsultationSort>("score");
+  const [consultBusy, setConsultBusy] = useState(false);
+  const [consultMeta, setConsultMeta] = useState<{ omitted: number }>({ omitted: 0 });
+  const consultTimeframe: ConsultationTimeframe = "monthly";
+  const consultBarsCount = 60;
+  const consultPaddingClass = consultVisible
+    ? consultExpanded
+      ? "consult-padding-expanded"
+      : "consult-padding-mini"
+    : "";
 
   useEffect(() => {
     if (!backendReady) return;
@@ -301,6 +341,33 @@ export default function RankingView() {
       })
       .finally(() => setLoading(false));
   }, [backendReady, dir]);
+
+  useEffect(() => {
+    if (!items.length) {
+      setSelectedCodes([]);
+      return;
+    }
+    setSelectedCodes((prev) => prev.filter((code) => items.some((item) => item.code === code)));
+  }, [items]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && consultVisible) {
+        setConsultVisible(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [consultVisible]);
+
+  const selectedSet = useMemo(() => new Set(selectedCodes), [selectedCodes]);
+
+  const toggleSelect = useCallback((code: string) => {
+    setSelectedCodes((prev) => {
+      if (prev.includes(code)) return prev.filter((item) => item !== code);
+      return [...prev, code];
+    });
+  }, []);
 
   const handleToggleFavorite = useCallback(
     async (code: string, isFavorite: boolean) => {
@@ -329,6 +396,81 @@ export default function RankingView() {
     [setFavoriteLocal]
   );
 
+  const buildConsultation = useCallback(async () => {
+    if (!selectedCodes.length) return;
+    setConsultBusy(true);
+    try {
+      try {
+        await ensureBarsForVisible(consultTimeframe, selectedCodes, "consult-pack");
+      } catch {
+        // Use available cache even if fetch fails.
+      }
+      const itemsForPack = selectedCodes.map((code) => {
+        const rankItem = items.find((item) => item.code === code);
+        const payload = barsCache[consultTimeframe][code];
+        const boxes = boxesCache[consultTimeframe][code] ?? [];
+        return {
+          code,
+          name: rankItem?.name ?? null,
+          market: null,
+          sector: null,
+          bars: payload?.bars ?? null,
+          boxes,
+          boxState: null,
+          hasBox: null,
+          buyState: null,
+          buyStateScore: null,
+          buyStateReason: null,
+          buyStateDetails: null
+        };
+      });
+      const result = buildConsultationPack(
+        {
+          createdAt: new Date(),
+          timeframe: consultTimeframe,
+          barsCount: consultBarsCount
+        },
+        itemsForPack,
+        consultSort
+      );
+      setConsultText(result.text);
+      setConsultMeta({ omitted: result.omittedCount });
+      setConsultVisible(true);
+      setConsultExpanded(true);
+      setConsultTab("selection");
+    } finally {
+      setConsultBusy(false);
+    }
+  }, [
+    selectedCodes,
+    ensureBarsForVisible,
+    consultTimeframe,
+    items,
+    barsCache,
+    boxesCache,
+    consultSort
+  ]);
+
+  const handleCopyConsult = useCallback(async () => {
+    if (!consultText) {
+      setToastMessage("相談パックがまだありません。");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(consultText);
+      setToastMessage("相談パックをコピーしました。");
+    } catch {
+      setToastMessage("コピーに失敗しました。");
+    }
+  }, [consultText]);
+
+  const selectedChips = useMemo(() => {
+    const limit = 6;
+    const visible = selectedCodes.slice(0, limit);
+    const extra = Math.max(0, selectedCodes.length - visible.length);
+    return { visible, extra };
+  }, [selectedCodes]);
+
   const showSkeleton = backendReady && loading && items.length === 0;
 
   return (
@@ -356,9 +498,21 @@ export default function RankingView() {
               </button>
             </div>
           </div>
+          <div className="top-bar-right">
+            <button
+              type="button"
+              className="consult-trigger"
+              onClick={() => {
+                setConsultVisible(true);
+                setConsultExpanded(false);
+              }}
+            >
+              相談
+            </button>
+          </div>
         </div>
       </header>
-      <div className="rank-shell">
+      <div className={`rank-shell ${consultPaddingClass}`}>
         {showSkeleton && (
           <div className="rank-skeleton">
             {Array.from({ length: 4 }).map((_, index) => (
@@ -384,10 +538,127 @@ export default function RankingView() {
                   index={index}
                   onToggleFavorite={handleToggleFavorite}
                   onOpenDetail={(code) => navigate(`/detail/${code}`)}
+                  selected={selectedSet.has(item.code)}
+                  onToggleSelect={toggleSelect}
                 />
               ))}
             </div>
           </>
+        )}
+      </div>
+      <div
+        className={`consult-sheet ${consultVisible ? "is-visible" : "is-hidden"} ${
+          consultExpanded ? "is-expanded" : "is-mini"
+        }`}
+      >
+        <button
+          type="button"
+          className="consult-handle"
+          onClick={() => {
+            if (!consultVisible) return;
+            setConsultExpanded((prev) => !prev);
+          }}
+          aria-label={consultExpanded ? "相談バーを折りたたむ" : "相談バーを展開する"}
+        />
+        {!consultExpanded && (
+          <div className="consult-mini">
+            <div className="consult-mini-left">
+              <div className="consult-mini-count">選択 {selectedCodes.length}件</div>
+              <div className="consult-chips">
+                {selectedChips.visible.map((code) => (
+                  <span key={code} className="consult-chip">
+                    {code}
+                  </span>
+                ))}
+                {selectedChips.extra > 0 && (
+                  <span className="consult-chip">+{selectedChips.extra}</span>
+                )}
+              </div>
+            </div>
+            <div className="consult-mini-actions">
+              <button
+                type="button"
+                className="consult-primary"
+                onClick={buildConsultation}
+                disabled={!selectedCodes.length || consultBusy}
+              >
+                {consultBusy ? "作成中..." : "相談作成"}
+              </button>
+              <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
+                コピー
+              </button>
+              <button type="button" onClick={() => setConsultVisible(false)}>
+                閉じる
+              </button>
+            </div>
+          </div>
+        )}
+        {consultExpanded && (
+          <div className="consult-expanded">
+            <div className="consult-expanded-header">
+              <div className="consult-tabs">
+                <button
+                  type="button"
+                  className={consultTab === "selection" ? "active" : ""}
+                  onClick={() => setConsultTab("selection")}
+                >
+                  選定相談
+                </button>
+                <button
+                  type="button"
+                  className={consultTab === "position" ? "active" : ""}
+                  onClick={() => setConsultTab("position")}
+                >
+                  建玉相談
+                </button>
+              </div>
+              <div className="consult-expanded-actions">
+                <button
+                  type="button"
+                  className="consult-primary"
+                  onClick={buildConsultation}
+                  disabled={!selectedCodes.length || consultBusy}
+                >
+                  {consultBusy ? "作成中..." : "相談作成"}
+                </button>
+                <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
+                  コピー
+                </button>
+                <button type="button" onClick={() => setConsultVisible(false)}>
+                  閉じる
+                </button>
+              </div>
+            </div>
+            <div className="consult-expanded-body">
+              <div className="consult-expanded-meta-row">
+                <div className="consult-expanded-meta">
+                  選択 {selectedCodes.length}件
+                  {consultMeta.omitted
+                    ? ` / 表示外 ${consultMeta.omitted}件`
+                    : " / 最大10件まで表示"}
+                </div>
+                <div className="consult-sort">
+                  <span>並び順</span>
+                  <div className="segmented segmented-compact">
+                    {(["score", "code"] as ConsultationSort[]).map((key) => (
+                      <button
+                        key={key}
+                        className={consultSort === key ? "active" : ""}
+                        onClick={() => setConsultSort(key)}
+                      >
+                        {key === "score" ? "スコア順" : "コード順"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              {consultTab === "selection" ? (
+                <textarea className="consult-drawer-body" value={consultText} readOnly />
+              ) : (
+                <div className="consult-placeholder">建玉相談は準備中です。</div>
+              )}
+            </div>
+          </div>
         )}
       </div>
       <Toast message={toastMessage} onClose={() => setToastMessage(null)} />

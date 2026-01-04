@@ -9,6 +9,11 @@ import StockTile from "../components/StockTile";
 import Toast from "../components/Toast";
 import TopNav from "../components/TopNav";
 import { computeSignalMetrics } from "../utils/signals";
+import {
+  buildConsultationPack,
+  ConsultationSort,
+  ConsultationTimeframe
+} from "../utils/consultation";
 
 const TILE_HEIGHT = 220;
 const GRID_GAP = 12;
@@ -53,6 +58,7 @@ export default function GridView() {
   const resetBarsCache = useStore((state) => state.resetBarsCache);
   const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const barsCache = useStore((state) => state.barsCache);
+  const boxesCache = useStore((state) => state.boxesCache);
   const columns = useStore((state) => state.settings.columns);
   const search = useStore((state) => state.settings.search);
   const gridScrollTop = useStore((state) => state.settings.gridScrollTop);
@@ -80,12 +86,29 @@ export default function GridView() {
   const [txtUpdateStatus, setTxtUpdateStatus] = useState<TxtUpdateStatus | null>(null);
   const [splitSuspects, setSplitSuspects] = useState<SplitSuspect[]>([]);
   const [showSplitSuspects, setShowSplitSuspects] = useState(false);
+  const [updateLogLines, setUpdateLogLines] = useState<string[]>([]);
+  const [showUpdateLog, setShowUpdateLog] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
+  const [consultVisible, setConsultVisible] = useState(false);
+  const [consultExpanded, setConsultExpanded] = useState(false);
+  const [consultTab, setConsultTab] = useState<"selection" | "position">("selection");
+  const [consultText, setConsultText] = useState("");
+  const [consultSort, setConsultSort] = useState<ConsultationSort>("score");
+  const [consultBusy, setConsultBusy] = useState(false);
+  const [consultMeta, setConsultMeta] = useState<{ omitted: number }>({ omitted: 0 });
   const sortRef = useRef<HTMLDivElement | null>(null);
   const displayRef = useRef<HTMLDivElement | null>(null);
   const prevUpdateRunningRef = useRef(false);
   const lastVisibleCodesRef = useRef<string[]>([]);
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
+  const consultTimeframe: ConsultationTimeframe = "monthly";
+  const consultBarsCount = 60;
+  const consultPaddingClass = consultVisible
+    ? consultExpanded
+      ? "consult-padding-expanded"
+      : "consult-padding-mini"
+    : "";
 
   useEffect(() => {
     if (!backendReady) return;
@@ -129,6 +152,9 @@ export default function GridView() {
       if (event.key === "Escape") {
         setSortOpen(false);
         setDisplayOpen(false);
+        if (consultVisible) {
+          setConsultVisible(false);
+        }
       } else if (event.key === "1") {
         setGridTimeframe("monthly");
       } else if (event.key === "2") {
@@ -139,7 +165,7 @@ export default function GridView() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [setGridTimeframe]);
+  }, [setGridTimeframe, consultVisible]);
 
   useEffect(() => {
     setIsSorting(true);
@@ -149,6 +175,14 @@ export default function GridView() {
 
   const sortSections = useMemo<SortSection[]>(
     () => [
+      {
+        title: "買い候補",
+        options: [
+          { key: "buyCandidate", label: "買い候補（初動→底がため）" },
+          { key: "buyInitial", label: "買い候補（初動のみ）" },
+          { key: "buyBase", label: "監視（底がためのみ）" }
+        ]
+      },
       {
         title: "基本",
         options: [
@@ -227,11 +261,15 @@ export default function GridView() {
 
   const sortedTickers = useMemo(() => {
     const boxOrder: Record<string, number> = {
-      BREAKOUT_UP: 3,
-      IN_BOX: 2,
-      BREAKOUT_DOWN: 1,
+      IN_BOX: 3,
+      JUST_BREAKOUT: 2,
+      BREAKOUT_UP: 2,
+      BREAKOUT_DOWN: 2,
       NONE: 0
     };
+    const isBuyCandidate =
+      sortKey === "buyCandidate" || sortKey === "buyInitial" || sortKey === "buyBase";
+
     const items = scoredTickers.map((item) => {
       const ticker = item.ticker;
       let sortValue: string | number | null = null;
@@ -270,10 +308,71 @@ export default function GridView() {
       } else if (sortKey === "boxState") {
         const state = ticker.boxState ?? "NONE";
         sortValue = boxOrder[state] ?? 0;
+      } else if (isBuyCandidate) {
+        sortValue = null;
       }
       return { ...item, sortValue };
     });
+
+    const compareNumeric = (av: number | null, bv: number | null, dir: SortDir) => {
+      const aMissing = av == null || !Number.isFinite(av);
+      const bMissing = bv == null || !Number.isFinite(bv);
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;
+      if (bMissing) return -1;
+      const diff = (av ?? 0) - (bv ?? 0);
+      return dir === "desc" ? -diff : diff;
+    };
+
+    const compareBuyState = (a: typeof items[number], b: typeof items[number]) => {
+      const aState = a.ticker.buyState ?? "";
+      const bState = b.ticker.buyState ?? "";
+      const aRank = Number.isFinite(a.ticker.buyStateRank)
+        ? (a.ticker.buyStateRank as number)
+        : 0;
+      const bRank = Number.isFinite(b.ticker.buyStateRank)
+        ? (b.ticker.buyStateRank as number)
+        : 0;
+      const aScore = Number.isFinite(a.ticker.buyStateScore)
+        ? (a.ticker.buyStateScore as number)
+        : null;
+      const bScore = Number.isFinite(b.ticker.buyStateScore)
+        ? (b.ticker.buyStateScore as number)
+        : null;
+      const aRisk = Number.isFinite(a.ticker.buyRiskDistance)
+        ? (a.ticker.buyRiskDistance as number)
+        : null;
+      const bRisk = Number.isFinite(b.ticker.buyRiskDistance)
+        ? (b.ticker.buyRiskDistance as number)
+        : null;
+
+      if (sortKey === "buyInitial" || sortKey === "buyBase") {
+        const target = sortKey === "buyInitial" ? "初動" : "底がため";
+        const aEligible = aState === target;
+        const bEligible = bState === target;
+        if (aEligible !== bEligible) return aEligible ? -1 : 1;
+        if (!aEligible && !bEligible) return a.ticker.code.localeCompare(b.ticker.code);
+        const scoreResult = compareNumeric(aScore, bScore, sortDir);
+        if (scoreResult !== 0) return scoreResult;
+        const riskResult = compareNumeric(aRisk, bRisk, "asc");
+        if (riskResult !== 0) return riskResult;
+        return a.ticker.code.localeCompare(b.ticker.code);
+      }
+
+      if (aRank !== bRank) return bRank - aRank;
+      const scoreResult = compareNumeric(aScore, bScore, sortDir);
+      if (scoreResult !== 0) return scoreResult;
+      const riskResult = compareNumeric(aRisk, bRisk, "asc");
+      if (riskResult !== 0) return riskResult;
+      const totalResult = compareNumeric(a.ticker.score ?? null, b.ticker.score ?? null, "desc");
+      if (totalResult !== 0) return totalResult;
+      return a.ticker.code.localeCompare(b.ticker.code);
+    };
+
     const compare = (a: typeof items[number], b: typeof items[number]) => {
+      if (isBuyCandidate) {
+        return compareBuyState(a, b);
+      }
       const av = a.sortValue;
       const bv = b.sortValue;
       const aMissing =
@@ -301,6 +400,14 @@ export default function GridView() {
     items.sort(compare);
     return items;
   }, [scoredTickers, sortKey, sortDir, collator]);
+
+  const tickerMap = useMemo(() => {
+    const map = new Map<string, typeof tickers[number]>();
+    tickers.forEach((ticker) => map.set(ticker.code, ticker));
+    return map;
+  }, [tickers]);
+
+  const selectedSet = useMemo(() => new Set(selectedCodes), [selectedCodes]);
 
   const gridHeight = Math.max(200, size.height);
   const gridWidth = Math.max(0, size.width);
@@ -372,6 +479,13 @@ export default function GridView() {
     setShowBoxes(true);
   }, [setColumns, setShowBoxes]);
 
+  const toggleSelect = useCallback((code: string) => {
+    setSelectedCodes((prev) => {
+      if (prev.includes(code)) return prev.filter((item) => item !== code);
+      return [...prev, code];
+    });
+  }, []);
+
   const updateSetting = (frame: Timeframe, index: number, patch: Partial<MaSetting>) => {
     updateMaSetting(frame, index, patch);
   };
@@ -392,6 +506,8 @@ export default function GridView() {
     error?: string;
     last_updated_at?: string;
     summary?: UpdateSummary;
+    searched?: string[];
+    stdout_tail?: string[];
   };
 
   type TxtUpdateStatus = {
@@ -406,6 +522,8 @@ export default function GridView() {
     last_updated_at?: string | null;
     stdout_tail?: string[];
     elapsed_ms?: number | null;
+    timeout_sec?: number;
+    warning?: boolean;
   };
 
   type SplitSuspect = {
@@ -433,12 +551,18 @@ export default function GridView() {
     (txtUpdateStatus?.last_updated_at as string | null | undefined) ?? health?.last_updated
   );
   const isUpdatingTxt = updateRequestInFlight || Boolean(txtUpdateStatus?.running);
-  const updateProgressLabel =
-    txtUpdateStatus?.running && typeof txtUpdateStatus.processed === "number" && txtUpdateStatus.total
-      ? `更新中 ${txtUpdateStatus.processed}/${txtUpdateStatus.total}`
-      : txtUpdateStatus?.running
-      ? "更新中"
-      : null;
+  const updateProgressLabel = (() => {
+    if (!txtUpdateStatus?.running) return null;
+    if (txtUpdateStatus.phase === "ingesting") return "取り込み中";
+    if (
+      typeof txtUpdateStatus.processed === "number" &&
+      typeof txtUpdateStatus.total === "number" &&
+      txtUpdateStatus.total > 0
+    ) {
+      return `更新中 ${txtUpdateStatus.processed}/${txtUpdateStatus.total}`;
+    }
+    return "更新中";
+  })();
 
   const formatUpdateSummary = (summary?: UpdateSummary) => {
     if (!summary) return null;
@@ -488,7 +612,10 @@ export default function GridView() {
       return;
     }
     if (error === "code_txt_missing") {
-      setToastMessage("code.txt が見つかりません。");
+      const searched = payload?.searched?.filter(Boolean).join(" / ");
+      setToastMessage(
+        searched ? `code.txt が見つかりません（探索: ${searched}）` : "code.txt が見つかりません。"
+      );
       return;
     }
     if (error.startsWith("ingest_not_found")) {
@@ -502,7 +629,11 @@ export default function GridView() {
     if (!backendReady) return;
     try {
       const res = await api.get("/txt_update/status");
-      setTxtUpdateStatus(res.data as TxtUpdateStatus);
+      const payload = res.data as TxtUpdateStatus;
+      setTxtUpdateStatus(payload);
+      if (payload.stdout_tail && payload.stdout_tail.length) {
+        setUpdateLogLines(payload.stdout_tail);
+      }
     } catch {
       // Ignore status fetch errors while offline.
     }
@@ -520,11 +651,89 @@ export default function GridView() {
     }
   }, [backendReady]);
 
+  const buildConsultation = useCallback(async () => {
+    if (!selectedCodes.length) return;
+    setConsultBusy(true);
+    try {
+      try {
+        await ensureBarsForVisible(consultTimeframe, selectedCodes, "consult-pack");
+      } catch {
+        // Use available cache even if fetch fails.
+      }
+      const items = selectedCodes.map((code) => {
+        const ticker = tickerMap.get(code);
+        const payload = barsCache[consultTimeframe][code];
+        const boxes = boxesCache[consultTimeframe][code] ?? [];
+        return {
+          code,
+          name: ticker?.name ?? null,
+          market: null,
+          sector: null,
+          bars: payload?.bars ?? null,
+          boxes,
+          boxState: ticker?.boxState ?? null,
+          hasBox: ticker?.hasBox ?? null,
+          buyState: ticker?.buyState ?? null,
+          buyStateScore:
+            typeof ticker?.buyStateScore === "number" ? ticker.buyStateScore : null,
+          buyStateReason: ticker?.buyStateReason ?? null,
+          buyStateDetails: ticker?.buyStateDetails ?? null
+        };
+      });
+      const result = buildConsultationPack(
+        {
+          createdAt: new Date(),
+          timeframe: consultTimeframe,
+          barsCount: consultBarsCount
+        },
+        items,
+        consultSort
+      );
+      setConsultText(result.text);
+      setConsultMeta({ omitted: result.omittedCount });
+      setConsultVisible(true);
+      setConsultExpanded(true);
+      setConsultTab("selection");
+    } finally {
+      setConsultBusy(false);
+    }
+  }, [
+    selectedCodes,
+    ensureBarsForVisible,
+    consultTimeframe,
+    barsCache,
+    boxesCache,
+    tickerMap,
+    consultSort
+  ]);
+
+  const handleCopyConsult = useCallback(async () => {
+    if (!consultText) {
+      setToastMessage("相談パックがまだありません。");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(consultText);
+      setToastMessage("相談パックをコピーしました。");
+    } catch {
+      setToastMessage("コピーに失敗しました。");
+    }
+  }, [consultText]);
+
+  const selectedChips = useMemo(() => {
+    const limit = 6;
+    const visible = selectedCodes.slice(0, limit);
+    const extra = Math.max(0, selectedCodes.length - visible.length);
+    return { visible, extra };
+  }, [selectedCodes]);
+
   const handleUpdateTxt = useCallback(async () => {
     if (isUpdatingTxt || !backendReady) return;
     setUpdateRequestInFlight(true);
     setShowSplitSuspects(false);
     setSplitSuspects([]);
+    setShowUpdateLog(false);
+    setUpdateLogLines([]);
     setToastMessage("TXT更新を開始しました。");
     try {
       const res = await api.post("/txt_update/run");
@@ -572,7 +781,16 @@ export default function GridView() {
         const summary = txtUpdateStatus.summary;
         resetBarsCache();
         loadList();
-        setToastMessage(formatUpdateToast("TXT更新が完了しました。", summary));
+        const hasWarning = Boolean(txtUpdateStatus.warning);
+        setToastMessage(
+          formatUpdateToast(
+            hasWarning ? "TXT更新が完了しました（警告あり）。" : "TXT更新が完了しました。",
+            summary
+          )
+        );
+        if (hasWarning) {
+          setShowUpdateLog(true);
+        }
         fetchSplitSuspects().then((items) => {
           if (items.length) {
             setShowSplitSuspects(true);
@@ -585,6 +803,7 @@ export default function GridView() {
           .catch(() => undefined);
       } else if (txtUpdateStatus?.phase === "error") {
         setToastMessage("TXT更新に失敗しました。");
+        setShowUpdateLog(true);
       }
     }
     prevUpdateRunningRef.current = isRunning;
@@ -628,6 +847,16 @@ export default function GridView() {
             </div>
           </div>
           <div className="toolbar-right">
+            <button
+              type="button"
+              className="consult-trigger"
+              onClick={() => {
+                setConsultVisible(true);
+                setConsultExpanded(false);
+              }}
+            >
+              相談
+            </button>
             <div className="popover-anchor" ref={sortRef}>
               <button
                 type="button"
@@ -804,7 +1033,28 @@ export default function GridView() {
           </div>
         </div>
       )}
-      <div className="grid-shell" ref={ref}>
+      {showUpdateLog && (
+        <div className="update-log-panel">
+          <div className="update-log-header">
+            <div className="update-log-title">TXT更新ログ（末尾）</div>
+            <button type="button" onClick={() => setShowUpdateLog(false)}>
+              閉じる
+            </button>
+          </div>
+          {txtUpdateStatus?.error && (
+            <div className="update-log-error">
+              原因: {txtUpdateStatus.error}
+              {txtUpdateStatus.error === "timeout" && txtUpdateStatus.timeout_sec
+                ? `（${txtUpdateStatus.timeout_sec}s）`
+                : ""}
+            </div>
+          )}
+          <pre className="update-log-body">
+            {updateLogLines.length ? updateLogLines.join("\n") : "ログはまだありません。"}
+          </pre>
+        </div>
+      )}
+      <div className={`grid-shell ${consultPaddingClass}`} ref={ref}>
         {showSkeleton && (
           <div className="grid-skeleton">
             {Array.from({ length: 8 }).map((_, index) => (
@@ -851,11 +1101,128 @@ export default function GridView() {
                       trendStrength={item.metrics?.trendStrength ?? null}
                       exhaustionRisk={item.metrics?.exhaustionRisk ?? null}
                       onOpenDetail={handleOpenDetail}
+                      selected={selectedSet.has(item.ticker.code)}
+                      onToggleSelect={toggleSelect}
                     />
                   </div>
                 );
               }}
             </Grid>
+          </div>
+        )}
+      </div>
+      <div
+        className={`consult-sheet ${consultVisible ? "is-visible" : "is-hidden"} ${
+          consultExpanded ? "is-expanded" : "is-mini"
+        }`}
+      >
+        <button
+          type="button"
+          className="consult-handle"
+          onClick={() => {
+            if (!consultVisible) return;
+            setConsultExpanded((prev) => !prev);
+          }}
+          aria-label={consultExpanded ? "相談バーを折りたたむ" : "相談バーを展開する"}
+        />
+        {!consultExpanded && (
+          <div className="consult-mini">
+            <div className="consult-mini-left">
+              <div className="consult-mini-count">選択 {selectedCodes.length}件</div>
+              <div className="consult-chips">
+                {selectedChips.visible.map((code) => (
+                  <span key={code} className="consult-chip">
+                    {code}
+                  </span>
+                ))}
+                {selectedChips.extra > 0 && (
+                  <span className="consult-chip">+{selectedChips.extra}</span>
+                )}
+              </div>
+            </div>
+            <div className="consult-mini-actions">
+              <button
+                type="button"
+                className="consult-primary"
+                onClick={buildConsultation}
+                disabled={!selectedCodes.length || consultBusy}
+              >
+                {consultBusy ? "作成中..." : "相談作成"}
+              </button>
+              <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
+                コピー
+              </button>
+              <button type="button" onClick={() => setConsultVisible(false)}>
+                閉じる
+              </button>
+            </div>
+          </div>
+        )}
+        {consultExpanded && (
+          <div className="consult-expanded">
+            <div className="consult-expanded-header">
+              <div className="consult-tabs">
+                <button
+                  type="button"
+                  className={consultTab === "selection" ? "active" : ""}
+                  onClick={() => setConsultTab("selection")}
+                >
+                  選定相談
+                </button>
+                <button
+                  type="button"
+                  className={consultTab === "position" ? "active" : ""}
+                  onClick={() => setConsultTab("position")}
+                >
+                  建玉相談
+                </button>
+              </div>
+              <div className="consult-expanded-actions">
+                <button
+                  type="button"
+                  className="consult-primary"
+                  onClick={buildConsultation}
+                  disabled={!selectedCodes.length || consultBusy}
+                >
+                  {consultBusy ? "作成中..." : "相談作成"}
+                </button>
+                <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
+                  コピー
+                </button>
+                <button type="button" onClick={() => setConsultVisible(false)}>
+                  閉じる
+                </button>
+              </div>
+            </div>
+            <div className="consult-expanded-body">
+              <div className="consult-expanded-meta-row">
+                <div className="consult-expanded-meta">
+                  選択 {selectedCodes.length}件
+                  {consultMeta.omitted
+                    ? ` / 表示外 ${consultMeta.omitted}件`
+                    : " / 最大10件まで表示"}
+                </div>
+                <div className="consult-sort">
+                  <span>並び順</span>
+                  <div className="segmented segmented-compact">
+                    {(["score", "code"] as ConsultationSort[]).map((key) => (
+                      <button
+                        key={key}
+                        className={consultSort === key ? "active" : ""}
+                        onClick={() => setConsultSort(key)}
+                      >
+                        {key === "score" ? "スコア順" : "コード順"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              {consultTab === "selection" ? (
+                <textarea className="consult-drawer-body" value={consultText} readOnly />
+              ) : (
+                <div className="consult-placeholder">建玉相談は準備中です。</div>
+              )}
+            </div>
           </div>
         )}
       </div>

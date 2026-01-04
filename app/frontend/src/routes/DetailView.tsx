@@ -8,7 +8,7 @@ import Toast from "../components/Toast";
 import { Box, MaSetting, useStore } from "../store";
 import { computeSignalMetrics } from "../utils/signals";
 import type { TradeEvent } from "../utils/positions";
-import { buildDailyPositions } from "../utils/positions";
+import { buildDailyPositions, buildPositionLedger } from "../utils/positions";
 
 type Timeframe = "daily" | "weekly" | "monthly";
 type FocusPanel = Timeframe | null;
@@ -76,6 +76,14 @@ const normalizeDateParts = (year: number, month: number, day: number) => {
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
   if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) return null;
   return Math.floor(Date.UTC(year, month - 1, day) / 1000);
+};
+
+const formatNumber = (value: number | null | undefined, digits = 0) => {
+  if (value == null || !Number.isFinite(value)) return "--";
+  return value.toLocaleString("ja-JP", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
 };
 
 const normalizeTime = (value: unknown) => {
@@ -313,6 +321,8 @@ export default function DetailView() {
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [focusPanel, setFocusPanel] = useState<FocusPanel>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [showPositionLedger, setShowPositionLedger] = useState(false);
+  const [positionLedgerExpanded, setPositionLedgerExpanded] = useState(false);
 
   const tickerName = useMemo(() => {
     if (!code) return "";
@@ -321,12 +331,7 @@ export default function DetailView() {
     return cleaned === "?" ? "" : cleaned;
   }, [tickers, code]);
 
-  const subtitle = useMemo(() => {
-    const parts = [] as string[];
-    if (tickerName) parts.push(tickerName);
-    parts.push("Daily / Weekly / Monthly");
-    return parts.filter(Boolean).join(" / ");
-  }, [tickerName]);
+  const subtitle = "Daily / Weekly / Monthly";
 
   const favoritesSet = useMemo(() => new Set(favorites), [favorites]);
   const isFavorite = useMemo(() => (code ? favoritesSet.has(code) : false), [favoritesSet, code]);
@@ -467,6 +472,39 @@ export default function DetailView() {
   );
   const dailyPositions = positionData.dailyPositions;
   const tradeMarkers = positionData.tradeMarkers;
+  const positionLedger = useMemo(() => buildPositionLedger(trades), [trades]);
+  const ledgerGroups = useMemo(() => {
+    const brokerOrder = (key: string) => {
+      if (key === "rakuten") return 0;
+      if (key === "sbi") return 1;
+      if (key === "unknown") return 2;
+      return 3;
+    };
+    const map = new Map<
+      string,
+      { brokerKey: string; brokerLabel: string; account: string; rows: typeof positionLedger }
+    >();
+    positionLedger.forEach((row) => {
+      const brokerKey = row.brokerKey ?? "unknown";
+      const brokerLabel = row.brokerLabel ?? "N/A";
+      const account = row.account ?? "";
+      const groupKey = `${brokerKey}|${account}`;
+      const existing = map.get(groupKey);
+      if (existing) {
+        existing.rows.push(row);
+      } else {
+        map.set(groupKey, { brokerKey, brokerLabel, account, rows: [row] });
+      }
+    });
+    return Array.from(map.values()).sort((a, b) => {
+      const order = brokerOrder(a.brokerKey) - brokerOrder(b.brokerKey);
+      if (order !== 0) return order;
+      return `${a.brokerLabel}${a.account}`.localeCompare(`${b.brokerLabel}${b.account}`);
+    });
+  }, [positionLedger]);
+  const ledgerEligible = ledgerGroups.some((group) =>
+    group.rows.some((row) => row.realizedPnL !== null || row.price !== null)
+  );
   const dailyRangeCount = useMemo(
     () => countInRange(dailyCandles, rangeMonths),
     [dailyCandles, rangeMonths]
@@ -624,6 +662,11 @@ export default function DetailView() {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (showPositionLedger) {
+          setShowPositionLedger(false);
+          setPositionLedgerExpanded(false);
+          return;
+        }
         setFocusPanel(null);
       }
     };
@@ -631,7 +674,7 @@ export default function DetailView() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, []);
+  }, [showPositionLedger]);
 
   useEffect(() => {
     if (hoverRafRef.current !== null) {
@@ -780,7 +823,10 @@ export default function DetailView() {
         </button>
         <div className="detail-title">
           <div>
-            <div className="title">{code}</div>
+            <div className="detail-title-main">
+              <div className="title">{code}</div>
+              {tickerName && <div className="title-name">{tickerName}</div>}
+            </div>
             <div className="subtitle">{subtitle}</div>
             {dailySignals.length > 0 && (
               <div className="detail-signals">
@@ -825,9 +871,23 @@ export default function DetailView() {
           </button>
           <button
             className={showTradesOverlay ? "indicator-button active" : "indicator-button"}
-            onClick={() => setShowTradesOverlay(!showTradesOverlay)}
+            onClick={() => setShowTradesOverlay((prev) => !prev)}
           >
             Positions
+          </button>
+          <button
+            className={showPositionLedger ? "indicator-button active" : "indicator-button"}
+            onClick={() =>
+              setShowPositionLedger((prev) => {
+                const next = !prev;
+                if (!next) {
+                  setPositionLedgerExpanded(false);
+                }
+                return next;
+              })
+            }
+          >
+            建玉推移
           </button>
           <button
             className={showPnLPanel ? "indicator-button active" : "indicator-button"}
@@ -1040,6 +1100,98 @@ export default function DetailView() {
           <div className="detail-hint">
             Daily {dailyCandles.length} bars | Weekly {weeklyCandles.length} bars | Monthly {monthlyCandles.length} bars
           </div>
+        </div>
+      )}
+      {showPositionLedger && (
+        <div
+          className={`position-ledger-sheet ${
+            positionLedgerExpanded ? "is-expanded" : "is-mini"
+          }`}
+        >
+          <button
+            type="button"
+            className="position-ledger-handle"
+            onClick={() => setPositionLedgerExpanded((prev) => !prev)}
+            aria-label={positionLedgerExpanded ? "Collapse position ledger" : "Expand position ledger"}
+          />
+          <div className="position-ledger-header">
+            <div>
+              <div className="position-ledger-title">Position Ledger (Per Broker)</div>
+              <div className="position-ledger-sub">Grouped by broker</div>
+            </div>
+            <button
+              type="button"
+              className="position-ledger-close"
+              onClick={() => {
+                setShowPositionLedger(false);
+                setPositionLedgerExpanded(false);
+              }}
+              aria-label="Close position ledger"
+            >
+              x
+            </button>
+          </div>
+          {!ledgerEligible ? (
+            <div className="position-ledger-empty">
+              No eligible position ledger data.
+            </div>
+          ) : (
+            <div className="position-ledger-group-list">
+              {ledgerGroups.map((group) => (
+                <div
+                  key={`${group.brokerKey}-${group.account}`}
+                  className={`position-ledger-group broker-${group.brokerKey}`}
+                >
+                  <div className="position-ledger-group-header">
+                    <span className="broker-badge">{group.brokerLabel}</span>
+                    {group.account && (
+                      <span className="position-ledger-account">{group.account}</span>
+                    )}
+                  </div>
+                  <div className="position-ledger-table">
+                    <div className="position-ledger-row position-ledger-head">
+                      <span>Date</span>
+                      <span>Type</span>
+                      <span>Qty</span>
+                      <span>Price</span>
+                      <span>Long</span>
+                      <span>Short</span>
+                      <span>PnL</span>
+                      <span>Total</span>
+                    </div>
+                    {group.rows.map((row, index) => (
+                      <div className="position-ledger-row" key={`${row.date}-${index}`}>
+                        <span>{row.date}</span>
+                        <span className="position-ledger-kind">{row.kindLabel}</span>
+                        <span>{formatNumber(row.qtyShares, 0)}</span>
+                        <span>{formatNumber(row.price, 2)}</span>
+                        <span>{formatNumber(row.buyShares, 0)}</span>
+                        <span>{formatNumber(row.sellShares, 0)}</span>
+                        <span
+                          className={
+                            row.realizedPnL == null
+                              ? "position-ledger-pnl"
+                              : row.realizedPnL >= 0
+                              ? "position-ledger-pnl up"
+                              : "position-ledger-pnl down"
+                          }
+                        >
+                          {row.realizedPnL == null ? "--" : formatNumber(row.realizedPnL, 0)}
+                        </span>
+                        <span
+                          className={
+                            row.totalPnL >= 0 ? "position-ledger-pnl up" : "position-ledger-pnl down"
+                          }
+                        >
+                          {formatNumber(row.totalPnL, 0)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {hasIssues && (

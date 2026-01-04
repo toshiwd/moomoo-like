@@ -75,7 +75,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
   const lineSeriesRef = useRef<any[]>([]);
   const [overlayTargets, setOverlayTargets] = useState<{
     candleSeries: any;
-  }>({ candleSeries: null });
+    chart: ReturnType<typeof createChart> | null;
+  }>({ candleSeries: null, chart: null });
   const dataRef = useRef({ candles, volume, maLines, showVolume, boxes, showBoxes });
   const visibleRangeRef = useRef<DetailChartProps["visibleRange"]>(visibleRange);
   const candlesRef = useRef<Candle[]>(candles);
@@ -408,7 +409,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       candleSeriesRef.current = candleSeries;
       volumeSeriesRef.current = volumeSeries;
       lineSeriesRef.current = lineSeries;
-      setOverlayTargets({ candleSeries });
+      setOverlayTargets({ candleSeries, chart });
 
       applyData(dataRef.current);
       resizeOverlay();
@@ -462,7 +463,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
       lineSeriesRef.current = [];
-      setOverlayTargets({ candleSeries: null });
+      setOverlayTargets({ candleSeries: null, chart: null });
     };
   }, []);
 
@@ -473,6 +474,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       {positionOverlay && (
         <PositionOverlay
           candleSeries={overlayTargets.candleSeries}
+          chart={overlayTargets.chart}
           dailyPositions={positionOverlay.dailyPositions}
           tradeMarkers={positionOverlay.tradeMarkers}
           showOverlay={positionOverlay.showOverlay}

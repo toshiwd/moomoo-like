@@ -16,35 +16,60 @@ from fastapi.responses import JSONResponse
 from db import get_conn, init_schema
 from box_detector import detect_boxes
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_PAN_VBS_PATH = os.path.join(REPO_ROOT, "tools", "export_pan.vbs")
+DEFAULT_PAN_CODE_PATH = os.path.join(REPO_ROOT, "tools", "code.txt")
+DEFAULT_PAN_OUT_DIR = os.path.join(REPO_ROOT, "data", "txt")
+
 
 def resolve_data_dir() -> str:
-    env = os.getenv("TXT_DATA_DIR")
+    env = os.getenv("PAN_OUT_TXT_DIR") or os.getenv("TXT_DATA_DIR")
     if env:
         return os.path.abspath(env)
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    app_data = os.path.join(repo_root, "app", "data", "txt")
-    app_code = os.path.join(repo_root, "app", "data", "code.txt")
-    root_data = os.path.join(repo_root, "data", "txt")
-    if os.path.isfile(app_code) or os.path.isdir(app_data):
-        return app_data
-    return root_data
+    return os.path.abspath(DEFAULT_PAN_OUT_DIR)
 
 
 DATA_DIR = resolve_data_dir()
-DEFAULT_TRADE_CSV_PATH = os.path.abspath(
+DEFAULT_TRADE_RAKUTEN_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "楽天証券取引履歴.csv")
 )
-TRADE_CSV_PATH = os.getenv("TRADE_CSV_PATH") or DEFAULT_TRADE_CSV_PATH
+DEFAULT_TRADE_SBI_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "data", "SBI証券取引履歴.csv")
+)
+
+
+def resolve_trade_csv_paths() -> list[str]:
+    env = os.getenv("TRADE_CSV_PATH")
+    if env:
+        parts = [p.strip() for p in re.split(r"[;,\\n]+", env) if p.strip()]
+        return [os.path.abspath(part) for part in parts]
+    paths: list[str] = []
+    if os.path.isfile(DEFAULT_TRADE_RAKUTEN_PATH):
+        paths.append(DEFAULT_TRADE_RAKUTEN_PATH)
+    if os.path.isfile(DEFAULT_TRADE_SBI_PATH):
+        paths.append(DEFAULT_TRADE_SBI_PATH)
+    if not paths:
+        paths.append(DEFAULT_TRADE_RAKUTEN_PATH)
+    return paths
+
+
+TRADE_CSV_PATHS = resolve_trade_csv_paths()
 USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
 DEFAULT_DB_PATH = os.getenv("STOCKS_DB_PATH", os.path.join(os.path.dirname(__file__), "stocks.duckdb"))
 RANK_CONFIG_PATH = os.getenv("RANK_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "rank_config.json"))
 FAVORITES_DB_PATH = os.getenv(
     "FAVORITES_DB_PATH", os.path.join(os.path.dirname(__file__), "favorites.sqlite")
 )
-UPDATE_VBS_PATH = os.getenv(
-    "UPDATE_VBS_PATH",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "tools", "pan", "export_pan.vbs"))
+PAN_EXPORT_VBS_PATH = os.path.abspath(
+    os.getenv("PAN_EXPORT_VBS_PATH") or os.getenv("UPDATE_VBS_PATH") or DEFAULT_PAN_VBS_PATH
 )
+PAN_CODE_TXT_PATH = os.path.abspath(
+    os.getenv("PAN_CODE_TXT_PATH") or DEFAULT_PAN_CODE_PATH
+)
+PAN_OUT_TXT_DIR = os.path.abspath(
+    os.getenv("PAN_OUT_TXT_DIR") or DEFAULT_PAN_OUT_DIR
+)
+UPDATE_VBS_PATH = PAN_EXPORT_VBS_PATH
 INGEST_SCRIPT_PATH = os.getenv(
     "INGEST_SCRIPT_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "ingest_txt.py"))
@@ -56,7 +81,7 @@ UPDATE_STATE_PATH = os.getenv(
 SPLIT_SUSPECTS_PATH = os.path.abspath(os.path.join(DATA_DIR, "_split_suspects.csv"))
 
 
-_trade_cache = {"mtime": None, "path": None, "rows": [], "warnings": []}
+_trade_cache = {"key": None, "rows": [], "warnings": []}
 _screener_cache = {"mtime": None, "rows": []}
 _rank_cache = {"mtime": None, "config_mtime": None, "weekly": {}, "monthly": {}}
 _rank_config_cache = {"mtime": None, "config": None}
@@ -130,16 +155,8 @@ def _load_favorite_items() -> list[dict]:
 
 
 def find_code_txt_path(data_dir: str) -> str | None:
-    direct = os.path.join(data_dir, "code.txt")
-    if os.path.exists(direct):
-        return direct
-    parent = os.path.join(os.path.dirname(data_dir), "code.txt")
-    if os.path.exists(parent):
-        return parent
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    tools_path = os.path.join(repo_root, "tools", "code.txt")
-    if os.path.exists(tools_path):
-        return tools_path
+    if os.path.exists(PAN_CODE_TXT_PATH):
+        return PAN_CODE_TXT_PATH
     return None
 
 app = FastAPI()
@@ -161,74 +178,24 @@ def on_startup():
 
 def _parse_trade_csv() -> dict:
     warnings: list[dict] = []
-    path = TRADE_CSV_PATH
-    if not os.path.isfile(path):
-        warnings.append({"type": "trade_csv_missing", "message": f"trade_csv_missing:{path}"})
+    paths = resolve_trade_csv_paths()
+    existing_paths = [path for path in paths if os.path.isfile(path)]
+    if not existing_paths:
+        missing = ", ".join(paths)
+        warnings.append({"type": "trade_csv_missing", "message": f"trade_csv_missing:{missing}"})
         return {"rows": [], "warnings": warnings}
-    mtime = os.path.getmtime(path)
-    if _trade_cache["mtime"] == mtime and _trade_cache["path"] == path:
+
+    key = tuple((path, os.path.getmtime(path)) for path in existing_paths)
+    if _trade_cache["key"] == key:
         return {"rows": _trade_cache["rows"], "warnings": _trade_cache["warnings"]}
 
     rows: list[dict] = []
-    unknown_labels_by_code: dict[str, set[str]] = {}
-    try:
-        handle = open(path, "r", encoding="cp932", newline="")
-    except OSError as exc:
-        warnings.append({"type": "trade_csv_read_failed", "message": f"trade_csv_read_failed:{exc}"})
-        return {"rows": [], "warnings": warnings}
-
-    rows_all: list[list[str]] = []
-    encoding_used = "cp932"
-    try:
-        with handle:
-            reader = csv.reader(handle)
-            rows_all = list(reader)
-    except UnicodeDecodeError:
-        try:
-            with open(path, "r", encoding="utf-8-sig", newline="") as fallback:
-                reader = csv.reader(fallback)
-                rows_all = list(reader)
-                encoding_used = "utf-8-sig"
-                warnings.append(
-                    {"type": "trade_csv_encoding_fallback", "message": "trade_csv_encoding_fallback:utf-8-sig"}
-                )
-        except OSError as exc:
-            warnings.append({"type": "trade_csv_read_failed", "message": f"trade_csv_read_failed:{exc}"})
-            return {"rows": [], "warnings": warnings}
-
-    header = rows_all[0] if rows_all else None
-    if not header:
-        _trade_cache["mtime"] = mtime
-        _trade_cache["path"] = path
-        _trade_cache["rows"] = []
-        _trade_cache["warnings"] = warnings
-        return {"rows": [], "warnings": warnings}
-
-    header = [cell.strip() for cell in header]
-
-    def find_col(*names: str) -> int | None:
-        for name in names:
-            if name in header:
-                return header.index(name)
-        return None
-
-    col_date = find_col("約定日", "約定日付")
-    col_code = find_col("銘柄コード", "銘柄ｺｰﾄﾞ")
-    col_name = find_col("銘柄名")
-    col_kind = find_col("売買区分")
-    col_type = find_col("取引区分")
-    col_qty = find_col("数量［株］", "数量[株]", "数量")
-    col_price = find_col("単価［円］", "単価[円]", "単価")
-    col_amount = find_col("受渡金額", "受渡金額［円］", "受渡金額[円]")
-
-    dedup_keys: set[str] = set()
-    duplicate_counts: dict[str, int] = {}
 
     def normalize_text(value: str | None) -> str:
         if value is None:
             return ""
         text = str(value).replace("\ufeff", "")
-        if text.strip().lower() in ("nan", "none"):
+        if text.strip().lower() in ("nan", "none", "--"):
             return ""
         text = text.replace("\u3000", " ")
         return text.strip()
@@ -239,203 +206,638 @@ def _parse_trade_csv() -> dict:
             return ""
         return re.sub(r"\s+", "", text)
 
-    for row_index, line in enumerate(rows_all[1:], start=1):
-        if not line or col_date is None or col_code is None:
-            continue
-        date_raw = line[col_date].strip()
-        code_raw = line[col_code].strip()
-        if not date_raw or not code_raw:
-            continue
+    def read_csv_rows(path: str, encoding: str) -> list[list[str]]:
+        with open(path, "r", encoding=encoding, newline="") as handle:
+            reader = csv.reader(handle)
+            return list(reader)
 
-        date_value = None
+    def to_float(value: str) -> float:
+        try:
+            return float(value.replace(",", ""))
+        except ValueError:
+            return 0.0
+
+    def to_optional_float(value: str) -> float | None:
+        text = normalize_text(value)
+        if not text:
+            return None
+        try:
+            return float(text.replace(",", ""))
+        except ValueError:
+            return None
+
+    def parse_date(value: str) -> str | None:
+        raw = normalize_text(value)
+        if not raw:
+            return None
         for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y%m%d"):
             try:
-                date_value = datetime.strptime(date_raw, fmt).strftime("%Y-%m-%d")
-                break
+                return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
             except ValueError:
                 continue
-        if date_value is None:
-            continue
+        return None
 
-        code_match = re.search(r"\d{4}", code_raw)
-        if not code_match:
-            continue
-        code = code_match.group(0)
+    def find_sbi_header_index(rows_all: list[list[str]]) -> int | None:
+        start = min(6, max(0, len(rows_all)))
+        for idx in range(start, min(len(rows_all), start + 6)):
+            row = rows_all[idx]
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            if "約定日" in row or "銘柄コード" in row:
+                return idx
+        return None
 
-        name = normalize_text(line[col_name]) if col_name is not None and col_name < len(line) else ""
-        kind_raw = normalize_text(line[col_kind]) if col_kind is not None and col_kind < len(line) else ""
-        type_raw = normalize_text(line[col_type]) if col_type is not None and col_type < len(line) else ""
-        qty_raw = normalize_text(line[col_qty]) if col_qty is not None and col_qty < len(line) else ""
-        price_raw = normalize_text(line[col_price]) if col_price is not None and col_price < len(line) else ""
-        amount_raw = normalize_text(line[col_amount]) if col_amount is not None and col_amount < len(line) else ""
+    def looks_like_sbi(rows_all: list[list[str]]) -> bool:
+        for row in rows_all[:10]:
+            if any("CSV作成日" in cell for cell in row):
+                return True
+        header_index = find_sbi_header_index(rows_all)
+        if header_index is None:
+            return False
+        header_row = [cell.strip() for cell in rows_all[header_index]]
+        if any(
+            name in header_row
+            for name in ("受渡金額/決済損益", "決済損益", "受渡金額", "手数料/諸経費等")
+        ):
+            return True
+        if "取引" in header_row:
+            trade_idx = header_row.index("取引")
+            for row in rows_all[header_index + 1 : header_index + 50]:
+                if trade_idx < len(row) and any(
+                    key in row[trade_idx] for key in ("信用新規買", "信用返済売", "信用新規売", "信用返済買")
+                ):
+                    return True
+        return False
 
-        def to_float(value: str) -> float:
-            try:
-                return float(value.replace(",", ""))
-            except ValueError:
-                return 0.0
+    def parse_sbi_rows(rows_all: list[list[str]], encoding_used: str) -> dict:
+        header_index = find_sbi_header_index(rows_all)
+        if header_index is None:
+            warnings.append({"type": "sbi_header_missing", "message": "sbi_header_missing"})
+            return {"rows": [], "warnings": warnings}
 
-        qty_shares = to_float(qty_raw)
-        price = to_float(price_raw)
-        if qty_shares <= 0:
-            continue
+        header = [cell.strip() for cell in rows_all[header_index]]
 
-        if qty_shares % 100 != 0:
+        def find_col(*names: str) -> int | None:
+            for name in names:
+                if name in header:
+                    return header.index(name)
+            return None
+
+        col_trade_date = find_col("約定日")
+        col_settle_date = find_col("受渡日")
+        col_code = find_col("銘柄コード")
+        col_name = find_col("銘柄")
+        col_market = find_col("市場")
+        col_trade = find_col("取引")
+        col_account = find_col("預り")
+        col_qty = find_col("約定数量", "数量")
+        col_price = find_col("約定単価", "単価")
+        col_fee = find_col("手数料/諸経費等", "手数料等")
+        col_tax = find_col("税額")
+        col_amount = find_col("受渡金額/決済損益", "決済損益", "受渡金額")
+
+        dedup_keys: set[str] = set()
+        for row_index, line in enumerate(rows_all[header_index + 1 :], start=1):
+            if not line or col_trade_date is None or col_code is None:
+                continue
+            if not any(cell.strip() for cell in line):
+                continue
+            date_value = parse_date(line[col_trade_date]) if col_trade_date < len(line) else None
+            code_raw = normalize_text(line[col_code]) if col_code < len(line) else ""
+            if not date_value or not code_raw:
+                continue
+            code = _normalize_code(code_raw)
+            if not code:
+                continue
+
+            name = normalize_text(line[col_name]) if col_name is not None and col_name < len(line) else ""
+            market = normalize_text(line[col_market]) if col_market is not None and col_market < len(line) else ""
+            account = normalize_text(line[col_account]) if col_account is not None and col_account < len(line) else ""
+            trade_raw = normalize_text(line[col_trade]) if col_trade is not None and col_trade < len(line) else ""
+            qty_raw = normalize_text(line[col_qty]) if col_qty is not None and col_qty < len(line) else ""
+            price_raw = normalize_text(line[col_price]) if col_price is not None and col_price < len(line) else ""
+            fee_raw = normalize_text(line[col_fee]) if col_fee is not None and col_fee < len(line) else ""
+            tax_raw = normalize_text(line[col_tax]) if col_tax is not None and col_tax < len(line) else ""
+            amount_raw = normalize_text(line[col_amount]) if col_amount is not None and col_amount < len(line) else ""
+            settle_date = (
+                parse_date(line[col_settle_date]) if col_settle_date is not None and col_settle_date < len(line) else None
+            )
+
+            qty_shares = to_float(qty_raw)
+            if qty_shares <= 0:
+                continue
+            if qty_shares % 100 != 0:
+                warnings.append(
+                    {
+                        "type": "non_100_shares",
+                        "message": f"non_100_shares:{code}:{date_value}:{qty_shares}",
+                        "code": code
+                    }
+                )
+            price = to_optional_float(price_raw)
+            fee = to_optional_float(fee_raw)
+            tax = to_optional_float(tax_raw)
+            amount = to_optional_float(amount_raw)
+            realized_net = None
+            if amount is not None:
+                realized_net = amount
+                if fee is not None:
+                    realized_net -= fee
+                if tax is not None:
+                    realized_net -= tax
+
+            trade_label = normalize_label(trade_raw)
+            txn_type = ""
+            event_kind = None
+            if "信用新規買" in trade_label:
+                txn_type = "OPEN_LONG"
+                event_kind = "BUY_OPEN"
+            elif "信用返済売" in trade_label:
+                txn_type = "CLOSE_LONG"
+                event_kind = "SELL_CLOSE"
+            elif "信用新規売" in trade_label:
+                txn_type = "OPEN_SHORT"
+                event_kind = "SELL_OPEN"
+            elif "信用返済買" in trade_label:
+                txn_type = "CLOSE_SHORT"
+                event_kind = "BUY_CLOSE"
+            elif "現物買" in trade_label or "買付" in trade_label:
+                txn_type = "OPEN_LONG"
+                event_kind = "BUY_OPEN"
+            elif "現物売" in trade_label or "売付" in trade_label:
+                txn_type = "CLOSE_LONG"
+                event_kind = "SELL_CLOSE"
+            elif "入庫" in trade_label:
+                txn_type = "CORPORATE_ACTION"
+                event_kind = "INBOUND"
+            elif "出庫" in trade_label:
+                txn_type = "CORPORATE_ACTION"
+                event_kind = "OUTBOUND"
+
+            if event_kind is None:
+                sample = f"取引={trade_raw or '(blank)'}"
+                unknown_labels_by_code.setdefault(code, set()).add(sample)
+                continue
+
+            dedup_key = "|".join([code, date_value, trade_label, qty_raw, price_raw, amount_raw])
+            if dedup_key in dedup_keys:
+                continue
+            dedup_keys.add(dedup_key)
+
+            if event_kind == "BUY_OPEN":
+                side = "buy"
+                action = "open"
+            elif event_kind == "BUY_CLOSE":
+                side = "buy"
+                action = "close"
+            elif event_kind == "SELL_OPEN":
+                side = "sell"
+                action = "open"
+            elif event_kind == "SELL_CLOSE":
+                side = "sell"
+                action = "close"
+            else:
+                side = "buy"
+                action = "open"
+
+            if event_kind in ("BUY_OPEN", "SELL_OPEN"):
+                event_order = 0
+            elif event_kind in ("SELL_CLOSE", "BUY_CLOSE"):
+                event_order = 1
+            else:
+                event_order = 2
+
+            rows.append(
+                {
+                    "broker": "SBI",
+                    "tradeDate": date_value,
+                    "trade_date": date_value,
+                    "settleDate": settle_date,
+                    "settle_date": settle_date,
+                    "code": code,
+                    "name": name,
+                    "market": market,
+                    "account": account,
+                    "txnType": txn_type,
+                    "txn_type": txn_type,
+                    "qty": qty_shares,
+                    "qtyShares": qty_shares,
+                    "units": int(qty_shares // 100),
+                    "price": price if price is not None and price > 0 else None,
+                    "fee": fee,
+                    "tax": tax,
+                    "realizedPnlGross": amount,
+                    "realizedPnlNet": realized_net,
+                    "memo": trade_raw,
+                    "date": date_value,
+                    "side": side,
+                    "action": action,
+                    "kind": event_kind,
+                    "_row_index": row_index,
+                    "_event_order": event_order,
+                    "raw": {
+                        "date": line[col_trade_date] if col_trade_date is not None and col_trade_date < len(line) else "",
+                        "code": code_raw,
+                        "name": name,
+                        "trade": trade_raw,
+                        "market": market,
+                        "account": account,
+                        "qty": qty_raw,
+                        "price": price_raw,
+                        "fee": fee_raw,
+                        "tax": tax_raw,
+                        "amount": amount_raw,
+                        "encoding": encoding_used
+                    }
+                }
+            )
+
+        for code, samples_set in unknown_labels_by_code.items():
+            samples = sorted(list(samples_set))[:5]
             warnings.append(
                 {
-                    "type": "non_100_shares",
-                    "message": f"non_100_shares:{code}:{date_value}:{qty_shares}",
+                    "type": "unrecognized_labels",
+                    "count": len(samples_set),
+                    "samples": samples,
                     "code": code
                 }
             )
 
-        trade_type = normalize_label(type_raw)
-        trade_kind = normalize_label(kind_raw)
-
-        is_new = "信用新規" in trade_type or (trade_type and "新規" in trade_type)
-        is_close = "信用返済" in trade_type or (trade_type and "返済" in trade_type)
-        is_spot = "現物" in trade_type
-        is_delivery = trade_type == "現渡" or trade_kind == "現渡"
-        is_take_delivery = trade_type == "現引" or trade_kind == "現引"
-        is_inbound = trade_type == "入庫" or trade_kind == "入庫"
-        is_outbound = trade_type == "出庫" or trade_kind == "出庫"
-
-        event_kind = None
-        if is_inbound:
-            event_kind = "INBOUND"
-        elif is_outbound:
-            event_kind = "OUTBOUND"
-        elif is_delivery:
-            event_kind = "DELIVERY"
-        elif is_take_delivery:
-            event_kind = "TAKE_DELIVERY"
-        elif is_new and "買建" in trade_kind:
-            event_kind = "BUY_OPEN"
-        elif is_new and "売建" in trade_kind:
-            event_kind = "SELL_OPEN"
-        elif is_close and "買埋" in trade_kind:
-            event_kind = "BUY_CLOSE"
-        elif is_close and "売埋" in trade_kind:
-            event_kind = "SELL_CLOSE"
-        elif is_spot and ("買" in trade_kind or "買付" in trade_kind):
-            event_kind = "BUY_OPEN"
-        elif is_spot and ("売" in trade_kind or "売付" in trade_kind):
-            event_kind = "SELL_CLOSE"
-
-        if event_kind is None:
-            if "買建" in trade_kind:
-                event_kind = "BUY_OPEN"
-            elif "売建" in trade_kind:
-                event_kind = "SELL_OPEN"
-            elif "買埋" in trade_kind:
-                event_kind = "BUY_CLOSE"
-            elif "売埋" in trade_kind:
-                event_kind = "SELL_CLOSE"
-            elif "現物買" in trade_kind or "買付" in trade_kind:
-                event_kind = "BUY_OPEN"
-            elif "現物売" in trade_kind or "売付" in trade_kind:
-                event_kind = "SELL_CLOSE"
-            elif trade_type == "入庫" or trade_kind == "入庫":
-                event_kind = "INBOUND"
-            elif trade_type == "出庫" or trade_kind == "出庫":
-                event_kind = "OUTBOUND"
-            elif trade_type == "現渡" or trade_kind == "現渡":
-                event_kind = "DELIVERY"
-            elif trade_type == "現引" or trade_kind == "現引":
-                event_kind = "TAKE_DELIVERY"
-
-        if event_kind is None:
-            sample = f"取引区分={trade_type or '(blank)'}, 売買区分={trade_kind or '(blank)'}"
-            unknown_labels_by_code.setdefault(code, set()).add(sample)
-            continue
-
-        dedup_key = "|".join(
-            [
-                code,
-                date_value,
-                trade_type,
-                trade_kind,
-                qty_raw,
-                price_raw,
-                amount_raw
-            ]
+        rows.sort(
+            key=lambda item: (item.get("date", ""), item.get("_event_order", 2), item.get("_row_index", 0))
         )
-        if dedup_key in dedup_keys:
-            duplicate_counts[code] = duplicate_counts.get(code, 0) + 1
-            continue
-        dedup_keys.add(dedup_key)
+        return {"rows": rows, "warnings": warnings}
 
-        if event_kind == "BUY_OPEN":
-            side = "buy"
-            action = "open"
-        elif event_kind == "BUY_CLOSE":
-            side = "buy"
-            action = "close"
-        elif event_kind == "SELL_OPEN":
-            side = "sell"
-            action = "open"
-        elif event_kind == "SELL_CLOSE":
-            side = "sell"
-            action = "close"
+    def parse_single(path: str) -> tuple[list[dict], list[dict]]:
+        file_rows: list[dict] = []
+        file_warnings: list[dict] = []
+        unknown_labels_by_code: dict[str, set[str]] = {}
+
+        try:
+            rows_all = read_csv_rows(path, "cp932")
+            encoding_used = "cp932"
+        except UnicodeDecodeError:
+            rows_all = read_csv_rows(path, "utf-8-sig")
+            encoding_used = "utf-8-sig"
+
+        if rows_all:
+            header = [normalize_text(cell) for cell in rows_all[0]] if rows_all else []
+            if not looks_like_sbi(rows_all) and ("約定日" not in header and "約定日付" not in header):
+                try:
+                    rows_all = read_csv_rows(path, "utf-8-sig")
+                    encoding_used = "utf-8-sig"
+                except UnicodeDecodeError:
+                    pass
+
+        if looks_like_sbi(rows_all):
+            header_index = find_sbi_header_index(rows_all)
+            if header_index is None:
+                file_warnings.append(
+                    {"type": "sbi_header_missing", "message": f"sbi_header_missing:{path}"}
+                )
+                return file_rows, file_warnings
+            raw_header = [normalize_text(cell) for cell in rows_all[header_index]]
+            data_rows = rows_all[header_index + 1 :]
+            header = raw_header
+            col_map = {name: index for index, name in enumerate(header) if name}
+            get_cell = lambda row, key: normalize_text(row[col_map.get(key, -1)]) if key in col_map else ""
+
+            for row_index, row in enumerate(data_rows, start=1):
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                trade_date = parse_date(get_cell(row, "約定日"))
+                if not trade_date:
+                    continue
+                code = _normalize_code(get_cell(row, "銘柄コード"))
+                name = get_cell(row, "銘柄")
+                market = get_cell(row, "市場")
+                account = get_cell(row, "預り")
+                trade_kind = get_cell(row, "取引") or get_cell(row, "取引区分")
+                qty_raw = get_cell(row, "約定数量") or get_cell(row, "数量")
+                qty_shares = to_float(qty_raw)
+                price_raw = get_cell(row, "約定単価") or get_cell(row, "単価")
+                price = to_optional_float(price_raw)
+                fee_raw = get_cell(row, "手数料/諸経費等")
+                tax_raw = get_cell(row, "税金") or get_cell(row, "税額")
+                pnl_raw = get_cell(row, "受渡金額/決済損益") or get_cell(row, "決済損益")
+                realized_pnl = to_optional_float(pnl_raw)
+                if qty_shares <= 0:
+                    continue
+
+                event_kind = None
+                if "信用新規買" in trade_kind:
+                    event_kind = "BUY_OPEN"
+                elif "信用返済売" in trade_kind:
+                    event_kind = "SELL_CLOSE"
+                elif "信用新規売" in trade_kind:
+                    event_kind = "SELL_OPEN"
+                elif "信用返済買" in trade_kind:
+                    event_kind = "BUY_CLOSE"
+                elif "現物買" in trade_kind or "買付" in trade_kind:
+                    event_kind = "BUY_OPEN"
+                elif "現物売" in trade_kind or "売付" in trade_kind:
+                    event_kind = "SELL_CLOSE"
+
+                if event_kind is None:
+                    sample = f"取引区分={trade_kind or '(blank)'}, 売買区分=(blank)"
+                    unknown_labels_by_code.setdefault(code, set()).add(sample)
+                    continue
+
+                if event_kind == "BUY_OPEN":
+                    side = "buy"
+                    action = "open"
+                elif event_kind == "BUY_CLOSE":
+                    side = "buy"
+                    action = "close"
+                elif event_kind == "SELL_OPEN":
+                    side = "sell"
+                    action = "open"
+                else:
+                    side = "sell"
+                    action = "close"
+
+                if event_kind in ("BUY_OPEN", "SELL_OPEN"):
+                    event_order = 0
+                elif event_kind in ("SELL_CLOSE", "BUY_CLOSE"):
+                    event_order = 1
+                else:
+                    event_order = 2
+
+                txn_type = "CORPORATE_ACTION"
+                if event_kind == "BUY_OPEN":
+                    txn_type = "OPEN_LONG"
+                elif event_kind == "SELL_CLOSE":
+                    txn_type = "CLOSE_LONG"
+                elif event_kind == "SELL_OPEN":
+                    txn_type = "OPEN_SHORT"
+                elif event_kind == "BUY_CLOSE":
+                    txn_type = "CLOSE_SHORT"
+
+                file_rows.append(
+                    {
+                        "broker": "SBI",
+                        "tradeDate": trade_date,
+                        "trade_date": trade_date,
+                        "settleDate": parse_date(get_cell(row, "受渡日")),
+                        "settle_date": parse_date(get_cell(row, "受渡日")),
+                        "date": trade_date,
+                        "code": code,
+                        "name": name,
+                        "market": market,
+                        "account": account,
+                        "txnType": txn_type,
+                        "txn_type": txn_type,
+                        "qty": qty_shares,
+                        "side": side,
+                        "action": action,
+                        "kind": event_kind,
+                        "qtyShares": qty_shares,
+                        "units": int(qty_shares // 100),
+                        "price": price if price is not None and price > 0 else None,
+                        "fee": to_optional_float(fee_raw),
+                        "tax": to_optional_float(tax_raw),
+                        "realizedPnlGross": realized_pnl,
+                        "realizedPnlNet": realized_pnl,
+                        "memo": trade_kind,
+                        "_row_index": row_index,
+                        "_event_order": event_order,
+                        "raw": {
+                            "date": trade_date,
+                            "code": code,
+                            "name": name,
+                            "trade": trade_kind,
+                            "qty": qty_raw,
+                            "price": price_raw,
+                            "amount": pnl_raw,
+                            "encoding": encoding_used
+                        }
+                    }
+                )
+
         else:
-            side = "buy"
-            action = "open"
+            rows_all = rows_all
+            header = [normalize_text(cell) for cell in rows_all[0]] if rows_all else []
+            data_rows = rows_all[1:] if rows_all else []
+            col_map = {name: index for index, name in enumerate(header) if name}
+            get_cell = lambda row, key: normalize_text(row[col_map.get(key, -1)]) if key in col_map else ""
 
-        if event_kind in ("BUY_OPEN", "SELL_OPEN"):
-            event_order = 0
-        elif event_kind in ("SELL_CLOSE", "BUY_CLOSE"):
-            event_order = 1
-        else:
-            event_order = 2
+            dedup_keys: set[str] = set()
+            duplicate_counts: dict[str, int] = {}
 
-        rows.append(
-            {
-                "date": date_value,
-                "code": code,
-                "name": name,
-                "side": side,
-                "action": action,
-                "kind": event_kind,
-                "qtyShares": qty_shares,
-                "units": int(qty_shares // 100),
-                "price": price if price > 0 else None,
-                "_row_index": row_index,
-                "_event_order": event_order,
-                "raw": {
-                    "date": date_raw,
-                    "code": code_raw,
-                    "name": name,
-                    "trade": kind_raw,
-                    "type": type_raw,
-                    "qty": qty_raw,
-                    "price": price_raw,
-                    "amount": amount_raw,
-                    "encoding": encoding_used
+            for row_index, row in enumerate(data_rows, start=1):
+                if not row or not any(cell.strip() for cell in row):
+                    continue
+                date_raw = get_cell(row, "約定日") or get_cell(row, "日付")
+                date_value = parse_date(date_raw)
+                if not date_value:
+                    continue
+                settle_date = parse_date(get_cell(row, "受渡日"))
+                code_raw = get_cell(row, "銘柄コード") or get_cell(row, "銘柄ｺｰﾄﾞ") or get_cell(row, "銘柄")
+                code = _normalize_code(code_raw)
+                name = get_cell(row, "銘柄名") or get_cell(row, "銘柄")
+                market = get_cell(row, "市場")
+                account = get_cell(row, "口座区分") or get_cell(row, "預り区分")
+                type_raw = get_cell(row, "取引区分")
+                kind_raw = get_cell(row, "売買区分")
+                trade_type = normalize_label(type_raw)
+                trade_kind = normalize_label(kind_raw)
+                qty_raw = (
+                    get_cell(row, "数量［株］")
+                    or get_cell(row, "数量[株]")
+                    or get_cell(row, "数量")
+                    or get_cell(row, "数量(株)")
+                )
+                qty_shares = to_float(qty_raw)
+                price_raw = (
+                    get_cell(row, "単価［円］")
+                    or get_cell(row, "単価[円]")
+                    or get_cell(row, "単価")
+                    or get_cell(row, "約定単価")
+                )
+                price = to_optional_float(price_raw)
+                amount_raw = (
+                    get_cell(row, "受渡金額［円］")
+                    or get_cell(row, "受渡金額[円]")
+                    or get_cell(row, "受渡金額")
+                )
+                fee_raw = (
+                    get_cell(row, "手数料［円］")
+                    or get_cell(row, "手数料[円]")
+                    or get_cell(row, "手数料")
+                )
+                tax_raw = (
+                    get_cell(row, "税金等［円］")
+                    or get_cell(row, "税金等[円]")
+                    or get_cell(row, "税金")
+                )
+                if qty_shares <= 0:
+                    continue
+
+                event_kind = None
+                if trade_kind == "現渡" or trade_type == "現渡":
+                    event_kind = "DELIVERY"
+                elif trade_kind == "現引" or trade_type == "現引":
+                    event_kind = "TAKE_DELIVERY"
+                elif trade_type == "入庫" or trade_kind == "入庫":
+                    event_kind = "INBOUND"
+                elif trade_type == "出庫" or trade_kind == "出庫":
+                    event_kind = "OUTBOUND"
+
+                if event_kind is None:
+                    if "買建" in trade_kind:
+                        event_kind = "BUY_OPEN"
+                    elif "売建" in trade_kind:
+                        event_kind = "SELL_OPEN"
+                    elif "買埋" in trade_kind:
+                        event_kind = "BUY_CLOSE"
+                    elif "売埋" in trade_kind:
+                        event_kind = "SELL_CLOSE"
+                    elif "現物買" in trade_kind or "買付" in trade_kind:
+                        event_kind = "BUY_OPEN"
+                    elif "現物売" in trade_kind or "売付" in trade_kind:
+                        event_kind = "SELL_CLOSE"
+                    elif trade_type == "入庫" or trade_kind == "入庫":
+                        event_kind = "INBOUND"
+                    elif trade_type == "出庫" or trade_kind == "出庫":
+                        event_kind = "OUTBOUND"
+                    elif trade_type == "現渡" or trade_kind == "現渡":
+                        event_kind = "DELIVERY"
+                    elif trade_type == "現引" or trade_kind == "現引":
+                        event_kind = "TAKE_DELIVERY"
+
+                if event_kind is None:
+                    sample = f"取引区分={trade_type or '(blank)'}, 売買区分={trade_kind or '(blank)'}"
+                    unknown_labels_by_code.setdefault(code, set()).add(sample)
+                    continue
+
+                dedup_key = "|".join(
+                    [
+                        code,
+                        date_value,
+                        trade_type,
+                        trade_kind,
+                        qty_raw,
+                        price_raw,
+                        amount_raw
+                    ]
+                )
+                if dedup_key in dedup_keys:
+                    duplicate_counts[code] = duplicate_counts.get(code, 0) + 1
+                    continue
+                dedup_keys.add(dedup_key)
+
+                if event_kind == "BUY_OPEN":
+                    side = "buy"
+                    action = "open"
+                elif event_kind == "BUY_CLOSE":
+                    side = "buy"
+                    action = "close"
+                elif event_kind == "SELL_OPEN":
+                    side = "sell"
+                    action = "open"
+                elif event_kind == "SELL_CLOSE":
+                    side = "sell"
+                    action = "close"
+                else:
+                    side = "buy"
+                    action = "open"
+
+                if event_kind in ("BUY_OPEN", "SELL_OPEN"):
+                    event_order = 0
+                elif event_kind in ("SELL_CLOSE", "BUY_CLOSE"):
+                    event_order = 1
+                else:
+                    event_order = 2
+
+                txn_type = "CORPORATE_ACTION"
+                if event_kind == "BUY_OPEN":
+                    txn_type = "OPEN_LONG"
+                elif event_kind == "SELL_CLOSE":
+                    txn_type = "CLOSE_LONG"
+                elif event_kind == "SELL_OPEN":
+                    txn_type = "OPEN_SHORT"
+                elif event_kind == "BUY_CLOSE":
+                    txn_type = "CLOSE_SHORT"
+
+                file_rows.append(
+                    {
+                        "broker": "RAKUTEN",
+                        "tradeDate": date_value,
+                        "trade_date": date_value,
+                        "settleDate": settle_date,
+                        "settle_date": settle_date,
+                        "date": date_value,
+                        "code": code,
+                        "name": name,
+                        "market": market,
+                        "account": account,
+                        "txnType": txn_type,
+                        "txn_type": txn_type,
+                        "qty": qty_shares,
+                        "side": side,
+                        "action": action,
+                        "kind": event_kind,
+                        "qtyShares": qty_shares,
+                        "units": int(qty_shares // 100),
+                        "price": price if price is not None and price > 0 else None,
+                        "fee": to_optional_float(fee_raw),
+                        "tax": to_optional_float(tax_raw),
+                        "realizedPnlGross": None,
+                        "realizedPnlNet": None,
+                        "memo": kind_raw or type_raw,
+                        "_row_index": row_index,
+                        "_event_order": event_order,
+                        "raw": {
+                            "date": date_raw,
+                            "code": code_raw,
+                            "name": name,
+                            "trade": kind_raw,
+                            "type": type_raw,
+                            "qty": qty_raw,
+                            "price": price_raw,
+                            "amount": amount_raw,
+                            "encoding": encoding_used
+                        }
+                    }
+                )
+
+            for code, count in duplicate_counts.items():
+                file_warnings.append(
+                    {"type": "duplicate_rows", "message": f"duplicate_rows:{code}:{count}", "code": code}
+                )
+
+        for code, samples_set in unknown_labels_by_code.items():
+            samples = sorted(list(samples_set))[:5]
+            file_warnings.append(
+                {
+                    "type": "unrecognized_labels",
+                    "count": len(samples_set),
+                    "samples": samples,
+                    "code": code
                 }
-            }
-        )
+            )
 
-    for code, count in duplicate_counts.items():
-        warnings.append(
-            {"type": "duplicate_rows", "message": f"duplicate_rows:{code}:{count}", "code": code}
+        file_rows.sort(
+            key=lambda item: (
+                item.get("date", ""),
+                item.get("_event_order", 2),
+                item.get("_row_index", 0)
+            )
         )
+        return file_rows, file_warnings
 
-    for code, samples_set in unknown_labels_by_code.items():
-        samples = sorted(list(samples_set))[:5]
-        warnings.append(
-            {
-                "type": "unrecognized_labels",
-                "count": len(samples_set),
-                "samples": samples,
-                "code": code
-            }
-        )
+    for path in existing_paths:
+        file_rows, file_warnings = parse_single(path)
+        if not file_rows and not file_warnings:
+            continue
+        rows.extend(file_rows)
+        warnings.extend(file_warnings)
+
     rows.sort(
         key=lambda item: (item.get("date", ""), item.get("_event_order", 2), item.get("_row_index", 0))
     )
 
-    _trade_cache["mtime"] = mtime
-    _trade_cache["path"] = path
+    _trade_cache["key"] = key
     _trade_cache["rows"] = rows
     _trade_cache["warnings"] = warnings
     return {"rows": rows, "warnings": warnings}
@@ -474,8 +876,12 @@ def _build_daily_positions(trades: list[dict]) -> list[dict]:
             elif kind == "TAKE_DELIVERY":
                 continue
             elif kind == "INBOUND":
+                if long_shares > 0 and qty_shares > 0:
+                    long_shares += qty_shares
                 continue
             elif kind == "OUTBOUND":
+                if long_shares > 0 and qty_shares > 0:
+                    long_shares = max(0.0, long_shares - qty_shares)
                 continue
 
         positions.append(
@@ -559,6 +965,22 @@ def _format_month_label(value: int | str | None) -> str | None:
     if not month:
         return None
     return f"{month.year:04d}-{month.month:02d}"
+
+
+def _month_label_to_int(label: str | None) -> int | None:
+    if not label:
+        return None
+    try:
+        parts = label.split("-")
+        if len(parts) != 2:
+            return None
+        year = int(parts[0])
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            return None
+        return year * 100 + month
+    except (TypeError, ValueError):
+        return None
 
 
 def _pct_change(latest: float | None, prev: float | None) -> float | None:
@@ -733,12 +1155,15 @@ def _count_streak(
     return None if not has_values else count
 
 
-def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> tuple[dict | None, str]:
+def _build_box_metrics(
+    monthly_rows: list[tuple],
+    last_close: float | None
+) -> tuple[dict | None, str, str | None, str | None, str]:
     if not monthly_rows:
-        return None, "NONE"
+        return None, "NONE", None, None, "NONE"
     boxes = detect_boxes(monthly_rows)
     if not boxes:
-        return None, "NONE"
+        return None, "NONE", None, None, "NONE"
 
     bars = []
     for row in monthly_rows:
@@ -755,16 +1180,16 @@ def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> t
             }
         )
 
-    active_box = None
-    for box in boxes:
-        months = box["endIndex"] - box["startIndex"] + 1
-        if months < 3:
-            continue
-        active_box = {**box, "months": months}
+    if not bars:
+        return None, "NONE", None, None, "NONE"
 
-    if not active_box:
-        return None, "NONE"
+    latest_box = max(boxes, key=lambda item: item["endIndex"])
+    months = latest_box["endIndex"] - latest_box["startIndex"] + 1
+    if months < 3:
+        return None, "NONE", None, None, "NONE"
 
+    active_box = {**latest_box, "months": months}
+    latest_index = len(bars) - 1
     start_index = active_box["startIndex"]
     end_index = active_box["endIndex"]
     body_low = None
@@ -776,7 +1201,7 @@ def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> t
         body_high = high if body_high is None else max(body_high, high)
 
     if body_low is None or body_high is None:
-        return None, "NONE"
+        return None, "NONE", None, None, "NONE"
 
     base = max(abs(body_low), 1e-9)
     range_pct = (body_high - body_low) / base
@@ -784,13 +1209,23 @@ def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> t
     end_label = _format_month_label(active_box["endTime"])
 
     box_state = "NONE"
-    if last_close is not None:
+    if end_index == latest_index:
+        box_state = "IN_BOX"
+    elif end_index == latest_index - 1:
+        box_state = "JUST_BREAKOUT"
+
+    breakout_month = None
+    if box_state == "JUST_BREAKOUT" and latest_index >= 0:
+        breakout_month = _format_month_label(bars[latest_index]["month"])
+
+    direction_state = "NONE"
+    if box_state != "NONE" and last_close is not None:
         if last_close > body_high:
-            box_state = "BREAKOUT_UP"
+            direction_state = "BREAKOUT_UP"
         elif last_close < body_low:
-            box_state = "BREAKOUT_DOWN"
+            direction_state = "BREAKOUT_DOWN"
         else:
-            box_state = "IN_BOX"
+            direction_state = "IN_BOX"
 
     payload = {
         "startDate": start_label,
@@ -799,9 +1234,12 @@ def _build_box_metrics(monthly_rows: list[tuple], last_close: float | None) -> t
         "bodyHigh": body_high,
         "months": active_box["months"],
         "rangePct": range_pct,
-        "isActive": box_state == "IN_BOX"
+        "isActive": box_state == "IN_BOX",
+        "boxState": box_state,
+        "boxEndMonth": end_label,
+        "breakoutMonth": breakout_month
     }
-    return payload, box_state
+    return payload, box_state, end_label, breakout_month, direction_state
 
 
 def _load_rank_config() -> dict:
@@ -1704,7 +2142,185 @@ def _compute_screener_metrics(
     if chg1y is None:
         reasons.append("missing_chg1y")
 
-    box_monthly, box_state = _build_box_metrics(monthly_rows, last_close)
+    box_monthly, box_state, box_end_month, breakout_month, box_direction = _build_box_metrics(
+        monthly_rows, last_close
+    )
+
+    latest_month_label = _format_month_label(confirmed_monthly[-1][0]) if confirmed_monthly else None
+    prev_month_label = _format_month_label(confirmed_monthly[-2][0]) if len(confirmed_monthly) >= 2 else None
+    latest_month_value = _month_label_to_int(latest_month_label)
+    prev_month_value = _month_label_to_int(prev_month_label)
+    box_active = False
+    if box_monthly:
+        box_start_value = _month_label_to_int(box_monthly.get("startDate"))
+        box_end_value = _month_label_to_int(box_monthly.get("endDate"))
+        if box_start_value is not None and box_end_value is not None:
+            if latest_month_value is not None and box_start_value <= latest_month_value <= box_end_value:
+                box_active = True
+            elif prev_month_value is not None and box_start_value <= prev_month_value <= box_end_value:
+                box_active = True
+
+    monthly_ma7_series = _build_ma_series(monthly_closes, 7)
+    monthly_ma20_series = _build_ma_series(monthly_closes, 20)
+    monthly_down20 = _count_streak(monthly_closes, monthly_ma20_series, "down")
+    bottom_zone = bool(monthly_down20 is not None and monthly_down20 >= 6)
+
+    weekly_closes = [item["c"] for item in weekly]
+    weekly_highs = [item["h"] for item in weekly]
+    weekly_lows = [item["l"] for item in weekly]
+    weekly_ma7_series = _build_ma_series(weekly_closes, 7)
+    weekly_ma20_series = _build_ma_series(weekly_closes, 20)
+    weekly_ma7 = weekly_ma7_series[-1] if weekly_ma7_series else None
+    weekly_ma20 = weekly_ma20_series[-1] if weekly_ma20_series else None
+    weekly_above_ma7 = (
+        weekly_closes[-1] > weekly_ma7 if weekly_ma7 is not None and weekly_closes else False
+    )
+    weekly_above_ma20 = (
+        weekly_closes[-1] > weekly_ma20 if weekly_ma20 is not None and weekly_closes else False
+    )
+
+    weekly_low_stop = False
+    if len(weekly_lows) >= 6:
+        recent_lows = weekly_lows[-6:]
+        previous_lows = weekly_lows[:-6]
+        if previous_lows:
+            weekly_low_stop = min(recent_lows) >= min(previous_lows)
+
+    weekly_range_contraction = False
+    if len(weekly_highs) >= 12:
+        recent_range = max(weekly_highs[-6:]) - min(weekly_lows[-6:])
+        prev_range = max(weekly_highs[-12:-6]) - min(weekly_lows[-12:-6])
+        if prev_range > 0 and recent_range <= prev_range * 0.8:
+            weekly_range_contraction = True
+
+    daily_cross_ma7 = False
+    daily_cross_ma20 = False
+    if len(closes) >= 2 and len(ma7_series) >= 2:
+        daily_cross_ma7 = closes[-1] > ma7_series[-1] and closes[-2] <= ma7_series[-2]
+    if len(closes) >= 2 and len(ma20_series) >= 2:
+        daily_cross_ma20 = closes[-1] > ma20_series[-1] and closes[-2] <= ma20_series[-2]
+
+    daily_pre_signal = False
+    if daily_rows:
+        last_row = daily_rows[-1]
+        if len(last_row) >= 5:
+            open_ = float(last_row[1]) if last_row[1] is not None else None
+            high = float(last_row[2]) if last_row[2] is not None else None
+            low = float(last_row[3]) if last_row[3] is not None else None
+            close = float(last_row[4]) if last_row[4] is not None else None
+            if open_ is not None and high is not None and low is not None and close is not None:
+                rng = max(high - low, 1e-9)
+                body = abs(close - open_)
+                lower_shadow = min(open_, close) - low
+                if body / rng <= 0.35 or lower_shadow / rng >= 0.45:
+                    daily_pre_signal = True
+
+    daily_low_break = False
+    if len(daily_rows) >= 11:
+        lows = [
+            float(row[3])
+            for row in daily_rows[-11:-1]
+            if len(row) >= 4 and row[3] is not None
+        ]
+        if lows and daily_rows[-1][3] is not None:
+            daily_low_break = float(daily_rows[-1][3]) < min(lows)
+
+    weekly_low_break = False
+    if len(weekly_lows) >= 7:
+        weekly_low_break = weekly_lows[-1] < min(weekly_lows[-7:-1])
+
+    falling_knife = daily_low_break or weekly_low_break
+    monthly_ok = box_active or bottom_zone
+
+    score_monthly = 0
+    if box_active:
+        score_monthly += 18
+    if bottom_zone:
+        score_monthly += 12
+
+    score_weekly = 0
+    if weekly_low_stop:
+        score_weekly += 15
+    if weekly_range_contraction:
+        score_weekly += 10
+    if weekly_above_ma7:
+        score_weekly += 7
+    if weekly_above_ma20:
+        score_weekly += 8
+
+    score_daily = 0
+    if daily_cross_ma7:
+        score_daily += 10
+    if daily_cross_ma20:
+        score_daily += 12
+    if daily_pre_signal:
+        score_daily += 8
+
+    daily_ma20_down = False
+    if len(ma20_series) >= 2:
+        daily_ma20_down = ma20_series[-1] < ma20_series[-2]
+
+    buy_state = "その他"
+    buy_state_rank = 0
+    buy_state_score = 0
+    buy_state_reason_parts: list[str] = []
+
+    if monthly_ok and weekly_low_stop and not falling_knife:
+        if daily_cross_ma7 or daily_cross_ma20 or daily_pre_signal:
+            buy_state = "初動"
+            buy_state_rank = 2
+            buy_state_score = score_monthly + score_weekly + score_daily
+            if daily_ma20_down and ma20 is not None and last_close is not None and last_close < ma20:
+                buy_state_score -= 15
+        elif weekly_range_contraction:
+            buy_state = "底がため"
+            buy_state_rank = 1
+            buy_state_score = score_monthly + score_weekly + min(score_daily, 10)
+
+    if buy_state_score < 0:
+        buy_state_score = 0
+    if buy_state == "初動":
+        buy_state_score = min(100, buy_state_score)
+    elif buy_state == "底がため":
+        buy_state_score = min(80, buy_state_score)
+
+    if monthly_ok:
+        month_parts = []
+        if box_active:
+            month_parts.append("箱有")
+        if bottom_zone:
+            month_parts.append("大底警戒")
+        buy_state_reason_parts.append(f"月:{'/'.join(month_parts)}")
+    if weekly_low_stop or weekly_range_contraction:
+        week_parts = []
+        if weekly_low_stop:
+            week_parts.append("安値更新停止")
+        if weekly_range_contraction:
+            week_parts.append("収縮")
+        if weekly_above_ma7:
+            week_parts.append("7MA上")
+        if weekly_above_ma20:
+            week_parts.append("20MA上")
+        buy_state_reason_parts.append(f"週:{'/'.join(week_parts)}")
+    if daily_cross_ma7 or daily_cross_ma20 or daily_pre_signal:
+        day_parts = []
+        if daily_cross_ma7:
+            day_parts.append("7MA上抜け")
+        if daily_cross_ma20:
+            day_parts.append("20MA上抜け")
+        if daily_pre_signal:
+            day_parts.append("事前決定打")
+        buy_state_reason_parts.append(f"日:{'/'.join(day_parts)}")
+    if falling_knife:
+        buy_state_reason_parts.append("落ちるナイフ")
+
+    buy_state_reason = " / ".join(buy_state_reason_parts) if buy_state_reason_parts else "N/A"
+
+    buy_risk_distance = None
+    if last_close is not None and box_monthly and box_monthly.get("bodyLow") is not None:
+        body_low = float(box_monthly["bodyLow"])
+        if last_close > 0:
+            buy_risk_distance = max(0.0, (last_close - body_low) / last_close * 100)
 
     status_label = "UNKNOWN"
     essential_missing = last_close is None or ma20 is None or ma60 is None
@@ -1738,10 +2354,11 @@ def _compute_screener_metrics(
             elif up7 >= 7:
                 up_score += 10
 
-        if box_state == "BREAKOUT_UP":
-            up_score += 30
-        elif box_state == "IN_BOX" and box_monthly and box_monthly.get("months", 0) >= 3:
-            up_score += 10
+        if box_state != "NONE":
+            if box_direction == "BREAKOUT_UP":
+                up_score += 30
+            elif box_state == "IN_BOX" and box_monthly and box_monthly.get("months", 0) >= 3:
+                up_score += 10
 
         if chg1m is not None and chg1m > 0:
             up_score += 10
@@ -1761,7 +2378,7 @@ def _compute_screener_metrics(
             elif down7 >= 7:
                 down_score += 10
 
-        if box_state == "BREAKOUT_DOWN":
+        if box_state != "NONE" and box_direction == "BREAKOUT_DOWN":
             down_score += 30
 
         if chg1m is not None and chg1m < 0:
@@ -1805,6 +2422,29 @@ def _compute_screener_metrics(
         },
         "boxMonthly": box_monthly,
         "boxState": box_state,
+        "boxEndMonth": box_end_month,
+        "breakoutMonth": breakout_month,
+        "boxActive": box_active,
+        "hasBox": box_active,
+        "box_state": box_state,
+        "box_end_month": box_end_month,
+        "breakout_month": breakout_month,
+        "box_active": box_active,
+        "buyState": buy_state,
+        "buyStateRank": buy_state_rank,
+        "buyStateScore": buy_state_score,
+        "buyStateReason": buy_state_reason,
+        "buyRiskDistance": buy_risk_distance,
+        "buy_state": buy_state,
+        "buy_state_rank": buy_state_rank,
+        "buy_state_score": buy_state_score,
+        "buy_state_reason": buy_state_reason,
+        "buy_risk_distance": buy_risk_distance,
+        "buyStateDetails": {
+            "monthly": score_monthly,
+            "weekly": score_weekly,
+            "daily": score_daily
+        },
         "scores": {
             "upScore": up_score,
             "downScore": down_score,
@@ -1896,7 +2536,7 @@ def _get_screener_rows() -> list[dict]:
 
 
 def get_txt_status() -> dict:
-    if not os.path.isdir(DATA_DIR):
+    if not os.path.isdir(PAN_OUT_TXT_DIR):
         return {
             "txt_count": 0,
             "code_txt_missing": False,
@@ -1904,13 +2544,13 @@ def get_txt_status() -> dict:
         }
 
     txt_files = [
-        os.path.join(DATA_DIR, name)
-        for name in os.listdir(DATA_DIR)
+        os.path.join(PAN_OUT_TXT_DIR, name)
+        for name in os.listdir(PAN_OUT_TXT_DIR)
         if name.endswith(".txt") and name.lower() != "code.txt"
     ]
     code_txt_missing = False
     if USE_CODE_TXT:
-        code_txt_missing = find_code_txt_path(DATA_DIR) is None
+        code_txt_missing = find_code_txt_path(PAN_OUT_TXT_DIR) is None
     last_updated = None
     if txt_files:
         last_updated = max(os.path.getmtime(path) for path in txt_files)
@@ -1979,19 +2619,20 @@ def _get_update_status_snapshot() -> dict:
         return dict(_update_txt_status)
 
 
-def _run_streaming_command(cmd: list[str], timeout: int, on_line) -> tuple[int, str]:
+def _run_streaming_command(cmd: list[str], timeout: int, on_line) -> tuple[int, str, bool]:
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        encoding="utf-8",
+        encoding="cp932" if os.name == "nt" else "utf-8",
         errors="replace",
         creationflags=creationflags
     )
     output_lines: list[str] = []
     start = time.time()
+    timed_out = False
     while True:
         if process.stdout is None:
             break
@@ -2004,6 +2645,7 @@ def _run_streaming_command(cmd: list[str], timeout: int, on_line) -> tuple[int, 
             break
         if time.time() - start > timeout:
             process.kill()
+            timed_out = True
             break
     if process.stdout is not None:
         remaining = process.stdout.read()
@@ -2011,7 +2653,7 @@ def _run_streaming_command(cmd: list[str], timeout: int, on_line) -> tuple[int, 
             for extra in remaining.splitlines():
                 output_lines.append(extra)
                 on_line(extra)
-    return process.wait(), "\n".join(output_lines).strip()
+    return process.wait(), "\n".join(output_lines).strip(), timed_out
 
 
 def _load_update_state() -> dict:
@@ -2057,9 +2699,21 @@ def _run_txt_update_job(code_path: str, out_dir: str) -> None:
         if not os.path.isfile(cscript):
             cscript = os.path.join(sys_root, "System32", "cscript.exe")
         vbs_cmd = [cscript, "//nologo", UPDATE_VBS_PATH, code_path, out_dir]
-        vbs_code, vbs_output = _run_streaming_command(vbs_cmd, timeout=3600, on_line=on_line)
+        timeout_sec = 1800
+        vbs_code, vbs_output, timed_out = _run_streaming_command(
+            vbs_cmd, timeout=timeout_sec, on_line=on_line
+        )
         summary = _parse_vbs_summary(vbs_output)
         _set_update_status(summary=summary)
+        if timed_out:
+            _set_update_status(
+                running=False,
+                phase="error",
+                error="timeout",
+                finished_at=datetime.now().isoformat(),
+                timeout_sec=timeout_sec
+            )
+            return
         if vbs_code != 0:
             _set_update_status(
                 running=False,
@@ -2106,7 +2760,7 @@ def _run_txt_update_job(code_path: str, out_dir: str) -> None:
         )
 
 
-def _start_txt_update(code_path: str, out_dir: str, total: int) -> dict:
+def _start_txt_update(code_path: str, out_dir: str, total: int, cscript: str) -> dict:
     started_at = datetime.now().isoformat()
     with _update_txt_lock:
         if _update_txt_status.get("running"):
@@ -2121,7 +2775,11 @@ def _start_txt_update(code_path: str, out_dir: str, total: int) -> dict:
                 "total": total,
                 "summary": {},
                 "error": None,
-                "stdout_tail": []
+                "stdout_tail": [],
+                "code_path": code_path,
+                "out_dir": out_dir,
+                "script_path": UPDATE_VBS_PATH,
+                "cscript_path": cscript
             }
         )
     thread = threading.Thread(target=_run_txt_update_job, args=(code_path, out_dir), daemon=True)
@@ -2155,13 +2813,24 @@ def txt_update_run():
             content={"ok": False, "error": f"ingest_not_found:{INGEST_SCRIPT_PATH}"}
         )
 
-    code_path = find_code_txt_path(DATA_DIR)
+    code_path = PAN_CODE_TXT_PATH if os.path.isfile(PAN_CODE_TXT_PATH) else None
     if not code_path:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "code_txt_missing"})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "code_txt_missing",
+                "searched": [PAN_CODE_TXT_PATH]
+            }
+        )
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(PAN_OUT_TXT_DIR, exist_ok=True)
     total = _count_codes(code_path)
-    started = _start_txt_update(code_path, DATA_DIR, total)
+    sys_root = os.environ.get("SystemRoot") or "C:\\Windows"
+    cscript = os.path.join(sys_root, "SysWOW64", "cscript.exe")
+    if not os.path.isfile(cscript):
+        cscript = os.path.join(sys_root, "System32", "cscript.exe")
+    started = _start_txt_update(code_path, PAN_OUT_TXT_DIR, total, cscript)
     if not started:
         return JSONResponse(status_code=409, content={"ok": False, "error": "update_in_progress"})
     return started
@@ -2173,6 +2842,11 @@ def txt_update_status():
     if not snapshot.get("last_updated_at"):
         state = _load_update_state()
         snapshot["last_updated_at"] = state.get("last_txt_update_at")
+    summary = snapshot.get("summary") or {}
+    if summary.get("ok", 0) > 0 and summary.get("err", 0) > 0:
+        snapshot["warning"] = True
+    else:
+        snapshot["warning"] = False
     elapsed_ms = None
     if snapshot.get("started_at"):
         try:

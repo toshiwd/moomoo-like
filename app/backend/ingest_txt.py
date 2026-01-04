@@ -1,5 +1,6 @@
 ﻿import os
 import re
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -7,17 +8,16 @@ import pandas as pd
 from db import get_conn, init_schema
 
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_PAN_CODE_PATH = os.path.join(REPO_ROOT, "tools", "code.txt")
+DEFAULT_PAN_OUT_DIR = os.path.join(REPO_ROOT, "data", "txt")
+
+
 def resolve_data_dir() -> str:
-    env = os.getenv("TXT_DATA_DIR")
+    env = os.getenv("PAN_OUT_TXT_DIR") or os.getenv("TXT_DATA_DIR")
     if env:
         return os.path.abspath(env)
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    app_data = os.path.join(repo_root, "app", "data", "txt")
-    app_code = os.path.join(repo_root, "app", "data", "code.txt")
-    root_data = os.path.join(repo_root, "data", "txt")
-    if os.path.isfile(app_code) or os.path.isdir(app_data):
-        return app_data
-    return root_data
+    return os.path.abspath(DEFAULT_PAN_OUT_DIR)
 
 
 DATA_DIR = resolve_data_dir()
@@ -28,16 +28,9 @@ USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
 
 
 def find_code_txt_path(data_dir: str) -> str | None:
-    direct = os.path.join(data_dir, "code.txt")
-    if os.path.exists(direct):
-        return direct
-    parent = os.path.join(os.path.dirname(data_dir), "code.txt")
-    if os.path.exists(parent):
-        return parent
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    tools_path = os.path.join(repo_root, "tools", "code.txt")
-    if os.path.exists(tools_path):
-        return tools_path
+    code_path = os.path.abspath(os.getenv("PAN_CODE_TXT_PATH") or DEFAULT_PAN_CODE_PATH)
+    if os.path.exists(code_path):
+        return code_path
     return None
 
 
@@ -57,16 +50,26 @@ def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
     return "UNKNOWN", 0.0, "TODO: Iizuka stage/score pipeline"
 
 
-def load_watchlist(data_dir: str) -> set[str] | None:
+def load_watchlist(data_dir: str) -> list[str]:
+    path = find_code_txt_path(data_dir) if USE_CODE_TXT else None
+    exists = bool(path and os.path.exists(path))
     if not USE_CODE_TXT:
-        return None
-    path = find_code_txt_path(data_dir)
+        print("WATCHLIST_PATH=disabled exists=false count=0")
+        return []
     if not path:
-        print("Warning: code.txt is missing. Falling back to TXT contents.")
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        codes = [line.strip() for line in f.readlines() if line.strip()]
-    return set(codes) if codes else None
+        print("WARNING: watchlist missing. WATCHLIST_PATH=none exists=false count=0")
+        return []
+    if not exists:
+        print(f"WARNING: watchlist missing. WATCHLIST_PATH={path} exists=false count=0")
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            codes = [line.strip() for line in f.readlines() if line.strip()]
+        print(f"WATCHLIST_PATH={path} exists=true count={len(codes)}")
+        return codes
+    except OSError as exc:
+        print(f"WARNING: watchlist read failed. WATCHLIST_PATH={path} exists=true count=0 reason={exc}")
+        return []
 
 
 def list_txt_files(data_dir: str) -> list[str]:
@@ -295,11 +298,36 @@ def log_counts(counts: dict, parsed_rows: int) -> None:
 
 
 def ingest() -> None:
-    init_schema()
+    def step_start(label: str) -> float:
+        print(f"[STEP_START] {label}")
+        return time.perf_counter()
 
+    def step_end(label: str, start: float, **stats) -> None:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        stats_text = " ".join(
+            f"{key}={value}" for key, value in stats.items() if value is not None
+        )
+        if stats_text:
+            print(f"[STEP_END] {label} ms={elapsed_ms} {stats_text}")
+        else:
+            print(f"[STEP_END] {label} ms={elapsed_ms}")
+
+    total_start = time.perf_counter()
+
+    start = step_start("init_schema")
+    init_schema()
+    step_end("init_schema", start)
+
+    start = step_start("list_txt_files")
     print(f"TXT_DIR={DATA_DIR}")
     files = list_txt_files(DATA_DIR)
-    print(f"FOUND_FILES={len(files)}")
+    total_bytes = 0
+    for path in files:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            pass
+    step_end("list_txt_files", start, file_count=len(files), total_bytes=total_bytes)
 
     counts = {
         "missing_code": 0,
@@ -316,22 +344,45 @@ def ingest() -> None:
         clear_tables()
         log_counts(counts, 0)
         print("No TXT data found. Tables cleared.")
+        total_ms = int((time.perf_counter() - total_start) * 1000)
+        print(f"[STEP_END] ingest_total ms={total_ms} rows=0")
         return
 
+    start = step_start("load_watchlist")
     watchlist = load_watchlist(DATA_DIR)
+    step_end("load_watchlist", start, watchlist_count=len(watchlist))
+
+    start = step_start("read_daily_files")
     daily, name_map = read_daily_files(files, watchlist, counts)
+    daily_rows = len(daily)
+    daily_codes = int(daily["code"].nunique()) if not daily.empty else 0
+    step_end("read_daily_files", start, daily_rows=daily_rows, daily_codes=daily_codes)
 
     if daily.empty:
         clear_tables()
         log_counts(counts, 0)
         print("No valid TXT rows found. Tables cleared.")
+        total_ms = int((time.perf_counter() - total_start) * 1000)
+        print(f"[STEP_END] ingest_total ms={total_ms} rows=0")
         return
 
+    start = step_start("build_monthly")
     monthly = build_monthly(daily)
-    monthly_ma = build_monthly_ma(monthly)
-    daily_ma = build_daily_ma(daily)
-    meta = build_stock_meta(monthly, name_map)
+    step_end("build_monthly", start, monthly_rows=len(monthly))
 
+    start = step_start("build_monthly_ma")
+    monthly_ma = build_monthly_ma(monthly)
+    step_end("build_monthly_ma", start, monthly_ma_rows=len(monthly_ma))
+
+    start = step_start("build_daily_ma")
+    daily_ma = build_daily_ma(daily)
+    step_end("build_daily_ma", start, daily_ma_rows=len(daily_ma))
+
+    start = step_start("build_stock_meta")
+    meta = build_stock_meta(monthly, name_map)
+    step_end("build_stock_meta", start, meta_rows=len(meta))
+
+    start = step_start("db_replace")
     with get_conn() as conn:
         conn.execute("DELETE FROM daily_bars")
         conn.execute("DELETE FROM daily_ma")
@@ -358,14 +409,18 @@ def ingest() -> None:
         )
 
         conn.execute("INSERT INTO tickers SELECT code, name FROM meta_df")
+    step_end("db_replace", start, daily_rows=len(daily), monthly_rows=len(monthly), meta_rows=len(meta))
 
     log_counts(counts, len(daily))
     print(f"Inserted {len(meta)} tickers")
     print(f"Inserted {len(monthly)} monthly rows")
     print(f"Inserted {len(daily)} daily rows")
+    total_ms = int((time.perf_counter() - total_start) * 1000)
+    print(f"[STEP_END] ingest_total ms={total_ms} rows={len(daily)}")
 
 
 def main() -> None:
+
     ingest()
 
 

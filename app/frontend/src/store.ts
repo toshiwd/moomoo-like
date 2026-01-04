@@ -27,7 +27,21 @@ export type Ticker = {
     up100?: number | null;
     down100?: number | null;
   };
-  boxState?: "NONE" | "IN_BOX" | "BREAKOUT_UP" | "BREAKOUT_DOWN";
+  boxState?: "NONE" | "IN_BOX" | "JUST_BREAKOUT" | "BREAKOUT_UP" | "BREAKOUT_DOWN";
+  boxEndMonth?: string | null;
+  breakoutMonth?: string | null;
+  boxActive?: boolean;
+  hasBox?: boolean;
+  buyState?: string | null;
+  buyStateRank?: number | null;
+  buyStateScore?: number | null;
+  buyStateReason?: string | null;
+  buyRiskDistance?: number | null;
+  buyStateDetails?: {
+    monthly?: number | null;
+    weekly?: number | null;
+    daily?: number | null;
+  };
   scores?: {
     upScore?: number | null;
     downScore?: number | null;
@@ -154,6 +168,9 @@ type StoreState = {
 export type SortKey =
   | "code"
   | "name"
+  | "buyCandidate"
+  | "buyInitial"
+  | "buyBase"
   | "chg1D"
   | "chg1W"
   | "chg1M"
@@ -398,6 +415,9 @@ const getInitialSortKey = (): SortKey => {
   const options: SortKey[] = [
     "code",
     "name",
+    "buyCandidate",
+    "buyInitial",
+    "buyBase",
     "chg1D",
     "chg1W",
     "chg1M",
@@ -413,7 +433,7 @@ const getInitialSortKey = (): SortKey => {
     "overheatDown",
     "boxState"
   ];
-  return options.includes(saved as SortKey) ? (saved as SortKey) : "chg1D";
+  return options.includes(saved as SortKey) ? (saved as SortKey) : "buyCandidate";
 };
 
 const getInitialSortDir = (): SortDir => {
@@ -508,7 +528,44 @@ export const useStore = create<StoreState>((set, get) => ({
         prevQuarterChg: item.prevQuarterChg ?? null,
         prevYearChg: item.prevYearChg ?? null,
         counts: item.counts,
-        boxState: item.boxState,
+        boxState: item.boxState ?? item.box_state ?? "NONE",
+        boxEndMonth: item.boxEndMonth ?? item.box_end_month ?? null,
+        breakoutMonth: item.breakoutMonth ?? item.breakout_month ?? null,
+        boxActive:
+          typeof item.boxActive === "boolean"
+            ? item.boxActive
+            : typeof item.box_active === "boolean"
+            ? item.box_active
+            : null,
+        hasBox:
+          typeof item.hasBox === "boolean"
+            ? item.hasBox
+            : typeof item.boxActive === "boolean"
+            ? item.boxActive
+            : typeof item.box_active === "boolean"
+            ? item.box_active
+            : (item.boxState ?? item.box_state ?? "NONE") !== "NONE",
+        buyState: item.buyState ?? item.buy_state ?? null,
+        buyStateRank:
+          typeof item.buyStateRank === "number"
+            ? item.buyStateRank
+            : typeof item.buy_state_rank === "number"
+            ? item.buy_state_rank
+            : null,
+        buyStateScore:
+          typeof item.buyStateScore === "number"
+            ? item.buyStateScore
+            : typeof item.buy_state_score === "number"
+            ? item.buy_state_score
+            : null,
+        buyStateReason: item.buyStateReason ?? item.buy_state_reason ?? null,
+        buyRiskDistance:
+          typeof item.buyRiskDistance === "number"
+            ? item.buyRiskDistance
+            : typeof item.buy_risk_distance === "number"
+            ? item.buy_risk_distance
+            : null,
+        buyStateDetails: item.buyStateDetails ?? null,
         scores: item.scores,
         statusLabel: item.statusLabel,
         reasons: item.reasons

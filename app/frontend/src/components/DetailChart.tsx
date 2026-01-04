@@ -50,6 +50,7 @@ type DetailChartProps = {
     showMarkers?: boolean;
   };
   onCrosshairMove?: (time: number | null) => void;
+  onVisibleRangeChange?: (range: { from: number; to: number } | null) => void;
 };
 
 const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function DetailChart(
@@ -62,7 +63,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     showBoxes,
     visibleRange,
     positionOverlay,
-    onCrosshairMove
+    onCrosshairMove,
+    onVisibleRangeChange
   },
   ref
 ) {
@@ -84,9 +86,23 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
   const showBoxesRef = useRef(showBoxes);
   const suppressCrosshairRef = useRef(false);
   const onCrosshairMoveRef = useRef<DetailChartProps["onCrosshairMove"]>(onCrosshairMove);
+  const onVisibleRangeChangeRef = useRef<DetailChartProps["onVisibleRangeChange"]>(
+    onVisibleRangeChange
+  );
 
   const BOX_FILL = getBoxFill();
   const BOX_STROKE = getBoxStroke();
+
+  const normalizeRangeTime = (value: unknown) => {
+    if (typeof value === "number") return value;
+    if (value && typeof value === "object") {
+      const data = value as { year?: number; month?: number; day?: number };
+      if (data.year && data.month && data.day) {
+        return Math.floor(Date.UTC(data.year, data.month - 1, data.day) / 1000);
+      }
+    }
+    return null;
+  };
 
   const findNearestCandle = (time: number) => {
     const items = candlesRef.current;
@@ -300,6 +316,10 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     onCrosshairMoveRef.current = onCrosshairMove;
   }, [onCrosshairMove]);
 
+  useEffect(() => {
+    onVisibleRangeChangeRef.current = onVisibleRangeChange;
+  }, [onVisibleRangeChange]);
+
   useLayoutEffect(() => {
     if (!containerRef.current || chartRef.current) return;
     const element = containerRef.current;
@@ -394,7 +414,20 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       chart.subscribeCrosshairMove(crosshairHandler);
       const timeScale = chart.timeScale() as any;
       const priceScale = chart.priceScale("right") as any;
-      const rangeHandler = () => drawBoxes();
+      const rangeHandler = () => {
+        drawBoxes();
+        const handler = onVisibleRangeChangeRef.current;
+        if (!handler || typeof timeScale.getVisibleRange !== "function") return;
+        const range = timeScale.getVisibleRange();
+        if (!range) {
+          handler(null);
+          return;
+        }
+        const from = normalizeRangeTime(range.from);
+        const to = normalizeRangeTime(range.to);
+        if (from == null || to == null) return;
+        handler({ from, to });
+      };
       if (timeScale?.subscribeVisibleLogicalRangeChange) {
         timeScale.subscribeVisibleLogicalRangeChange(rangeHandler);
       }

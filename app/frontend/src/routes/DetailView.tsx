@@ -318,11 +318,15 @@ export default function DetailView() {
   const [rangeMonths, setRangeMonths] = useState<number | null>(12);
   const [showTradesOverlay, setShowTradesOverlay] = useState(true);
   const [showPnLPanel, setShowPnLPanel] = useState(true);
+  const [syncRanges, setSyncRanges] = useState(true);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [focusPanel, setFocusPanel] = useState<FocusPanel>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [showPositionLedger, setShowPositionLedger] = useState(false);
   const [positionLedgerExpanded, setPositionLedgerExpanded] = useState(false);
+  const syncRangesRef = useRef(syncRanges);
+  const pendingRangeRef = useRef<{ from: number; to: number } | null>(null);
+  const syncRafRef = useRef<number | null>(null);
 
   const tickerName = useMemo(() => {
     if (!code) return "";
@@ -518,6 +522,10 @@ export default function DetailView() {
     [monthlyCandles, rangeMonths]
   );
 
+  useEffect(() => {
+    syncRangesRef.current = syncRanges;
+  }, [syncRanges]);
+
   const dailyInvalidCount =
     dailyParse.stats.invalidRow + dailyParse.stats.invalidTime + dailyParse.stats.invalidValue;
   const monthlyInvalidCount =
@@ -698,6 +706,15 @@ export default function DetailView() {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (syncRafRef.current !== null) {
+        window.cancelAnimationFrame(syncRafRef.current);
+        syncRafRef.current = null;
+      }
+    };
+  }, []);
+
   const scheduleHoverTime = (time: number | null) => {
     hoverTimePendingRef.current = time;
     if (hoverRafRef.current !== null) return;
@@ -723,6 +740,38 @@ export default function DetailView() {
   const toggleRange = (months: number) => {
     setRangeMonths((prev) => (prev === months ? null : months));
   };
+
+  const syncRangeToSecondary = (range: { from: number; to: number }) => {
+    if (!syncRangesRef.current) return;
+    const weeklyMin = weeklyCandles[0]?.time;
+    const monthlyMin = monthlyCandles[0]?.time;
+    if (weeklyMin && range.from < weeklyMin && hasMoreDaily && !loadingDaily) {
+      loadMoreDaily();
+    }
+    if (monthlyMin && range.from < monthlyMin && hasMoreMonthly && !loadingMonthly) {
+      loadMoreMonthly();
+    }
+    weeklyChartRef.current?.setVisibleRange(range);
+    monthlyChartRef.current?.setVisibleRange(range);
+  };
+
+  const handleDailyVisibleRangeChange = (range: { from: number; to: number } | null) => {
+    if (!range) return;
+    pendingRangeRef.current = range;
+    if (syncRafRef.current !== null) return;
+    syncRafRef.current = window.requestAnimationFrame(() => {
+      syncRafRef.current = null;
+      const pending = pendingRangeRef.current;
+      if (!pending) return;
+      syncRangeToSecondary(pending);
+    });
+  };
+
+  useEffect(() => {
+    const pending = pendingRangeRef.current;
+    if (!pending || !syncRangesRef.current) return;
+    syncRangeToSecondary(pending);
+  }, [weeklyCandles, monthlyCandles, loadingDaily, loadingMonthly]);
 
   const parseBarsResponse = (payload: BarsResponse | number[][], label: string) => {
     if (Array.isArray(payload)) {
@@ -895,6 +944,12 @@ export default function DetailView() {
           >
             PnL
           </button>
+          <button
+            className={syncRanges ? "indicator-button active" : "indicator-button"}
+            onClick={() => setSyncRanges((prev) => !prev)}
+          >
+            連動: {syncRanges ? "ON" : "OFF"}
+          </button>
           <button className="indicator-button" onClick={() => setShowIndicators(true)}>
             Indicators
           </button>
@@ -927,6 +982,7 @@ export default function DetailView() {
                     hoverTime
                   }}
                   onCrosshairMove={handleDailyCrosshair}
+                  onVisibleRangeChange={handleDailyVisibleRangeChange}
                 />
               )}
               {focusPanel === "weekly" && (
@@ -1015,6 +1071,7 @@ export default function DetailView() {
                     hoverTime
                   }}
                   onCrosshairMove={handleDailyCrosshair}
+                  onVisibleRangeChange={handleDailyVisibleRangeChange}
                 />
                 {dailyEmptyMessage && (
                   <div className="detail-chart-empty">Daily: {dailyEmptyMessage}</div>

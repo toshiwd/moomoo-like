@@ -525,7 +525,9 @@ export default function GridView() {
         const already = Boolean(res.data?.alreadyExisted);
         await loadList();
         setToastMessage(
-          already ? `${code} は既に追加済みです。` : `${code} をウォッチリストに追加しました。`
+          already
+            ? `${code} は既に追加済みです。`
+            : `${code} を追加しました。次回TXT更新で反映されます。`
         );
       } catch {
         setToastMessage("ウォッチリスト追加に失敗しました。");
@@ -569,6 +571,9 @@ export default function GridView() {
     } catch {
       setToastMessage("復元に失敗しました。");
     } finally {
+      if (undoTimerRef.current) {
+        window.clearTimeout(undoTimerRef.current);
+      }
       setUndoInfo(null);
     }
   }, [undoInfo, loadList]);
@@ -931,16 +936,27 @@ export default function GridView() {
                 </button>
               ))}
             </div>
-            <div className="search-field">
-              <input
-                className="search-input"
-                placeholder="コード / 銘柄名で検索"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-              {search && (
-                <button type="button" className="search-clear" onClick={() => setSearch("")}>
-                  クリア
+            <div className="search-area">
+              <div className="search-field">
+                <input
+                  className="search-input"
+                  placeholder="コード / 銘柄名で検索"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                />
+                {search && (
+                  <button type="button" className="search-clear" onClick={() => setSearch("")}>
+                    クリア
+                  </button>
+                )}
+              </div>
+              {canAddWatchlist && (
+                <button
+                  type="button"
+                  className="search-add-row"
+                  onClick={() => handleAddWatchlist(canAddWatchlist)}
+                >
+                  “{canAddWatchlist}” は未登録です → ウォッチリストに追加
                 </button>
               )}
             </div>
@@ -1202,6 +1218,11 @@ export default function GridView() {
                       onOpenDetail={handleOpenDetail}
                       selected={selectedSet.has(item.ticker.code)}
                       onToggleSelect={toggleSelect}
+                      menuOpen={watchMenuCode === item.ticker.code}
+                      onToggleMenu={(code) =>
+                        setWatchMenuCode((prev) => (prev === code ? null : code))
+                      }
+                      onRemoveWatchlist={handleRemoveWatchlist}
                     />
                   </div>
                 );
@@ -1210,6 +1231,18 @@ export default function GridView() {
           </div>
         )}
       </div>
+      {undoInfo && (
+        <div
+          className={`undo-bar ${
+            consultVisible ? (consultExpanded ? "offset-expanded" : "offset-mini") : ""
+          }`}
+        >
+          <span>{undoInfo.code} を削除しました</span>
+          <button type="button" onClick={handleUndoRemove}>
+            元に戻す
+          </button>
+        </div>
+      )}
       <div
         className={`consult-sheet ${consultVisible ? "is-visible" : "is-hidden"} ${
           consultExpanded ? "is-expanded" : "is-mini"

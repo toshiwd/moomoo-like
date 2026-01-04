@@ -1,4 +1,4 @@
-﻿import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { Ticker, useStore } from "../store";
 import type { SignalChip } from "../utils/signals";
 import ThumbnailCanvas from "./ThumbnailCanvas";
@@ -137,7 +137,7 @@ const StockTile = memo(function StockTile({
                 }}
                 aria-label="ウォッチリスト操作"
               >
-                ⋯
+                ...
               </button>
               {menuOpen && (
                 <div

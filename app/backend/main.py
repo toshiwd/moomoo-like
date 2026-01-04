@@ -1,8 +1,10 @@
 ﻿from datetime import datetime, timedelta
 import csv
+import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -79,6 +81,40 @@ UPDATE_STATE_PATH = os.getenv(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "update_state.json"))
 )
 SPLIT_SUSPECTS_PATH = os.path.abspath(os.path.join(DATA_DIR, "_split_suspects.csv"))
+WATCHLIST_TRASH_DIR = os.path.abspath(os.path.join(DATA_DIR, "trash"))
+WATCHLIST_TRASH_PATTERNS = [
+    pattern
+    for pattern in re.split(
+        r"[;\n]+",
+        os.getenv(
+            "WATCHLIST_TRASH_PATTERNS",
+            os.path.join(REPO_ROOT, "data", "csv", "{code}*.csv")
+            + ";"
+            + os.path.join(REPO_ROOT, "data", "txt", "{code}*.txt")
+        )
+    )
+    if pattern.strip()
+]
+WATCHLIST_CODE_RE = re.compile(r"^\d{4}[A-Z]?$")
+_watchlist_lock = threading.Lock()
+
+
+def _build_name_map_from_txt() -> dict[str, str]:
+    if not os.path.isdir(PAN_OUT_TXT_DIR):
+        return {}
+    name_map: dict[str, str] = {}
+    for filename in os.listdir(PAN_OUT_TXT_DIR):
+        if not filename.endswith(".txt") or filename.lower() == "code.txt":
+            continue
+        base = os.path.splitext(filename)[0]
+        if "_" not in base:
+            continue
+        code, name = base.split("_", 1)
+        code = code.strip()
+        name = name.strip()
+        if code and name and code not in name_map:
+            name_map[code] = name
+    return name_map
 
 
 _trade_cache = {"key": None, "rows": [], "warnings": []}
@@ -158,6 +194,141 @@ def find_code_txt_path(data_dir: str) -> str | None:
     if os.path.exists(PAN_CODE_TXT_PATH):
         return PAN_CODE_TXT_PATH
     return None
+
+
+def _normalize_watch_code(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    fullwidth = str.maketrans(
+        "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    )
+    text = text.translate(fullwidth)
+    text = re.sub(r"\s+", "", text)
+    text = text.upper()
+    if not WATCHLIST_CODE_RE.match(text):
+        return None
+    return text
+
+
+def _extract_code_from_line(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("#") or stripped.startswith("'"):
+        return None
+    token = re.split(r"[,\t ]+", stripped, maxsplit=1)[0]
+    return _normalize_watch_code(token)
+
+
+def _read_watchlist_lines(path: str) -> list[str]:
+    for encoding in ("utf-8", "cp932"):
+        try:
+            with open(path, "r", encoding=encoding) as handle:
+                return handle.read().splitlines()
+        except OSError:
+            continue
+    return []
+
+
+def _write_watchlist_lines(path: str, lines: list[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _load_watchlist_codes(path: str) -> list[str]:
+    lines = _read_watchlist_lines(path)
+    seen: set[str] = set()
+    codes: list[str] = []
+    for line in lines:
+        code = _extract_code_from_line(line)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+    return codes
+
+
+def _update_watchlist_file(path: str, code: str, remove: bool) -> bool:
+    lines = _read_watchlist_lines(path)
+    seen: set[str] = set()
+    updated: list[str] = []
+    removed = False
+    for line in lines:
+        parsed = _extract_code_from_line(line)
+        if not parsed:
+            updated.append(line)
+            continue
+        if parsed == code and remove:
+            removed = True
+            continue
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        updated.append(parsed)
+
+    if not remove and code not in seen:
+        updated.append(code)
+    _write_watchlist_lines(path, updated)
+    return removed
+
+
+def _trash_watchlist_artifacts(code: str) -> tuple[str | None, list[str]]:
+    if not WATCHLIST_TRASH_PATTERNS:
+        return None, []
+    trashed: list[str] = []
+    token = datetime.now().strftime("%Y%m%d_%H%M%S")
+    trash_dir = os.path.join(WATCHLIST_TRASH_DIR, token)
+    os.makedirs(trash_dir, exist_ok=True)
+    manifest: list[dict] = []
+    for pattern in WATCHLIST_TRASH_PATTERNS:
+        expanded = pattern.format(code=code)
+        for path in glob.glob(expanded):
+            if not os.path.isfile(path):
+                continue
+            dest = os.path.join(trash_dir, os.path.basename(path))
+            shutil.move(path, dest)
+            trashed.append(path)
+            manifest.append({"from": path, "to": dest})
+    if manifest:
+        manifest_path = os.path.join(trash_dir, "_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        return token, trashed
+    return None, []
+
+
+def _restore_watchlist_artifacts(token: str) -> list[str]:
+    if not token:
+        return []
+    trash_dir = os.path.join(WATCHLIST_TRASH_DIR, token)
+    manifest_path = os.path.join(trash_dir, "_manifest.json")
+    if not os.path.isfile(manifest_path):
+        return []
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    restored: list[str] = []
+    for entry in manifest:
+        src = entry.get("to")
+        dest = entry.get("from")
+        if not src or not dest:
+            continue
+        if not os.path.isfile(src):
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(src, dest)
+        restored.append(dest)
+    return restored
 
 app = FastAPI()
 
@@ -2460,7 +2631,7 @@ def _build_screener_rows() -> list[dict]:
     with get_conn() as conn:
         codes = [row[0] for row in conn.execute("SELECT DISTINCT code FROM daily_bars ORDER BY code").fetchall()]
         meta_rows = conn.execute(
-            "SELECT code, name, stage, score, reason FROM stock_meta"
+            "SELECT code, name, stage, score, reason, score_status, missing_reasons_json, score_breakdown_json FROM stock_meta"
         ).fetchall()
         daily_rows = conn.execute(
             """
@@ -2490,6 +2661,7 @@ def _build_screener_rows() -> list[dict]:
         ).fetchall()
 
     meta_map = {row[0]: row for row in meta_rows}
+    fallback_names = _build_name_map_from_txt()
     daily_map: dict[str, list[tuple]] = {}
     monthly_map: dict[str, list[tuple]] = {}
 
@@ -2503,12 +2675,68 @@ def _build_screener_rows() -> list[dict]:
 
     items: list[dict] = []
     for code in codes:
-        meta = meta_map.get(code) or (code, code, "UNKNOWN", 0.0, "TXT_ONLY")
-        name = meta[1] or code
-        stage = meta[2] or "UNKNOWN"
-        score = meta[3] if meta[3] is not None else 0.0
-        reason = meta[4] or ""
+        meta = meta_map.get(code)
+        name = meta[1] if meta else None
+        stage = meta[2] if meta else None
+        score = meta[3] if meta and meta[3] is not None else None
+        reason = meta[4] if meta and meta[4] is not None else ""
+        score_status = meta[5] if meta else None
+        missing_reasons = []
+        if meta and meta[6]:
+            try:
+                missing_reasons = json.loads(meta[6]) or []
+            except (TypeError, json.JSONDecodeError):
+                missing_reasons = []
+        score_breakdown = None
+        if meta and meta[7]:
+            try:
+                score_breakdown = json.loads(meta[7]) or None
+            except (TypeError, json.JSONDecodeError):
+                score_breakdown = None
         metrics = _compute_screener_metrics(daily_map.get(code, []), monthly_map.get(code, []))
+        fallback_name = fallback_names.get(code)
+        if not name or name == code:
+            name = fallback_name
+        if not name:
+            name = code
+        if not stage or stage.upper() == "UNKNOWN":
+            stage = metrics.get("statusLabel") or stage or "UNKNOWN"
+        if isinstance(score, (int, float)) and float(score) == 0.0:
+            if (
+                not score_status
+                or score_status == "INSUFFICIENT_DATA"
+                or not reason
+                or reason == "TODO"
+                or not stage
+                or (isinstance(stage, str) and stage.upper() == "UNKNOWN")
+            ):
+                score = None
+                score_status = "INSUFFICIENT_DATA"
+        if score is None:
+            fallback_score = None
+            buy_score = metrics.get("buyStateScore")
+            if isinstance(buy_score, (int, float)) and buy_score > 0:
+                fallback_score = float(buy_score)
+            else:
+                scores = metrics.get("scores") or {}
+                if isinstance(scores, dict):
+                    values = [
+                        scores.get("upScore"),
+                        scores.get("downScore")
+                    ]
+                    values = [float(v) for v in values if isinstance(v, (int, float)) and v > 0]
+                    if values:
+                        fallback_score = max(values)
+            if fallback_score is not None:
+                score = fallback_score
+                if not reason:
+                    reason = "DERIVED"
+                if not score_status:
+                    score_status = "OK"
+        if not score_status:
+            score_status = "OK" if score is not None else "INSUFFICIENT_DATA"
+        if not missing_reasons:
+            missing_reasons = metrics.get("reasons") or []
         items.append(
             {
                 "code": code,
@@ -2516,6 +2744,12 @@ def _build_screener_rows() -> list[dict]:
                 "stage": stage,
                 "score": score,
                 "reason": reason,
+                "scoreStatus": score_status,
+                "score_status": score_status,
+                "missingReasons": missing_reasons,
+                "missing_reasons": missing_reasons,
+                "scoreBreakdown": score_breakdown,
+                "score_breakdown": score_breakdown,
                 **metrics
             }
         )
@@ -2892,6 +3126,69 @@ def update_txt():
     return txt_update_run()
 
 
+@app.get("/api/watchlist")
+def get_watchlist():
+    path = PAN_CODE_TXT_PATH
+    if not os.path.isfile(path):
+        return {"codes": [], "path": path, "missing": True}
+    with _watchlist_lock:
+        codes = _load_watchlist_codes(path)
+    return {"codes": codes, "path": path, "missing": False}
+
+
+@app.post("/api/watchlist/add")
+def watchlist_add(payload: dict = Body(default=None)):
+    payload = payload or {}
+    code = _normalize_watch_code(payload.get("code"))
+    if not code:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_code"})
+    path = PAN_CODE_TXT_PATH
+    with _watchlist_lock:
+        codes = _load_watchlist_codes(path) if os.path.isfile(path) else []
+        already = code in codes
+        _update_watchlist_file(path, code, remove=False)
+    return {"ok": True, "code": code, "alreadyExisted": already}
+
+
+@app.post("/api/watchlist/remove")
+def watchlist_remove(payload: dict = Body(default=None)):
+    payload = payload or {}
+    code = _normalize_watch_code(payload.get("code"))
+    if not code:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_code"})
+    delete_artifacts = payload.get("deleteArtifacts", True)
+    path = PAN_CODE_TXT_PATH
+    if not os.path.isfile(path):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "code_txt_missing"})
+    with _watchlist_lock:
+        removed = _update_watchlist_file(path, code, remove=True)
+        trash_token = None
+        trashed: list[str] = []
+        if delete_artifacts:
+            trash_token, trashed = _trash_watchlist_artifacts(code)
+    return {
+        "ok": True,
+        "code": code,
+        "removed": removed,
+        "deleteArtifacts": bool(delete_artifacts),
+        "trashed": trashed,
+        "trashToken": trash_token
+    }
+
+
+@app.post("/api/watchlist/undo_remove")
+def watchlist_undo_remove(payload: dict = Body(default=None)):
+    payload = payload or {}
+    code = _normalize_watch_code(payload.get("code"))
+    token = payload.get("trashToken") or ""
+    if not code:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_code"})
+    with _watchlist_lock:
+        restored = _restore_watchlist_artifacts(token)
+        _update_watchlist_file(PAN_CODE_TXT_PATH, code, remove=False)
+    return {"ok": True, "code": code, "restored": restored}
+
+
 @app.get("/api/health")
 def health():
     try:
@@ -3005,7 +3302,7 @@ def list_tickers():
             SELECT d.code,
                    COALESCE(m.name, d.code) AS name,
                    COALESCE(m.stage, 'UNKNOWN') AS stage,
-                   COALESCE(m.score, 0) AS score,
+                   m.score AS score,
                    COALESCE(m.reason, 'TXT_ONLY') AS reason
             FROM (SELECT DISTINCT code FROM daily_bars) d
             LEFT JOIN stock_meta m ON d.code = m.code

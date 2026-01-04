@@ -1,4 +1,4 @@
-﻿import { memo } from "react";
+﻿import { memo, useEffect, useState } from "react";
 import { Ticker, useStore } from "../store";
 import type { SignalChip } from "../utils/signals";
 import ThumbnailCanvas from "./ThumbnailCanvas";
@@ -12,7 +12,10 @@ const StockTile = memo(function StockTile({
   trendStrength,
   exhaustionRisk,
   selected = false,
-  onToggleSelect
+  onToggleSelect,
+  menuOpen = false,
+  onToggleMenu,
+  onRemoveWatchlist
 }: {
   ticker: Ticker;
   timeframe: "monthly" | "weekly" | "daily";
@@ -22,6 +25,9 @@ const StockTile = memo(function StockTile({
   onOpenDetail: (code: string) => void;
   selected?: boolean;
   onToggleSelect?: (code: string) => void;
+  menuOpen?: boolean;
+  onToggleMenu?: (code: string) => void;
+  onRemoveWatchlist?: (code: string, deleteArtifacts: boolean) => void;
 }) {
   const barsPayload = useStore((state) => {
     const map = state.barsCache?.[timeframe] ?? {};
@@ -45,18 +51,38 @@ const StockTile = memo(function StockTile({
       : map.monthly ?? [];
   });
   const showBoxes = useStore((state) => state.settings.showBoxes);
+  const [deleteArtifacts, setDeleteArtifacts] = useState(true);
   const cacheKey = buildThumbnailCacheKey(ticker.code, timeframe, showBoxes, maSettings);
   const cachedThumb = getThumbnailCache(cacheKey);
 
-  const stageLabel = (ticker.stage ?? "").trim();
-  const showStage = stageLabel.length > 0 && stageLabel.toUpperCase() !== "UNKNOWN";
+  const rawStageLabel = (ticker.stage ?? "").trim();
+  const scoreStatus =
+    ticker.scoreStatus ?? (Number.isFinite(ticker.score) ? "OK" : "INSUFFICIENT_DATA");
+  const scoreOk =
+    scoreStatus === "OK" &&
+    Number.isFinite(ticker.score) &&
+    typeof ticker.score === "number" &&
+    ticker.score > 0;
+  const stageLabel = rawStageLabel;
+  const showStage =
+    stageLabel.length > 0 && stageLabel.toUpperCase() !== "UNKNOWN";
   const stageClass = stageLabel.toLowerCase();
+  const missingTitle =
+    !scoreOk && ticker.missingReasons?.length
+      ? `missing: ${ticker.missingReasons.join(", ")}`
+      : undefined;
   const scoreText =
     typeof trendStrength === "number"
       ? `TS:${trendStrength >= 0 ? "+" : ""}${Math.round(trendStrength)}`
       : null;
   const riskText =
     typeof exhaustionRisk === "number" ? `ER:${Math.round(exhaustionRisk)}` : null;
+
+  useEffect(() => {
+    if (!menuOpen) {
+      setDeleteArtifacts(true);
+    }
+  }, [menuOpen]);
 
   return (
     <div
@@ -83,17 +109,65 @@ const StockTile = memo(function StockTile({
                 <span className="tile-code">{ticker.code}</span>
               </label>
               <span className="tile-name">{ticker.name}</span>
+              {ticker.dataStatus === "missing" && (
+                <span className="badge status-missing">未取得</span>
+              )}
             </>
           ) : (
             <>
               <span className="tile-code">{ticker.code}</span>
               <span className="tile-name">{ticker.name}</span>
+              {ticker.dataStatus === "missing" && (
+                <span className="badge status-missing">未取得</span>
+              )}
             </>
           )}
         </div>
-        <div className="tile-meta">
+        <div className="tile-meta" title={missingTitle}>
           {showStage && <span className={`badge stage-${stageClass}`}>{stageLabel}</span>}
-          <span className="score">{ticker.score?.toFixed(1) ?? "--"}</span>
+          {scoreOk && <span className="score">{ticker.score?.toFixed(1)}</span>}
+          {onToggleMenu && (
+            <div className="tile-menu">
+              <button
+                type="button"
+                className="tile-menu-button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleMenu(ticker.code);
+                }}
+                aria-label="ウォッチリスト操作"
+              >
+                ⋯
+              </button>
+              {menuOpen && (
+                <div
+                  className="tile-menu-panel"
+                  onClick={(event) => event.stopPropagation()}
+                  onDoubleClick={(event) => event.stopPropagation()}
+                >
+                  <div className="tile-menu-title">ウォッチリストから削除</div>
+                  <label className="tile-menu-check">
+                    <input
+                      type="checkbox"
+                      checked={deleteArtifacts}
+                      onChange={(event) => setDeleteArtifacts(event.target.checked)}
+                    />
+                    データも削除（退避）
+                  </label>
+                  <button
+                    type="button"
+                    className="tile-menu-action"
+                    onClick={() => {
+                      onRemoveWatchlist?.(ticker.code, deleteArtifacts);
+                      onToggleMenu(ticker.code);
+                    }}
+                  >
+                    削除
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       {(signals?.length || scoreText || riskText) && (

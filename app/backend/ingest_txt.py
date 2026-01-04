@@ -1,4 +1,5 @@
 ﻿import os
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -45,9 +46,312 @@ def name_from_filename(path: str, code: str) -> str | None:
     return name if name else None
 
 
-def compute_stage_score(monthly_df: pd.DataFrame) -> tuple[str, float, str]:
-    # TODO: replace with Iizuka stage logic when available.
-    return "UNKNOWN", 0.0, "TODO: Iizuka stage/score pipeline"
+
+def _build_ma_series(values: list[float], period: int) -> list[float | None]:
+    if period <= 0:
+        return [None for _ in values]
+    result: list[float | None] = []
+    total = 0.0
+    for index, value in enumerate(values):
+        total += value
+        if index >= period:
+            total -= values[index - period]
+        if index >= period - 1:
+            result.append(total / period)
+        else:
+            result.append(None)
+    return result
+
+
+def _count_streak(values: list[float], averages: list[float | None], direction: str) -> int | None:
+    count = 0
+    opposite = 0
+    has_values = False
+    for value, avg in zip(values, averages):
+        if avg is None:
+            continue
+        has_values = True
+        if direction == "up":
+            if value > avg:
+                count += 1
+                opposite = 0
+            elif value < avg:
+                opposite += 1
+                if opposite >= 2:
+                    count = 0
+            else:
+                opposite = 0
+        else:
+            if value < avg:
+                count += 1
+                opposite = 0
+            elif value > avg:
+                opposite += 1
+                if opposite >= 2:
+                    count = 0
+            else:
+                opposite = 0
+    return None if not has_values else count
+
+
+def _pct_change(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None or previous == 0:
+        return None
+    return current / previous - 1
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(result):
+        return None
+    return result
+
+
+def _compute_volume_ratio(volumes: list[float], period: int = 20) -> float | None:
+    if len(volumes) < period:
+        return None
+    window = volumes[-period:]
+    avg = sum(window) / period
+    if avg <= 0:
+        return None
+    return volumes[-1] / avg
+
+
+def _detect_body_box(monthly_rows: list[tuple]) -> dict | None:
+    min_months = 3
+    max_months = 14
+    max_range_pct = 0.2
+    wild_wick_pct = 0.1
+
+    bars: list[dict] = []
+    for row in monthly_rows:
+        if len(row) < 5:
+            continue
+        month_value, open_, high, low, close = row[:5]
+        open_v = _safe_float(open_)
+        high_v = _safe_float(high)
+        low_v = _safe_float(low)
+        close_v = _safe_float(close)
+        if month_value is None or open_v is None or high_v is None or low_v is None or close_v is None:
+            continue
+        body_high = max(open_v, close_v)
+        body_low = min(open_v, close_v)
+        bars.append(
+            {
+                "time": int(month_value),
+                "open": open_v,
+                "high": high_v,
+                "low": low_v,
+                "close": close_v,
+                "body_high": body_high,
+                "body_low": body_low
+            }
+        )
+
+    if len(bars) < min_months:
+        return None
+
+    bars.sort(key=lambda item: item["time"])
+    max_months = min(max_months, len(bars))
+
+    for length in range(max_months, min_months - 1, -1):
+        window = bars[-length:]
+        upper = max(item["body_high"] for item in window)
+        lower = min(item["body_low"] for item in window)
+        base = max(abs(lower), 1e-9)
+        range_pct = (upper - lower) / base
+        if range_pct > max_range_pct:
+            continue
+        wild = False
+        for item in window:
+            if item["high"] > upper * (1 + wild_wick_pct) or item["low"] < lower * (1 - wild_wick_pct):
+                wild = True
+                break
+        return {
+            "start": window[0]["time"],
+            "end": window[-1]["time"],
+            "upper": upper,
+            "lower": lower,
+            "months": length,
+            "wild": wild,
+            "range_pct": range_pct
+        }
+
+    return None
+
+
+def compute_stage_score(
+    daily_df: pd.DataFrame, monthly_df: pd.DataFrame
+) -> tuple[str, float | None, str, list[str], dict]:
+    missing_reasons: list[str] = []
+    score_breakdown: dict[str, float] = {}
+
+    daily = daily_df.sort_values("date")
+    closes = [float(v) for v in daily["c"].tolist() if _safe_float(v) is not None]
+    volumes = [float(v) if _safe_float(v) is not None else 0.0 for v in daily["v"].tolist()]
+
+    last_close = closes[-1] if closes else None
+    if last_close is None:
+        missing_reasons.append("missing_last_close")
+
+    if len(closes) < 60:
+        missing_reasons.append("insufficient_daily_bars")
+
+    ma7_series = _build_ma_series(closes, 7)
+    ma20_series = _build_ma_series(closes, 20)
+    ma60_series = _build_ma_series(closes, 60)
+    ma100_series = _build_ma_series(closes, 100)
+
+    ma7 = ma7_series[-1] if ma7_series else None
+    ma20 = ma20_series[-1] if ma20_series else None
+    ma60 = ma60_series[-1] if ma60_series else None
+    ma100 = ma100_series[-1] if ma100_series else None
+
+    if ma20 is None:
+        missing_reasons.append("missing_ma20")
+    if ma60 is None:
+        missing_reasons.append("missing_ma60")
+    if ma100 is None:
+        missing_reasons.append("missing_ma100")
+
+    slope20 = (
+        ma20_series[-1] - ma20_series[-2]
+        if len(ma20_series) >= 2 and ma20_series[-1] is not None and ma20_series[-2] is not None
+        else None
+    )
+    slope60 = (
+        ma60_series[-1] - ma60_series[-2]
+        if len(ma60_series) >= 2 and ma60_series[-1] is not None and ma60_series[-2] is not None
+        else None
+    )
+
+    monthly = monthly_df.sort_values("month")
+    monthly_rows = monthly[["month", "o", "h", "l", "c"]].values.tolist()
+    monthly_closes = [
+        _safe_float(row[4]) for row in monthly_rows if len(row) >= 5 and _safe_float(row[4]) is not None
+    ]
+
+    if len(monthly_closes) < 3:
+        missing_reasons.append("insufficient_monthly_bars")
+
+    chg1m = _pct_change(monthly_closes[-1], monthly_closes[-2]) if len(monthly_closes) >= 2 else None
+    chg1q = _pct_change(monthly_closes[-1], monthly_closes[-4]) if len(monthly_closes) >= 4 else None
+    chg1y = _pct_change(monthly_closes[-1], monthly_closes[-13]) if len(monthly_closes) >= 13 else None
+
+    if chg1m is None:
+        missing_reasons.append("missing_chg1m")
+    if chg1q is None:
+        missing_reasons.append("missing_chg1q")
+    if chg1y is None:
+        missing_reasons.append("missing_chg1y")
+
+    box = _detect_body_box(monthly_rows)
+    if box is None and len(monthly_rows) >= 3:
+        missing_reasons.append("no_box")
+
+    box_active = False
+    breakout_up = False
+    if box and monthly_rows:
+        latest_month = int(monthly_rows[-1][0])
+        prev_month = int(monthly_rows[-2][0]) if len(monthly_rows) >= 2 else None
+        if box["start"] <= latest_month <= box["end"]:
+            box_active = True
+        elif prev_month is not None and box["start"] <= prev_month <= box["end"]:
+            box_active = True
+        if box_active and last_close is not None and last_close > box["upper"]:
+            breakout_up = True
+
+    essential_missing = (
+        last_close is None
+        or ma20 is None
+        or ma60 is None
+        or len(closes) < 60
+    )
+
+    if essential_missing:
+        return "UNKNOWN", None, "INSUFFICIENT_DATA", missing_reasons, score_breakdown
+
+    up60 = _count_streak(closes, ma60_series, "up")
+    down60 = _count_streak(closes, ma60_series, "down")
+    down20 = _count_streak(closes, ma20_series, "down")
+    up20 = _count_streak(closes, ma20_series, "up")
+
+    stage = "B"
+    if up60 is not None and (up60 >= 22 or (last_close > ma60 and (slope60 or 0) >= 0)):
+        stage = "C"
+    elif down60 is not None and down20 is not None and down60 >= 20 and down20 >= 10:
+        stage = "A"
+
+    trend = 0.0
+    if last_close > ma20:
+        trend += 8
+    if ma20 > ma60:
+        trend += 10
+    if last_close > ma60:
+        trend += 12
+    if ma60 is not None and ma100 is not None and ma60 > ma100:
+        trend += 10
+    if slope20 is not None and slope20 > 0:
+        trend += 3
+    trend = min(40, trend)
+
+    init_move = 0.0
+    if len(closes) >= 2 and len(ma20_series) >= 2:
+        prev_ma20 = ma20_series[-2]
+        if prev_ma20 is not None and closes[-2] <= prev_ma20 and last_close > ma20:
+            init_move += 15
+    if breakout_up:
+        init_move += 10
+    init_move = min(25, init_move)
+
+    base_build = 0.0
+    if stage == "A" and ma20 is not None and last_close >= ma20 * 0.98:
+        base_build += 8
+    if ma7 is not None and len(ma7_series) >= 2 and ma7_series[-2] is not None:
+        if ma7 > ma7_series[-2]:
+            base_build += 4
+    base_build = min(15, base_build)
+
+    box_score = 0.0
+    if breakout_up:
+        box_score += 12
+    elif box_active:
+        box_score += 8
+    box_score = min(15, box_score)
+
+    volume_score = 0.0
+    volume_ratio = _compute_volume_ratio(volumes, 20)
+    if volume_ratio is not None and volume_ratio >= 1.5:
+        volume_score = 5
+    elif volume_ratio is not None and volume_ratio >= 1.1:
+        volume_score = 2
+
+    penalty = 0.0
+    if up20 is not None and up20 >= 20:
+        penalty -= 5
+    if up60 is not None and up60 >= 22:
+        penalty -= 10
+    penalty = max(-20, penalty)
+
+    score_breakdown = {
+        "trend": trend,
+        "init_move": init_move,
+        "base_build": base_build,
+        "box": box_score,
+        "volume": volume_score,
+        "penalty": penalty
+    }
+
+    score = trend + init_move + base_build + box_score + volume_score + penalty
+    score = max(0.0, min(100.0, score))
+
+    return stage, round(score, 3), "OK", missing_reasons, score_breakdown
+
 
 
 def load_watchlist(data_dir: str) -> list[str]:
@@ -245,20 +549,53 @@ def build_daily_ma(daily: pd.DataFrame) -> pd.DataFrame:
     return daily[["code", "date", "ma7", "ma20", "ma60"]]
 
 
-def build_stock_meta(monthly: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
+def build_stock_meta(
+    daily: pd.DataFrame,
+    monthly: pd.DataFrame,
+    name_map: dict[str, str]
+) -> tuple[pd.DataFrame, dict]:
     now = datetime.now(tz=timezone.utc)
     records = []
-    for code, group in monthly.groupby("code"):
-        stage, score, reason = compute_stage_score(group)
-        records.append({
-            "code": code,
-            "name": name_map.get(code, code),
-            "stage": stage,
-            "score": score,
-            "reason": reason,
-            "updated_at": now
-        })
-    return pd.DataFrame(records)
+    score_ok_count = 0
+    score_insufficient_count = 0
+    stage_counts: dict[str, int] = {}
+    missing_reason_counts: dict[str, int] = {}
+
+    daily_groups = {code: group for code, group in daily.groupby("code")}
+    monthly_groups = {code: group for code, group in monthly.groupby("code")}
+
+    for code, group in daily_groups.items():
+        monthly_group = monthly_groups.get(code, pd.DataFrame(columns=monthly.columns))
+        stage, score, score_status, missing_reasons, score_breakdown = compute_stage_score(
+            group, monthly_group
+        )
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        if score_status == "OK":
+            score_ok_count += 1
+        else:
+            score_insufficient_count += 1
+        for reason in missing_reasons:
+            missing_reason_counts[reason] = missing_reason_counts.get(reason, 0) + 1
+        records.append(
+            {
+                "code": code,
+                "name": name_map.get(code, code),
+                "stage": stage,
+                "score": score,
+                "reason": score_status,
+                "score_status": score_status,
+                "missing_reasons_json": json.dumps(missing_reasons, ensure_ascii=False),
+                "score_breakdown_json": json.dumps(score_breakdown, ensure_ascii=False),
+                "updated_at": now
+            }
+        )
+    summary = {
+        "score_ok": score_ok_count,
+        "score_insufficient": score_insufficient_count,
+        "stage_counts": stage_counts,
+        "missing_reason_counts": missing_reason_counts
+    }
+    return pd.DataFrame(records), summary
 
 
 def clear_tables() -> None:
@@ -379,8 +716,21 @@ def ingest() -> None:
     step_end("build_daily_ma", start, daily_ma_rows=len(daily_ma))
 
     start = step_start("build_stock_meta")
-    meta = build_stock_meta(monthly, name_map)
-    step_end("build_stock_meta", start, meta_rows=len(meta))
+    meta, meta_summary = build_stock_meta(daily, monthly, name_map)
+    step_end("build_stock_meta", start, meta_rows=len(meta), score_ok=meta_summary.get("score_ok"), score_insufficient=meta_summary.get("score_insufficient"))
+    if meta_summary.get("stage_counts"):
+        stage_counts = ",".join(
+            f"{key}:{value}" for key, value in sorted(meta_summary["stage_counts"].items())
+        )
+        print(f"STAGE_COUNTS={stage_counts}")
+    if meta_summary.get("missing_reason_counts"):
+        missing_sorted = sorted(
+            meta_summary["missing_reason_counts"].items(),
+            key=lambda item: item[1],
+            reverse=True
+        )[:10]
+        missing_text = ",".join(f"{key}:{value}" for key, value in missing_sorted)
+        print(f"MISSING_REASONS_TOP={missing_text}")
 
     start = step_start("db_replace")
     with get_conn() as conn:
@@ -405,7 +755,7 @@ def ingest() -> None:
 
         conn.register("meta_df", meta)
         conn.execute(
-            "INSERT INTO stock_meta SELECT code, name, stage, score, reason, updated_at FROM meta_df"
+            "INSERT INTO stock_meta SELECT code, name, stage, score, reason, score_status, missing_reasons_json, score_breakdown_json, updated_at FROM meta_df"
         )
 
         conn.execute("INSERT INTO tickers SELECT code, name FROM meta_df")

@@ -78,7 +78,13 @@ def init_schema() -> None:
                 stage TEXT,
                 score DOUBLE,
                 reason TEXT,
+                score_status TEXT,
+                missing_reasons_json TEXT,
+                score_breakdown_json TEXT,
                 updated_at TIMESTAMP
             );
             """
         )
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS score_status TEXT;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS missing_reasons_json TEXT;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS score_breakdown_json TEXT;")

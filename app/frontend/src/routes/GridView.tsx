@@ -97,11 +97,16 @@ export default function GridView() {
   const [consultSort, setConsultSort] = useState<ConsultationSort>("score");
   const [consultBusy, setConsultBusy] = useState(false);
   const [consultMeta, setConsultMeta] = useState<{ omitted: number }>({ omitted: 0 });
+  const [watchMenuCode, setWatchMenuCode] = useState<string | null>(null);
+  const [undoInfo, setUndoInfo] = useState<{ code: string; trashToken?: string | null } | null>(
+    null
+  );
   const sortRef = useRef<HTMLDivElement | null>(null);
   const displayRef = useRef<HTMLDivElement | null>(null);
   const prevUpdateRunningRef = useRef(false);
   const lastVisibleCodesRef = useRef<string[]>([]);
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
   const consultTimeframe: ConsultationTimeframe = "monthly";
   const consultBarsCount = 60;
   const consultPaddingClass = consultVisible
@@ -128,17 +133,19 @@ export default function GridView() {
   }, [backendReady]);
 
   useEffect(() => {
-    if (!sortOpen && !displayOpen) return;
+    if (!sortOpen && !displayOpen && !watchMenuCode) return;
     const handleClick = (event: MouseEvent) => {
-      const target = event.target as Node;
+      const target = event.target as HTMLElement;
       if (sortRef.current && sortRef.current.contains(target)) return;
       if (displayRef.current && displayRef.current.contains(target)) return;
+      if (watchMenuCode && target.closest(".tile-menu")) return;
       setSortOpen(false);
       setDisplayOpen(false);
+      setWatchMenuCode(null);
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [sortOpen, displayOpen]);
+  }, [sortOpen, displayOpen, watchMenuCode]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -152,6 +159,7 @@ export default function GridView() {
       if (event.key === "Escape") {
         setSortOpen(false);
         setDisplayOpen(false);
+        setWatchMenuCode(null);
         if (consultVisible) {
           setConsultVisible(false);
         }
@@ -166,6 +174,14 @@ export default function GridView() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [setGridTimeframe, consultVisible]);
+
+  useEffect(() => {
+    return () => {
+      if (undoTimerRef.current) {
+        window.clearTimeout(undoTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setIsSorting(true);
@@ -238,6 +254,26 @@ export default function GridView() {
 
   const sortDirLabel = sortDir === "desc" ? "降順" : "昇順";
 
+  const normalizeWatchCode = useCallback((value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const fullwidth = "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ";
+    const halfwidth = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let normalized = "";
+    for (const ch of trimmed) {
+      const idx = fullwidth.indexOf(ch);
+      normalized += idx >= 0 ? halfwidth[idx] : ch;
+    }
+    normalized = normalized.replace(/\s+/g, "").toUpperCase();
+    if (!/^\d{4}[A-Z]?$/.test(normalized)) return null;
+    return normalized;
+  }, []);
+
+  const normalizedSearch = useMemo(
+    () => (search ? normalizeWatchCode(search) : null),
+    [search, normalizeWatchCode]
+  );
+
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return tickers;
@@ -245,6 +281,13 @@ export default function GridView() {
       return item.code.toLowerCase().includes(term) || item.name.toLowerCase().includes(term);
     });
   }, [tickers, search]);
+
+  const canAddWatchlist = useMemo(() => {
+    if (!normalizedSearch) return null;
+    if (filtered.length > 0) return null;
+    if (tickers.some((item) => item.code === normalizedSearch)) return null;
+    return normalizedSearch;
+  }, [normalizedSearch, filtered.length, tickers]);
 
   const scoredTickers = useMemo(() => {
     return filtered.map((ticker, index) => {
@@ -473,6 +516,62 @@ export default function GridView() {
     },
     [navigate]
   );
+
+  const handleAddWatchlist = useCallback(
+    async (code: string) => {
+      if (!code) return;
+      try {
+        const res = await api.post("/watchlist/add", { code });
+        const already = Boolean(res.data?.alreadyExisted);
+        await loadList();
+        setToastMessage(
+          already ? `${code} は既に追加済みです。` : `${code} をウォッチリストに追加しました。`
+        );
+      } catch {
+        setToastMessage("ウォッチリスト追加に失敗しました。");
+      }
+    },
+    [loadList]
+  );
+
+  const handleRemoveWatchlist = useCallback(
+    async (code: string, deleteArtifacts: boolean) => {
+      if (!code) return;
+      try {
+        const res = await api.post("/watchlist/remove", { code, deleteArtifacts });
+        await loadList();
+        const trashToken = res.data?.trashToken || null;
+        setUndoInfo({ code, trashToken });
+        if (undoTimerRef.current) {
+          window.clearTimeout(undoTimerRef.current);
+        }
+        undoTimerRef.current = window.setTimeout(() => {
+          setUndoInfo(null);
+        }, 8000);
+        setToastMessage(`${code} を削除しました。`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "ウォッチリスト削除に失敗しました。";
+        setToastMessage(message);
+      }
+    },
+    [loadList]
+  );
+
+  const handleUndoRemove = useCallback(async () => {
+    if (!undoInfo) return;
+    try {
+      await api.post("/watchlist/undo_remove", {
+        code: undoInfo.code,
+        trashToken: undoInfo.trashToken
+      });
+      await loadList();
+      setToastMessage(`${undoInfo.code} を復元しました。`);
+    } catch {
+      setToastMessage("復元に失敗しました。");
+    } finally {
+      setUndoInfo(null);
+    }
+  }, [undoInfo, loadList]);
 
   const resetDisplay = useCallback(() => {
     setColumns(3);

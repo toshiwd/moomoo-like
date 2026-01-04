@@ -5,8 +5,12 @@ export type Ticker = {
   code: string;
   name: string;
   stage: string;
-  score: number;
+  score: number | null;
   reason: string;
+  scoreStatus?: string | null;
+  missingReasons?: string[] | null;
+  scoreBreakdown?: Record<string, number> | null;
+  dataStatus?: "missing" | null;
   lastClose?: number | null;
   chg1D?: number | null;
   chg1W?: number | null;
@@ -511,26 +515,59 @@ export const useStore = create<StoreState>((set, get) => ({
       if (!items.length) {
         throw new Error("Empty screener payload");
       }
-      const tickers = items.map((item) => ({
-        code: item.code,
-        name: item.name ?? item.code,
-        stage: item.stage ?? item.statusLabel ?? "UNKNOWN",
-        score: Number.isFinite(item.score) ? item.score : 0,
-        reason: item.reason ?? "",
-        lastClose: item.lastClose ?? null,
-        chg1D: item.chg1D ?? null,
-        chg1W: item.chg1W ?? null,
-        chg1M: item.chg1M ?? null,
-        chg1Q: item.chg1Q ?? null,
-        chg1Y: item.chg1Y ?? null,
-        prevWeekChg: item.prevWeekChg ?? null,
-        prevMonthChg: item.prevMonthChg ?? null,
-        prevQuarterChg: item.prevQuarterChg ?? null,
-        prevYearChg: item.prevYearChg ?? null,
-        counts: item.counts,
-        boxState: item.boxState ?? item.box_state ?? "NONE",
-        boxEndMonth: item.boxEndMonth ?? item.box_end_month ?? null,
-        breakoutMonth: item.breakoutMonth ?? item.breakout_month ?? null,
+      const parseReasons = (value: unknown): string[] => {
+        if (Array.isArray(value)) {
+          return value.filter((item) => typeof item === "string") as string[];
+        }
+        if (typeof value === "string" && value.trim()) {
+          try {
+            const parsed = JSON.parse(value);
+            if (Array.isArray(parsed)) {
+              return parsed.filter((item) => typeof item === "string") as string[];
+            }
+          } catch {
+            return value.split(",").map((item) => item.trim()).filter(Boolean);
+          }
+        }
+        return [];
+      };
+      const tickers = items.map((item) => {
+        const statusLabel = item.statusLabel ?? null;
+        const stageRaw = item.stage ?? statusLabel ?? "UNKNOWN";
+        const stage =
+          typeof stageRaw === "string" && stageRaw.toUpperCase() === "UNKNOWN" && statusLabel
+            ? statusLabel
+            : stageRaw;
+        const nameRaw = typeof item.name === "string" ? item.name.trim() : "";
+        return {
+          code: item.code,
+          name: nameRaw || item.code,
+          stage,
+          score: Number.isFinite(item.score) ? item.score : null,
+          reason: item.reason ?? "",
+          scoreStatus:
+            item.scoreStatus ??
+            item.score_status ??
+            (Number.isFinite(item.score) ? "OK" : "INSUFFICIENT_DATA"),
+          missingReasons: parseReasons(item.missingReasons ?? item.missing_reasons ?? item.missing_reasons_json),
+          scoreBreakdown:
+            (item.scoreBreakdown as Record<string, number> | null) ??
+            (item.score_breakdown as Record<string, number> | null) ??
+            null,
+          lastClose: item.lastClose ?? null,
+          chg1D: item.chg1D ?? null,
+          chg1W: item.chg1W ?? null,
+          chg1M: item.chg1M ?? null,
+          chg1Q: item.chg1Q ?? null,
+          chg1Y: item.chg1Y ?? null,
+          prevWeekChg: item.prevWeekChg ?? null,
+          prevMonthChg: item.prevMonthChg ?? null,
+          prevQuarterChg: item.prevQuarterChg ?? null,
+          prevYearChg: item.prevYearChg ?? null,
+          counts: item.counts,
+          boxState: item.boxState ?? item.box_state ?? "NONE",
+          boxEndMonth: item.boxEndMonth ?? item.box_end_month ?? null,
+          breakoutMonth: item.breakoutMonth ?? item.breakout_month ?? null,
         boxActive:
           typeof item.boxActive === "boolean"
             ? item.boxActive
@@ -566,20 +603,47 @@ export const useStore = create<StoreState>((set, get) => ({
             ? item.buy_risk_distance
             : null,
         buyStateDetails: item.buyStateDetails ?? null,
-        scores: item.scores,
-        statusLabel: item.statusLabel,
-        reasons: item.reasons
-      }));
+          scores: item.scores,
+          statusLabel: item.statusLabel,
+          reasons: item.reasons
+        };
+      });
+      try {
+        const resWatch = await api.get("/watchlist");
+        const watchlistCodes = (resWatch.data?.codes || []) as string[];
+        if (watchlistCodes.length) {
+          const existing = new Set(tickers.map((item) => item.code));
+          watchlistCodes.forEach((code) => {
+            if (existing.has(code)) return;
+            tickers.push({
+              code,
+              name: code,
+              stage: "",
+              score: null,
+              reason: "WATCHLIST_ONLY",
+              scoreStatus: "INSUFFICIENT_DATA",
+              missingReasons: null,
+              scoreBreakdown: null,
+              dataStatus: "missing"
+            });
+          });
+        }
+      } catch {
+        // ignore watchlist failures for now
+      }
       set({ tickers });
     } catch {
       const res = await api.get("/list");
-      const items = (res.data || []) as [string, string, string, number, string][];
+      const items = (res.data || []) as [string, string, string, number | null, string][];
       const tickers = items.map(([code, name, stage, score, reason]) => ({
         code,
         name,
         stage,
-        score,
-        reason
+        score: Number.isFinite(score) ? score : null,
+        reason,
+        scoreStatus: Number.isFinite(score) ? "OK" : "INSUFFICIENT_DATA",
+        missingReasons: null,
+        scoreBreakdown: null
       }));
       set({ tickers });
     } finally {

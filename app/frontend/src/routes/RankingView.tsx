@@ -178,6 +178,8 @@ const RankChartCard = memo(function RankChartCard({
     () =>
       RANK_MA_SETTINGS.map((setting) => ({
         key: setting.key,
+        label: setting.label,
+        period: setting.period,
         color: setting.color,
         visible: setting.visible,
         lineWidth: setting.lineWidth,
@@ -191,7 +193,7 @@ const RankChartCard = memo(function RankChartCard({
     [candles]
   );
 
-  const scheduleHoverTime = useCallback((time: number | null) => {
+  const scheduleHoverTime = useCallback((time: number | null, _point?: { x: number; y: number } | null) => {
     hoverPendingRef.current = time;
     if (hoverRafRef.current !== null) return;
     hoverRafRef.current = window.requestAnimationFrame(() => {

@@ -22,6 +22,15 @@ type PositionOverlayProps = {
     value: number;
   }[];
   showMarkers?: boolean;
+  markerSuffix?: string;
+  maLines?: {
+    key: string;
+    label?: string;
+    period?: number;
+    color?: string;
+    data: { time: number; value: number }[];
+    visible: boolean;
+  }[];
 };
 
 const formatNumber = (value: number) => {
@@ -41,6 +50,11 @@ const formatPercent = (value: number) => {
   const rounded = Math.round(value * 100) / 100;
   const prefix = rounded > 0 ? "+" : "";
   return `${prefix}${rounded.toFixed(2)}%`;
+};
+
+const formatLots = (value: number) => {
+  if (!Number.isFinite(value)) return "0";
+  return Number.isInteger(value) ? `${value}` : value.toFixed(1);
 };
 
 const formatDate = (time: number) => {
@@ -67,6 +81,29 @@ const findClosestTime = (times: number[], time: number | null) => {
     }
   }
   return times[Math.max(0, Math.min(times.length - 1, right))] ?? null;
+};
+
+const findClosestValue = (data: { time: number; value: number }[], time: number | null) => {
+  if (!data.length || time == null) return null;
+  let left = 0;
+  let right = data.length - 1;
+  while (left <= right) {
+    const mid = Math.floor((left + right) / 2);
+    const midTime = data[mid].time;
+    if (midTime === time) return data[mid].value;
+    if (midTime < time) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
+    }
+  }
+  const lowerIndex = Math.max(0, Math.min(data.length - 1, right));
+  const upperIndex = Math.max(0, Math.min(data.length - 1, left));
+  const lower = data[lowerIndex];
+  const upper = data[upperIndex];
+  if (!lower) return upper?.value ?? null;
+  if (!upper) return lower.value;
+  return Math.abs(time - lower.time) <= Math.abs(upper.time - time) ? lower.value : upper.value;
 };
 
 const findClosestIndex = (bars: PositionOverlayProps["bars"], time: number | null) => {
@@ -102,8 +139,8 @@ const resolveBrokerMeta = (value: string | undefined) => {
 };
 
 const formatTrade = (trade: TradeEvent) => {
-  const action = trade.action === "open" ? "OPEN" : "CLOSE";
-  const side = trade.side.toUpperCase();
+  const action = trade.action === "open" ? "新規" : "決済";
+  const side = trade.side === "buy" ? "買い" : "売り";
   const units = Number.isFinite(trade.units) ? formatNumber(trade.units) : "0";
   const price = trade.price ? ` @ ${formatNumber(trade.price)}` : "";
   return `${side} ${action} ${units}${price}`;
@@ -135,7 +172,9 @@ export default function PositionOverlay({
   hoverTime,
   bars,
   volume,
-  showMarkers = true
+  showMarkers = true,
+  markerSuffix,
+  maLines = []
 }: PositionOverlayProps) {
   const [rangeTick, setRangeTick] = useState(0);
   const rangeRafRef = useRef<number | null>(null);
@@ -178,11 +217,6 @@ export default function PositionOverlay({
   };
 
   useEffect(() => {
-    if (!candleSeries) return;
-    candleSeries.setMarkers([]);
-  }, [candleSeries]);
-
-  useEffect(() => {
     if (!chart) return;
     const timeScale = chart.timeScale?.();
     const priceScale = (chart as any)?.priceScale?.("right");
@@ -219,9 +253,105 @@ export default function PositionOverlay({
     () => (showPositionInfo && activeBar ? findClosestTime(positionTimes, activeBar.time) : null),
     [positionTimes, activeBar?.time, showPositionInfo]
   );
+  const activeMaValues = useMemo(() => {
+    if (!maLines.length || !activeBar) return [];
+    return maLines
+      .filter((line) => line.visible)
+      .map((line) => {
+        const value = findClosestValue(line.data, activeBar.time);
+        const label = line.label ?? (line.period ? `MA${line.period}` : line.key.toUpperCase());
+        return {
+          key: line.key,
+          label,
+          value,
+          color: line.color
+        };
+      });
+  }, [maLines, activeBar]);
   const activePositions = useMemo(() => {
     if (activePositionTime == null) return [];
-    return positionsByTime.get(activePositionTime) ?? [];
+    const positions = positionsByTime.get(activePositionTime) ?? [];
+    if (!positions.length) return [];
+    const map = new Map<
+      string,
+      {
+        brokerKey: string;
+        brokerLabel: string;
+        time: number;
+        date: string;
+        close: number;
+        longLots: number;
+        shortLots: number;
+        longCost: number;
+        shortCost: number;
+        realizedPnL: number;
+        unrealizedPnL: number;
+        totalPnL: number;
+      }
+    >();
+    positions.forEach((pos) => {
+      const rawKey = pos.brokerKey ?? pos.brokerLabel ?? "unknown";
+      const normalizedKey = rawKey
+        .toString()
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+      const brokerKey = normalizedKey || "unknown";
+      const brokerLabel =
+        brokerKey === "rakuten"
+          ? "RAKUTEN"
+          : brokerKey === "sbi"
+          ? "SBI"
+          : pos.brokerLabel ?? "N/A";
+      const entry = map.get(brokerKey);
+      if (entry) {
+        entry.longLots += pos.longLots;
+        entry.shortLots += pos.shortLots;
+        entry.longCost += pos.avgLongPrice * pos.longLots;
+        entry.shortCost += pos.avgShortPrice * pos.shortLots;
+        entry.realizedPnL += pos.realizedPnL;
+        entry.unrealizedPnL += pos.unrealizedPnL;
+        entry.totalPnL += pos.totalPnL;
+      } else {
+        map.set(brokerKey, {
+          brokerKey,
+          brokerLabel,
+          time: pos.time,
+          date: pos.date,
+          close: pos.close,
+          longLots: pos.longLots,
+          shortLots: pos.shortLots,
+          longCost: pos.avgLongPrice * pos.longLots,
+          shortCost: pos.avgShortPrice * pos.shortLots,
+          realizedPnL: pos.realizedPnL,
+          unrealizedPnL: pos.unrealizedPnL,
+          totalPnL: pos.totalPnL
+        });
+      }
+    });
+    return Array.from(map.values())
+      .map((entry) => {
+        const avgLongPrice = entry.longLots > 0 ? entry.longCost / entry.longLots : 0;
+        const avgShortPrice = entry.shortLots > 0 ? entry.shortCost / entry.shortLots : 0;
+        const posText = `${formatLots(entry.shortLots)}-${formatLots(entry.longLots)}`;
+        return {
+          time: entry.time,
+          date: entry.date,
+          shortLots: entry.shortLots,
+          longLots: entry.longLots,
+          posText,
+          avgLongPrice,
+          avgShortPrice,
+          realizedPnL: entry.realizedPnL,
+          unrealizedPnL: entry.unrealizedPnL,
+          totalPnL: entry.totalPnL,
+          close: entry.close,
+          brokerKey: entry.brokerKey,
+          brokerLabel: entry.brokerLabel,
+          brokerGroupKey: entry.brokerKey
+        };
+      })
+      .sort((a, b) => compareBrokerKey(a.brokerKey, b.brokerKey));
   }, [positionsByTime, activePositionTime]);
   const activeTradeMarkers = useMemo(() => {
     if (!showOverlay || !showMarkers || activePositionTime == null) return [];
@@ -229,7 +359,7 @@ export default function PositionOverlay({
   }, [tradeMarkers, showOverlay, showMarkers, activePositionTime]);
 
   const labelEntries = useMemo(() => {
-    if (!showMarkers || !showOverlay || !chart || !candleSeries) return [];
+    if (!showMarkers || !chart || !candleSeries) return [];
     const timeScale = chart.timeScale?.();
     if (!timeScale || typeof timeScale.timeToCoordinate !== "function") return [];
     if (typeof candleSeries.priceToCoordinate !== "function") return [];
@@ -286,6 +416,7 @@ export default function PositionOverlay({
       byTime.set(entry.time, list);
     });
 
+    const suffix = markerSuffix ? ` ${markerSuffix}` : "";
     const output: { key: string; text: string; brokerKey: string; x: number; y: number }[] = [];
     const placed: { x: number; y: number }[] = [];
     byTime.forEach((list, time) => {
@@ -304,7 +435,7 @@ export default function PositionOverlay({
         placed.push({ x, y });
         output.push({
           key: `${time}-${entry.brokerKey}`,
-          text: entry.text,
+          text: `${entry.text}${suffix}`,
           brokerKey: entry.brokerKey,
           x,
           y
@@ -312,7 +443,7 @@ export default function PositionOverlay({
       });
     });
     return output;
-  }, [showMarkers, showOverlay, chart, candleSeries, bars, dailyPositions, rangeTick]);
+  }, [showMarkers, markerSuffix, chart, candleSeries, bars, dailyPositions, rangeTick]);
 
   if (!activeBar) return null;
 
@@ -346,7 +477,7 @@ export default function PositionOverlay({
         <div className="position-overlay-date">{formatDate(activeBar.time)}</div>
         {delta != null && percent != null && (
           <div className={`position-overlay-change ${deltaClass}`}>
-            Chg {formatSignedNumber(delta)} ({formatPercent(percent)})
+            前日比 {formatSignedNumber(delta)} ({formatPercent(percent)})
           </div>
         )}
         </div>
@@ -359,9 +490,23 @@ export default function PositionOverlay({
         <div className="position-overlay-value">{formatNumber(activeBar.low)}</div>
         <div className="position-overlay-label">C</div>
         <div className="position-overlay-value">{formatNumber(activeBar.close)}</div>
-        <div className="position-overlay-label">Vol</div>
+        <div className="position-overlay-label">出来高</div>
         <div className="position-overlay-value">{volumeText}</div>
         </div>
+        {activeMaValues.length > 0 && (
+          <div className="position-overlay-ma">
+            {activeMaValues.map((entry) => (
+              <div className="position-overlay-ma-row" key={`ma-${entry.key}`}>
+                <span className="position-overlay-label" style={{ color: entry.color ?? "#94a3b8" }}>
+                  {entry.label}
+                </span>
+                <span className="position-overlay-value">
+                  {entry.value == null ? "--" : formatNumber(entry.value)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         {showPositionInfo && activePositions.length > 0 && (
           <div className="position-overlay-block">
             {activePositions.map((position) => {
@@ -373,28 +518,28 @@ export default function PositionOverlay({
                   className={`position-overlay-broker broker-${brokerKey}`}
                 >
                   <div className="position-overlay-row">
-                    <span className="position-overlay-label">Position</span>
+                    <span className="position-overlay-label">建玉</span>
                     <span className="position-overlay-value">
                       <span className="broker-badge">{brokerLabel}</span>
-                      {position.posText} (Sell-Buy)
+                      {position.posText} (売-買)
                     </span>
                   </div>
                   {showPnL && (
                     <>
                       <div className="position-overlay-row">
-                        <span className="position-overlay-label">Unrealized</span>
+                        <span className="position-overlay-label">評価損益</span>
                         <span className="position-overlay-value">
                           {formatNumber(position.unrealizedPnL)}
                         </span>
                       </div>
                       <div className="position-overlay-row">
-                        <span className="position-overlay-label">Realized</span>
+                        <span className="position-overlay-label">実現損益</span>
                         <span className="position-overlay-value">
                           {formatNumber(position.realizedPnL)}
                         </span>
                       </div>
                       <div className="position-overlay-row total">
-                        <span className="position-overlay-label">Total</span>
+                        <span className="position-overlay-label">合計</span>
                         <span className="position-overlay-value">
                           {formatNumber(position.totalPnL)}
                         </span>

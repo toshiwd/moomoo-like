@@ -1,8 +1,12 @@
-﻿type StartupOverlayProps = {
+import type { ApiErrorInfo } from "../apiErrors";
+import { formatApiErrorText } from "../apiErrors";
+
+type StartupOverlayProps = {
   visible: boolean;
   subtitle: string;
   error: string | null;
   errorDetails?: string | null;
+  lastRequest?: ApiErrorInfo | null;
   attemptCount: number;
   elapsedMs: number;
   onRetry: () => void;
@@ -13,6 +17,7 @@ export default function StartupOverlay({
   subtitle,
   error,
   errorDetails,
+  lastRequest,
   attemptCount,
   elapsedMs,
   onRetry
@@ -22,18 +27,39 @@ export default function StartupOverlay({
   const progress = Math.min(0.9, elapsedMs / 60000);
   const progressPct = `${Math.round(progress * 100)}%`;
 
+  const handleCopy = () => {
+    const detailText = lastRequest ? formatApiErrorText(lastRequest) : errorDetails ?? error ?? "";
+    if (!detailText) return;
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(detailText).catch(() => undefined);
+      return;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = detailText;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand("copy");
+    } catch {
+      // noop
+    }
+    document.body.removeChild(textarea);
+  };
+
   return (
     <div className={`startup-overlay ${visible ? "is-visible" : "is-hidden"}`}>
       <div className="startup-card" role="status" aria-live="polite">
-        <div className="startup-title">データを読み込み中…</div>
+        <div className="startup-title">起動中</div>
         <div className="startup-subtitle">
-          {isError ? "起動に失敗しました" : subtitle}
+          {isError ? "起動エラー" : subtitle}
         </div>
         {!isError && (
           <div className="startup-progress">
             <div className="startup-progress-bar" style={{ width: progressPct }} />
             <div className="startup-progress-meta">
-              接続試行 {attemptCount} 回 / 経過 {elapsedSeconds}s
+              試行 {attemptCount} 回 / 経過 {elapsedSeconds}s
             </div>
           </div>
         )}
@@ -50,10 +76,29 @@ export default function StartupOverlay({
         {isError && (
           <div className="startup-error">
             <div className="startup-error-message">{error}</div>
-            <button type="button" className="startup-retry" onClick={onRetry}>
-              再試行
-            </button>
-            {errorDetails && (
+            <div className="startup-error-actions">
+              <button type="button" className="startup-retry" onClick={onRetry}>
+                再試行
+              </button>
+              <button type="button" className="startup-copy" onClick={handleCopy}>
+                詳細をコピー
+              </button>
+            </div>
+            {lastRequest && (
+              <div className="startup-error-grid">
+                <div className="startup-error-label">Endpoint</div>
+                <div className="startup-error-value">{lastRequest.url}</div>
+                <div className="startup-error-label">Method</div>
+                <div className="startup-error-value">{lastRequest.method}</div>
+                <div className="startup-error-label">Status</div>
+                <div className="startup-error-value">{lastRequest.status ?? "--"}</div>
+                <div className="startup-error-label">Request ID</div>
+                <div className="startup-error-value">{lastRequest.requestId ?? "--"}</div>
+                <div className="startup-error-label">Response</div>
+                <pre className="startup-error-response">{lastRequest.response ?? "--"}</pre>
+              </div>
+            )}
+            {errorDetails && !lastRequest && (
               <details className="startup-details">
                 <summary>詳細</summary>
                 <pre>{errorDetails}</pre>

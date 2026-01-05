@@ -1,6 +1,7 @@
 ﻿import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "./api";
+import { useStore } from "./store";
 import StartupOverlay from "./components/StartupOverlay";
 
 type BackendReadyState = {
@@ -168,6 +169,7 @@ const useBackendReadyInternal = (): BackendReadyState => {
 
 export function BackendReadyProvider({ children }: { children: ReactNode }) {
   const state = useBackendReadyInternal();
+  const lastApiError = useStore((store) => store.lastApiError);
   const [renderOverlay, setRenderOverlay] = useState(true);
   const [overlayVisible, setOverlayVisible] = useState(true);
 
@@ -191,6 +193,7 @@ export function BackendReadyProvider({ children }: { children: ReactNode }) {
           subtitle={state.message}
           error={state.error}
           errorDetails={state.errorDetails}
+          lastRequest={lastApiError}
           attemptCount={state.attemptCount}
           elapsedMs={state.elapsedMs}
           onRetry={state.retry}

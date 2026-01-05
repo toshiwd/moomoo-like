@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
-import { createChart } from "lightweight-charts";
+import { CrosshairMode, createChart } from "lightweight-charts";
 import type { Box } from "../store";
 import type { DailyPosition, TradeMarker } from "../utils/positions";
 import { getBodyRangeFromCandles, getBoxFill, getBoxStroke } from "../utils/boxes";
@@ -20,6 +20,8 @@ type VolumePoint = {
 
 type MaLine = {
   key: string;
+  label?: string;
+  period?: number;
   color: string;
   data: { time: number; value: number }[];
   visible: boolean;
@@ -29,7 +31,7 @@ type MaLine = {
 export type DetailChartHandle = {
   setVisibleRange: (range: { from: number; to: number } | null) => void;
   fitContent: () => void;
-  setCrosshair: (time: number | null) => void;
+  setCrosshair: (time: number | null, point?: { x: number; y: number } | null) => void;
   clearCrosshair: () => void;
 };
 
@@ -48,8 +50,12 @@ type DetailChartProps = {
     showPnL: boolean;
     hoverTime: number | null;
     showMarkers?: boolean;
+    markerSuffix?: string;
+    maLines?: MaLine[];
   };
-  onCrosshairMove?: (time: number | null) => void;
+  cursorTime?: number | null;
+  partialTimes?: number[];
+  onCrosshairMove?: (time: number | null, point?: { x: number; y: number } | null) => void;
   onVisibleRangeChange?: (range: { from: number; to: number } | null) => void;
 };
 
@@ -63,6 +69,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     showBoxes,
     visibleRange,
     positionOverlay,
+    cursorTime,
+    partialTimes,
     onCrosshairMove,
     onVisibleRangeChange
   },
@@ -79,11 +87,13 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     candleSeries: any;
     chart: ReturnType<typeof createChart> | null;
   }>({ candleSeries: null, chart: null });
-  const dataRef = useRef({ candles, volume, maLines, showVolume, boxes, showBoxes });
+  const dataRef = useRef({ candles, volume, maLines, showVolume, boxes, showBoxes, cursorTime });
   const visibleRangeRef = useRef<DetailChartProps["visibleRange"]>(visibleRange);
   const candlesRef = useRef<Candle[]>(candles);
   const boxesRef = useRef<Box[]>(boxes);
   const showBoxesRef = useRef(showBoxes);
+  const cursorTimeRef = useRef<number | null>(cursorTime ?? null);
+  const partialTimesRef = useRef<number[]>(partialTimes ?? []);
   const suppressCrosshairRef = useRef(false);
   const onCrosshairMoveRef = useRef<DetailChartProps["onCrosshairMove"]>(onCrosshairMove);
   const onVisibleRangeChangeRef = useRef<DetailChartProps["onVisibleRangeChange"]>(
@@ -92,6 +102,9 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
 
   const BOX_FILL = getBoxFill();
   const BOX_STROKE = getBoxStroke();
+  const CURSOR_STROKE = "rgba(148, 163, 184, 0.7)";
+  const PARTIAL_STROKE = "rgba(245, 158, 11, 0.7)";
+  const PARTIAL_LABEL = "Partial";
 
   const normalizeRangeTime = (value: unknown) => {
     if (typeof value === "number") return value;
@@ -126,7 +139,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     return Math.abs(time - lower.time) <= Math.abs(upper.time - time) ? lower : upper;
   };
 
-  const drawBoxes = () => {
+  const drawOverlay = () => {
     const canvas = overlayRef.current;
     const chart = chartRef.current;
     if (!canvas || !chart) return;
@@ -137,37 +150,83 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     const height = canvas.clientHeight;
     ctx.clearRect(0, 0, width, height);
 
-    if (!showBoxesRef.current) return;
-    const boxesToDraw = boxesRef.current;
-    if (!boxesToDraw.length) return;
+    if (showBoxesRef.current) {
+      const boxesToDraw = boxesRef.current;
+      if (boxesToDraw.length) {
+        const timeScale = chart.timeScale();
+        const series = candleSeriesRef.current;
+        if (
+          typeof timeScale.timeToCoordinate === "function" &&
+          typeof series?.priceToCoordinate === "function"
+        ) {
+          ctx.fillStyle = BOX_FILL;
+          ctx.strokeStyle = BOX_STROKE;
+          ctx.lineWidth = 1;
 
-    const timeScale = chart.timeScale();
-    const series = candleSeriesRef.current;
-    if (!series) return;
-    if (typeof timeScale.timeToCoordinate !== "function") return;
-    if (typeof series.priceToCoordinate !== "function") return;
+          boxesToDraw.forEach((box) => {
+            const x1 = timeScale.timeToCoordinate(box.startTime as any);
+            const x2 = timeScale.timeToCoordinate(box.endTime as any);
+            const bodyRange = getBodyRangeFromCandles(candlesRef.current, box.startTime, box.endTime);
+            const upper = bodyRange?.upper ?? box.upper;
+            const lower = bodyRange?.lower ?? box.lower;
+            if (!Number.isFinite(upper) || !Number.isFinite(lower)) return;
+            const y1 = series.priceToCoordinate(upper);
+            const y2 = series.priceToCoordinate(lower);
+            if (x1 == null || x2 == null || y1 == null || y2 == null) return;
+            const rectX = Math.min(x1, x2);
+            const rectY = Math.min(y1, y2);
+            const rectW = Math.max(1, Math.abs(x2 - x1));
+            const rectH = Math.max(1, Math.abs(y2 - y1));
+            ctx.fillRect(rectX, rectY, rectW, rectH);
+            ctx.strokeRect(rectX, rectY, rectW, rectH);
+          });
+        }
+      }
+    }
 
-    ctx.fillStyle = BOX_FILL;
-    ctx.strokeStyle = BOX_STROKE;
-    ctx.lineWidth = 1;
+    const cursorValue = cursorTimeRef.current;
+    if (cursorValue != null) {
+      const timeScale = chart.timeScale();
+      const x = typeof timeScale.timeToCoordinate === "function"
+        ? timeScale.timeToCoordinate(cursorValue as any)
+        : null;
+      if (x != null) {
+        ctx.strokeStyle = CURSOR_STROKE;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+    }
 
-    boxesToDraw.forEach((box) => {
-      const x1 = timeScale.timeToCoordinate(box.startTime as any);
-      const x2 = timeScale.timeToCoordinate(box.endTime as any);
-      const bodyRange = getBodyRangeFromCandles(candlesRef.current, box.startTime, box.endTime);
-      const upper = bodyRange?.upper ?? box.upper;
-      const lower = bodyRange?.lower ?? box.lower;
-      if (!Number.isFinite(upper) || !Number.isFinite(lower)) return;
-      const y1 = series.priceToCoordinate(upper);
-      const y2 = series.priceToCoordinate(lower);
-      if (x1 == null || x2 == null || y1 == null || y2 == null) return;
-      const rectX = Math.min(x1, x2);
-      const rectY = Math.min(y1, y2);
-      const rectW = Math.max(1, Math.abs(x2 - x1));
-      const rectH = Math.max(1, Math.abs(y2 - y1));
-      ctx.fillRect(rectX, rectY, rectW, rectH);
-      ctx.strokeRect(rectX, rectY, rectW, rectH);
-    });
+    const partialTimes = partialTimesRef.current;
+    if (partialTimes.length) {
+      const timeScale = chart.timeScale();
+      if (typeof timeScale.timeToCoordinate === "function") {
+        ctx.save();
+        ctx.strokeStyle = PARTIAL_STROKE;
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1;
+        ctx.font = "11px sans-serif";
+        partialTimes.forEach((time) => {
+          const x = timeScale.timeToCoordinate(time as any);
+          if (x == null) return;
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, height);
+          ctx.stroke();
+          const labelWidth = ctx.measureText(PARTIAL_LABEL).width;
+          const labelX = Math.max(4, x - labelWidth / 2 - 4);
+          const labelY = 6;
+          ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
+          ctx.fillRect(labelX, labelY, labelWidth + 8, 14);
+          ctx.fillStyle = PARTIAL_STROKE;
+          ctx.fillText(PARTIAL_LABEL, labelX + 4, labelY + 11);
+        });
+        ctx.restore();
+      }
+    }
   };
 
   const resizeOverlay = () => {
@@ -185,7 +244,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     if (ctx) {
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     }
-    drawBoxes();
+    drawOverlay();
   };
 
   const syncLineSeries = (nextLines: MaLine[]) => {
@@ -205,7 +264,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           chart.addLineSeries({
             color: line.color,
             lineWidth: line.lineWidth,
-            priceLineVisible: false
+            priceLineVisible: false,
+            crosshairMarkerVisible: false
           })
         );
       }
@@ -235,13 +295,18 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     next.maLines.forEach((line, index) => {
       const series = lineSeriesRef.current[index];
       if (!series) return;
-      series.applyOptions({ color: line.color, visible: line.visible, lineWidth: line.lineWidth });
+      series.applyOptions({
+        color: line.color,
+        visible: line.visible,
+        lineWidth: line.lineWidth,
+        crosshairMarkerVisible: false
+      });
       series.setData(line.data);
     });
     if (chart && next.candles.length && !visibleRangeRef.current) {
       chart.timeScale().fitContent();
     }
-    drawBoxes();
+    drawOverlay();
   };
 
   useImperativeHandle(ref, () => ({
@@ -257,7 +322,7 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     fitContent: () => {
       chartRef.current?.timeScale().fitContent();
     },
-    setCrosshair: (time) => {
+    setCrosshair: (time, point) => {
       const chart = chartRef.current as any;
       const series = candleSeriesRef.current;
       if (!chart || !series) return;
@@ -279,8 +344,23 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
       }
       const setCrosshairPosition = chart.setCrosshairPosition;
       if (typeof setCrosshairPosition === "function") {
+        let price = nearest.close;
+        if (point && Number.isFinite(point.y)) {
+          const priceScale = chart.priceScale?.("right");
+          const height = wrapperRef.current?.clientHeight ?? null;
+          let y = point.y;
+          if (height != null) {
+            y = Math.max(0, Math.min(height, y));
+          }
+          if (priceScale && typeof priceScale.coordinateToPrice === "function") {
+            const mapped = priceScale.coordinateToPrice(y);
+            if (mapped != null && Number.isFinite(mapped)) {
+              price = mapped;
+            }
+          }
+        }
         suppressCrosshairRef.current = true;
-        setCrosshairPosition.call(chart, nearest.close, nearest.time, series);
+        setCrosshairPosition.call(chart, price, nearest.time, series);
       }
     },
     clearCrosshair: () => {
@@ -294,12 +374,14 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
   }));
 
   useEffect(() => {
-    dataRef.current = { candles, volume, maLines, showVolume, boxes, showBoxes };
+    dataRef.current = { candles, volume, maLines, showVolume, boxes, showBoxes, cursorTime };
     candlesRef.current = candles;
     boxesRef.current = boxes;
     showBoxesRef.current = showBoxes;
+    cursorTimeRef.current = cursorTime ?? null;
+    partialTimesRef.current = partialTimes ?? [];
     applyData(dataRef.current);
-  }, [candles, volume, maLines, showVolume, boxes, showBoxes]);
+  }, [candles, volume, maLines, showVolume, boxes, showBoxes, cursorTime, partialTimes]);
 
   useEffect(() => {
     visibleRangeRef.current = visibleRange ?? null;
@@ -349,6 +431,9 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           vertLines: { color: "rgba(255,255,255,0.06)" },
           horzLines: { color: "rgba(255,255,255,0.06)" }
         },
+        crosshair: {
+          mode: CrosshairMode.Normal
+        },
         rightPriceScale: {
           visible: true,
           borderVisible: false,
@@ -382,7 +467,8 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
         chart.addLineSeries({
           color: line.color,
           lineWidth: line.lineWidth,
-          priceLineVisible: false
+          priceLineVisible: false,
+          crosshairMarkerVisible: false
         })
       );
 
@@ -392,30 +478,45 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           return;
         }
         if (!onCrosshairMoveRef.current) return;
+        const point =
+          param && param.point && Number.isFinite(param.point.x) && Number.isFinite(param.point.y)
+            ? { x: param.point.x, y: param.point.y }
+            : null;
         if (!param || !param.time) {
-          onCrosshairMoveRef.current(null);
+          onCrosshairMoveRef.current(null, point);
           return;
         }
+        if (point && chartRef.current && candleSeriesRef.current) {
+          const priceScale = chartRef.current.priceScale?.("right");
+          const setCrosshairPosition = (chartRef.current as any).setCrosshairPosition;
+          if (priceScale && typeof priceScale.coordinateToPrice === "function") {
+            const price = priceScale.coordinateToPrice(point.y);
+            if (price != null && Number.isFinite(price) && typeof setCrosshairPosition === "function") {
+              suppressCrosshairRef.current = true;
+              setCrosshairPosition.call(chartRef.current, price, param.time, candleSeriesRef.current);
+            }
+          }
+        }
         if (typeof param.time === "number") {
-          onCrosshairMoveRef.current(param.time);
+          onCrosshairMoveRef.current(param.time, point);
           return;
         }
         if (typeof param.time === "object" && param.time !== null) {
           const { year, month, day } = param.time as { year?: number; month?: number; day?: number };
           if (year && month && day) {
             const timestamp = Math.floor(Date.UTC(year, month - 1, day) / 1000);
-            onCrosshairMoveRef.current(timestamp);
+            onCrosshairMoveRef.current(timestamp, point);
             return;
           }
         }
-        onCrosshairMoveRef.current(null);
+        onCrosshairMoveRef.current(null, point);
       };
 
       chart.subscribeCrosshairMove(crosshairHandler);
       const timeScale = chart.timeScale() as any;
       const priceScale = chart.priceScale("right") as any;
       const rangeHandler = () => {
-        drawBoxes();
+        drawOverlay();
         const handler = onVisibleRangeChangeRef.current;
         if (!handler || typeof timeScale.getVisibleRange !== "function") return;
         const range = timeScale.getVisibleRange();
@@ -514,8 +615,10 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           showPnL={positionOverlay.showPnL}
           hoverTime={positionOverlay.hoverTime}
           showMarkers={positionOverlay.showMarkers}
+          markerSuffix={positionOverlay.markerSuffix}
           bars={candles}
           volume={volume}
+          maLines={positionOverlay.maLines ?? maLines}
         />
       )}
     </div>

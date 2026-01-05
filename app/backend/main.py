@@ -1,4 +1,5 @@
 ﻿from datetime import datetime, timedelta
+import calendar
 import csv
 import glob
 import json
@@ -10,8 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import uuid
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -22,6 +25,9 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_PAN_VBS_PATH = os.path.join(REPO_ROOT, "tools", "export_pan.vbs")
 DEFAULT_PAN_CODE_PATH = os.path.join(REPO_ROOT, "tools", "code.txt")
 DEFAULT_PAN_OUT_DIR = os.path.join(REPO_ROOT, "data", "txt")
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+APP_ENV = os.getenv("APP_ENV") or os.getenv("ENV") or "dev"
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 
 def resolve_data_dir() -> str:
@@ -61,6 +67,9 @@ DEFAULT_DB_PATH = os.getenv("STOCKS_DB_PATH", os.path.join(os.path.dirname(__fil
 RANK_CONFIG_PATH = os.getenv("RANK_CONFIG_PATH", os.path.join(os.path.dirname(__file__), "rank_config.json"))
 FAVORITES_DB_PATH = os.getenv(
     "FAVORITES_DB_PATH", os.path.join(os.path.dirname(__file__), "favorites.sqlite")
+)
+PRACTICE_DB_PATH = os.getenv(
+    "PRACTICE_DB_PATH", os.path.join(os.path.dirname(__file__), "practice.sqlite")
 )
 PAN_EXPORT_VBS_PATH = os.path.abspath(
     os.getenv("PAN_EXPORT_VBS_PATH") or os.getenv("UPDATE_VBS_PATH") or DEFAULT_PAN_VBS_PATH
@@ -154,6 +163,48 @@ def _init_favorites_schema() -> None:
         )
 
 
+def _get_practice_conn():
+    conn = sqlite3.connect(PRACTICE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_practice_schema() -> None:
+    with _get_practice_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS practice_sessions (
+                session_id TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                start_date TEXT,
+                end_date TEXT,
+                cursor_time INTEGER,
+                max_unlocked_time INTEGER,
+                lot_size INTEGER,
+                range_months INTEGER,
+                trades TEXT,
+                notes TEXT,
+                ui_state TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        _ensure_practice_column(conn, "practice_sessions", "end_date", "TEXT")
+        _ensure_practice_column(conn, "practice_sessions", "cursor_time", "INTEGER")
+        _ensure_practice_column(conn, "practice_sessions", "max_unlocked_time", "INTEGER")
+        _ensure_practice_column(conn, "practice_sessions", "lot_size", "INTEGER")
+        _ensure_practice_column(conn, "practice_sessions", "range_months", "INTEGER")
+        _ensure_practice_column(conn, "practice_sessions", "ui_state", "TEXT")
+
+
+def _ensure_practice_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    existing = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(row[1] == column for row in existing):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 def _normalize_code(value: str | None) -> str:
     if value is None:
         return ""
@@ -164,6 +215,39 @@ def _normalize_code(value: str | None) -> str:
     if match:
         return match.group(0)
     return text.upper()
+
+
+def _classify_exception(exc: Exception) -> tuple[int, str, str]:
+    detail = str(exc)
+    lower = detail.lower()
+    db_missing = not os.path.isfile(DEFAULT_DB_PATH)
+    if "io error" in lower or "failed to open" in lower or "cannot open" in lower:
+        return 503, "DB_OPEN_FAILED", "Database open failed"
+    if db_missing:
+        return 503, "DATA_NOT_INITIALIZED", "Data not initialized"
+    if (
+        "no such table" in lower
+        or "does not exist" in lower
+        or "catalog error" in lower
+        or "table with name" in lower
+    ):
+        return 503, "DATA_NOT_INITIALIZED", "Data not initialized"
+    if isinstance(exc, sqlite3.Error):
+        return 500, "SQLITE_ERROR", "Database error"
+    return 500, "UNHANDLED_EXCEPTION", "Internal server error"
+
+
+def _build_error_payload(exc: Exception, trace_id: str) -> dict:
+    status_code, error_code, message = _classify_exception(exc)
+    payload = {
+        "trace_id": trace_id,
+        "error_code": error_code,
+        "message": message,
+        "detail": str(exc)
+    }
+    if DEBUG:
+        payload["stack"] = traceback.format_exc()
+    return payload
 
 
 def _load_favorite_codes() -> list[str]:
@@ -341,10 +425,33 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    trace_id = str(uuid.uuid4())
+    payload = {
+        "trace_id": trace_id,
+        "error_code": "HTTP_ERROR",
+        "message": "Request failed",
+        "detail": str(exc.detail)
+    }
+    if DEBUG:
+        payload["stack"] = traceback.format_exc()
+    return JSONResponse(status_code=exc.status_code, content=payload, headers={"X-Request-Id": trace_id})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    trace_id = str(uuid.uuid4())
+    status_code, _, _ = _classify_exception(exc)
+    payload = _build_error_payload(exc, trace_id)
+    return JSONResponse(status_code=status_code, content=payload, headers={"X-Request-Id": trace_id})
+
+
 @app.on_event("startup")
 def on_startup():
     init_schema()
     _init_favorites_schema()
+    _init_practice_schema()
 
 
 def _parse_trade_csv() -> dict:
@@ -1117,6 +1224,60 @@ def _parse_daily_date(value: int | str | None) -> datetime | None:
         return datetime(year, month, day)
     except (ValueError, TypeError):
         return None
+
+
+def _parse_practice_date(value: int | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return None
+        if numeric >= 10_000_000_000_000:
+            return datetime.utcfromtimestamp(numeric / 1000)
+        if numeric >= 10_000_000_000:
+            return datetime.utcfromtimestamp(numeric)
+        if numeric >= 10_000_000:
+            return _parse_daily_date(numeric)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return _parse_practice_date(int(text))
+        match = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$", text)
+        if match:
+            try:
+                year = int(match.group(1))
+                month = int(match.group(2))
+                day = int(match.group(3))
+                return datetime(year, month, day)
+            except ValueError:
+                return None
+    return None
+
+
+def _format_practice_date(value: int | str | None) -> str | None:
+    parsed = _parse_practice_date(value)
+    if not parsed:
+        return None
+    return f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+
+
+def _resolve_practice_start_date(session_id: str | None, start_date: int | str | None) -> datetime | None:
+    if session_id:
+        with _get_practice_conn() as conn:
+            row = conn.execute(
+                "SELECT start_date FROM practice_sessions WHERE session_id = ?",
+                [session_id]
+            ).fetchone()
+        if row and row["start_date"]:
+            parsed = _parse_practice_date(row["start_date"])
+            if parsed:
+                return parsed
+    return _parse_practice_date(start_date)
 
 
 def _parse_month_value(value: int | str | None) -> datetime | None:
@@ -3189,35 +3350,53 @@ def watchlist_undo_remove(payload: dict = Body(default=None)):
     return {"ok": True, "code": code, "restored": restored}
 
 
+def _list_tables(conn) -> set[str]:
+    rows = conn.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'main'
+        """
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _collect_db_stats() -> dict:
+    stats = {
+        "tickers": None,
+        "daily_rows": None,
+        "monthly_rows": None,
+        "missing_tables": [],
+        "errors": []
+    }
+    required_tables = ["tickers", "daily_bars", "monthly_bars", "daily_ma", "monthly_ma"]
+    try:
+        with get_conn() as conn:
+            tables = _list_tables(conn)
+            stats["missing_tables"] = [name for name in required_tables if name not in tables]
+            if "tickers" in tables:
+                stats["tickers"] = conn.execute("SELECT COUNT(*) FROM tickers").fetchone()[0]
+            if "daily_bars" in tables:
+                stats["daily_rows"] = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+            if "monthly_bars" in tables:
+                stats["monthly_rows"] = conn.execute("SELECT COUNT(*) FROM monthly_bars").fetchone()[0]
+    except Exception as exc:
+        stats["errors"].append(str(exc))
+    return stats
+
+
 @app.get("/api/health")
 def health():
-    try:
-        status = get_txt_status()
-        with get_conn() as conn:
-            code_count = conn.execute("SELECT COUNT(DISTINCT code) FROM daily_bars").fetchone()[0]
-            daily_rows = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
-            monthly_rows = conn.execute("SELECT COUNT(*) FROM monthly_bars").fetchone()[0]
-        ready = True
-        phase = "ready"
-        message = "準備完了"
-        return {
-            "ok": True,
-            "status": "ok",
-            "ready": ready,
-            "phase": phase,
-            "message": message,
-            "stats": {
-                "tickers": code_count,
-                "daily_rows": daily_rows,
-                "monthly_rows": monthly_rows
-            },
-            "txt_count": status["txt_count"],
-            "code_count": code_count,
-            "last_updated": status["last_updated"],
-            "code_txt_missing": status["code_txt_missing"],
-            "errors": []
-        }
-    except Exception as exc:
+    now = datetime.utcnow().isoformat()
+    status = get_txt_status()
+    stats = _collect_db_stats()
+    is_data_ready = (
+        not stats["missing_tables"]
+        and stats["errors"] == []
+        and (stats["daily_rows"] or 0) > 0
+        and (stats["monthly_rows"] or 0) > 0
+    )
+    if not is_data_ready:
         return JSONResponse(
             status_code=503,
             content={
@@ -3226,10 +3405,58 @@ def health():
                 "ready": False,
                 "phase": "starting",
                 "message": "起動中",
+                "error_code": "DATA_NOT_INITIALIZED",
+                "version": APP_VERSION,
+                "env": APP_ENV,
+                "time": now,
                 "retryAfterMs": 1000,
-                "errors": [str(exc)]
+                "stats": stats,
+                "txt_count": status.get("txt_count"),
+                "last_updated": status.get("last_updated"),
+                "code_txt_missing": status.get("code_txt_missing"),
+                "errors": stats["errors"] + [f"missing_tables:{','.join(stats['missing_tables'])}"]
+                if stats["missing_tables"]
+                else stats["errors"]
             }
         )
+    return {
+        "ok": True,
+        "status": "ok",
+        "ready": True,
+        "phase": "ready",
+        "message": "準備完了",
+        "version": APP_VERSION,
+        "env": APP_ENV,
+        "time": now,
+        "stats": {
+            "tickers": stats["tickers"],
+            "daily_rows": stats["daily_rows"],
+            "monthly_rows": stats["monthly_rows"]
+        },
+        "txt_count": status.get("txt_count"),
+        "code_count": stats["tickers"],
+        "last_updated": status.get("last_updated"),
+        "code_txt_missing": status.get("code_txt_missing"),
+        "errors": []
+    }
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    now = datetime.utcnow().isoformat()
+    db_path = os.path.abspath(DEFAULT_DB_PATH)
+    stats = _collect_db_stats()
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "env": APP_ENV,
+        "time": now,
+        "data_dir": DATA_DIR,
+        "pan_out_txt_dir": PAN_OUT_TXT_DIR,
+        "db_path": db_path,
+        "db_exists": os.path.isfile(db_path),
+        "stats": stats
+    }
 
 
 @app.get("/api/trades/{code}")
@@ -3589,6 +3816,383 @@ def daily(code: str, limit: int = 400):
         except Exception as fallback_exc:
             errors.append(f"daily_query_fallback_failed:{fallback_exc}")
             return JSONResponse(content={"data": [], "errors": errors})
+
+
+@app.get("/api/practice/session")
+def practice_session(session_id: str | None = None):
+    if not session_id:
+        return JSONResponse(content={"error": "session_id_required"}, status_code=400)
+    with _get_practice_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                session_id,
+                code,
+                start_date,
+                end_date,
+                cursor_time,
+                max_unlocked_time,
+                lot_size,
+                range_months,
+                trades,
+                notes,
+                ui_state
+            FROM practice_sessions
+            WHERE session_id = ?
+            """,
+            [session_id]
+        ).fetchone()
+    if not row:
+        return JSONResponse(content={"session": None})
+    trades_raw = row["trades"] or "[]"
+    try:
+        trades = json.loads(trades_raw)
+        if not isinstance(trades, list):
+            trades = []
+    except (TypeError, ValueError):
+        trades = []
+    ui_state_raw = row["ui_state"] or "{}"
+    try:
+        ui_state = json.loads(ui_state_raw)
+        if not isinstance(ui_state, dict):
+            ui_state = {}
+    except (TypeError, ValueError):
+        ui_state = {}
+    return JSONResponse(
+        content={
+            "session": {
+                "session_id": row["session_id"],
+                "code": row["code"],
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+                "cursor_time": row["cursor_time"],
+                "max_unlocked_time": row["max_unlocked_time"],
+                "lot_size": row["lot_size"],
+                "range_months": row["range_months"],
+                "trades": trades,
+                "notes": row["notes"] or "",
+                "ui_state": ui_state
+            }
+        }
+    )
+
+
+@app.post("/api/practice/session")
+def practice_session_upsert(payload: dict = Body(...)):
+    session_id = payload.get("session_id")
+    code = payload.get("code")
+    if not session_id or not code:
+        return JSONResponse(content={"error": "session_id_code_required"}, status_code=400)
+    start_date = _format_practice_date(payload.get("start_date"))
+    end_date = _format_practice_date(payload.get("end_date"))
+    cursor_time = payload.get("cursor_time")
+    max_unlocked_time = payload.get("max_unlocked_time")
+    lot_size = payload.get("lot_size")
+    range_months = payload.get("range_months")
+    trades = payload.get("trades")
+    if not isinstance(trades, list):
+        trades = []
+    notes = payload.get("notes")
+    if notes is not None:
+        notes = str(notes)
+    ui_state = payload.get("ui_state")
+    if ui_state is None:
+        ui_state = {}
+    if not isinstance(ui_state, dict):
+        ui_state = {}
+    trades_json = json.dumps(trades, ensure_ascii=True)
+    ui_state_json = json.dumps(ui_state, ensure_ascii=True)
+    with _get_practice_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO practice_sessions (
+                session_id,
+                code,
+                start_date,
+                end_date,
+                cursor_time,
+                max_unlocked_time,
+                lot_size,
+                range_months,
+                trades,
+                notes,
+                ui_state,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id) DO UPDATE SET
+                code = excluded.code,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                cursor_time = excluded.cursor_time,
+                max_unlocked_time = excluded.max_unlocked_time,
+                lot_size = excluded.lot_size,
+                range_months = excluded.range_months,
+                trades = excluded.trades,
+                notes = excluded.notes,
+                ui_state = excluded.ui_state,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [
+                session_id,
+                code,
+                start_date,
+                end_date,
+                cursor_time,
+                max_unlocked_time,
+                lot_size,
+                range_months,
+                trades_json,
+                notes,
+                ui_state_json
+            ]
+        )
+    return JSONResponse(
+        content={
+            "session_id": session_id,
+            "code": code,
+            "start_date": start_date
+        }
+    )
+
+
+@app.delete("/api/practice/session")
+def practice_session_delete(session_id: str | None = None):
+    if not session_id:
+        return JSONResponse(content={"error": "session_id_required"}, status_code=400)
+    with _get_practice_conn() as conn:
+        conn.execute(
+            "DELETE FROM practice_sessions WHERE session_id = ?",
+            [session_id]
+        )
+    return JSONResponse(content={"deleted": True})
+
+
+@app.get("/api/practice/sessions")
+def practice_sessions(code: str | None = None):
+    query = """
+        SELECT
+            session_id,
+            code,
+            start_date,
+            end_date,
+            cursor_time,
+            max_unlocked_time,
+            lot_size,
+            range_months,
+            trades,
+            notes,
+            ui_state,
+            created_at,
+            updated_at
+        FROM practice_sessions
+        {where_clause}
+        ORDER BY datetime(updated_at) DESC
+    """
+    params: list = []
+    where_clause = ""
+    if code:
+        where_clause = "WHERE code = ?"
+        params.append(code)
+    with _get_practice_conn() as conn:
+        rows = conn.execute(query.format(where_clause=where_clause), params).fetchall()
+    sessions: list[dict] = []
+    for row in rows:
+        trades_raw = row["trades"] or "[]"
+        try:
+            trades = json.loads(trades_raw)
+            if not isinstance(trades, list):
+                trades = []
+        except (TypeError, ValueError):
+            trades = []
+        ui_state_raw = row["ui_state"] or "{}"
+        try:
+            ui_state = json.loads(ui_state_raw)
+            if not isinstance(ui_state, dict):
+                ui_state = {}
+        except (TypeError, ValueError):
+            ui_state = {}
+        sessions.append(
+            {
+                "session_id": row["session_id"],
+                "code": row["code"],
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+                "cursor_time": row["cursor_time"],
+                "max_unlocked_time": row["max_unlocked_time"],
+                "lot_size": row["lot_size"],
+                "range_months": row["range_months"],
+                "trades": trades,
+                "notes": row["notes"] or "",
+                "ui_state": ui_state,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"]
+            }
+        )
+    return JSONResponse(content={"sessions": sessions})
+
+
+@app.get("/api/practice/daily")
+def practice_daily(code: str, limit: int = 400, session_id: str | None = None, start_date: str | None = None):
+    query_with_ma = """
+        WITH base AS (
+            SELECT
+                b.date,
+                b.o,
+                b.h,
+                b.l,
+                b.c,
+                b.v,
+                m.ma7,
+                m.ma20,
+                m.ma60
+            FROM daily_bars b
+            LEFT JOIN daily_ma m
+              ON b.code = m.code AND b.date = m.date
+            WHERE b.code = ?
+            {date_filter}
+            ORDER BY b.date
+        ),
+        tail AS (
+            SELECT *
+            FROM base
+            ORDER BY date DESC
+            LIMIT ?
+        )
+        SELECT date, o, h, l, c, v, ma7, ma20, ma60
+        FROM tail
+        ORDER BY date
+    """
+    query_basic = """
+        WITH base AS (
+            SELECT
+                b.date,
+                b.o,
+                b.h,
+                b.l,
+                b.c,
+                b.v
+            FROM daily_bars b
+            WHERE b.code = ?
+            {date_filter}
+            ORDER BY b.date
+        ),
+        tail AS (
+            SELECT *
+            FROM base
+            ORDER BY date DESC
+            LIMIT ?
+        )
+        SELECT date, o, h, l, c, v
+        FROM tail
+        ORDER BY date
+    """
+    errors: list[str] = []
+    parsed_start = _parse_practice_date(start_date) if start_date is not None else None
+    resolved = _resolve_practice_start_date(session_id, start_date)
+    if start_date is not None and parsed_start is None and resolved is None:
+        errors.append("practice_start_date_invalid")
+    date_filter = ""
+    params: list = [code]
+    date_value = None
+    try:
+        with get_conn() as conn:
+            if resolved:
+                max_date = conn.execute(
+                    "SELECT MAX(date) FROM daily_bars WHERE code = ?",
+                    [code]
+                ).fetchone()[0]
+                use_epoch = max_date is not None and max_date >= 1_000_000_000
+                if use_epoch:
+                    date_value = int(calendar.timegm(resolved.timetuple()))
+                else:
+                    date_value = resolved.year * 10000 + resolved.month * 100 + resolved.day
+                date_filter = "AND b.date <= ?"
+                params.append(date_value)
+            params.append(limit)
+            rows = conn.execute(query_with_ma.format(date_filter=date_filter), params).fetchall()
+        return JSONResponse(content={"data": rows, "errors": errors})
+    except Exception as exc:
+        errors.append(f"daily_query_failed:{exc}")
+        try:
+            with get_conn() as conn:
+                fallback_params: list = [code]
+                if resolved:
+                    if date_value is None:
+                        max_date = conn.execute(
+                            "SELECT MAX(date) FROM daily_bars WHERE code = ?",
+                            [code]
+                        ).fetchone()[0]
+                        use_epoch = max_date is not None and max_date >= 1_000_000_000
+                        if use_epoch:
+                            date_value = int(calendar.timegm(resolved.timetuple()))
+                        else:
+                            date_value = resolved.year * 10000 + resolved.month * 100 + resolved.day
+                        date_filter = "AND b.date <= ?"
+                    fallback_params.append(date_value)
+                fallback_params.append(limit)
+                rows = conn.execute(query_basic.format(date_filter=date_filter), fallback_params).fetchall()
+            return JSONResponse(content={"data": rows, "errors": errors})
+        except Exception as fallback_exc:
+            errors.append(f"daily_query_fallback_failed:{fallback_exc}")
+            return JSONResponse(content={"data": [], "errors": errors})
+
+
+@app.get("/api/practice/monthly")
+def practice_monthly(
+    code: str,
+    limit: int = 240,
+    session_id: str | None = None,
+    start_date: str | None = None
+):
+    errors: list[str] = []
+    parsed_start = _parse_practice_date(start_date) if start_date is not None else None
+    resolved = _resolve_practice_start_date(session_id, start_date)
+    if start_date is not None and parsed_start is None and resolved is None:
+        errors.append("practice_start_date_invalid")
+    month_filter = ""
+    params: list = [code]
+    month_value = None
+    try:
+        with get_conn() as conn:
+            if resolved:
+                max_month = conn.execute(
+                    "SELECT MAX(month) FROM monthly_bars WHERE code = ?",
+                    [code]
+                ).fetchone()[0]
+                use_epoch = max_month is not None and max_month >= 1_000_000_000
+                if use_epoch:
+                    month_value = int(calendar.timegm(resolved.replace(day=1).timetuple()))
+                else:
+                    month_value = resolved.year * 100 + resolved.month
+                month_filter = "AND month <= ?"
+                params.append(month_value)
+            params.append(limit)
+            rows = conn.execute(
+                f"""
+                WITH base AS (
+                    SELECT
+                        month,
+                        o,
+                        h,
+                        l,
+                        c
+                    FROM monthly_bars
+                    WHERE code = ?
+                    {month_filter}
+                    ORDER BY month DESC
+                    LIMIT ?
+                )
+                SELECT month, o, h, l, c
+                FROM base
+                ORDER BY month
+                """,
+                params
+            ).fetchall()
+        return JSONResponse(content={"data": rows, "errors": errors})
+    except Exception as exc:
+        errors.append(f"monthly_query_failed:{exc}")
+        return JSONResponse(content={"data": [], "errors": errors})
 
 
 @app.get("/api/ticker/monthly")

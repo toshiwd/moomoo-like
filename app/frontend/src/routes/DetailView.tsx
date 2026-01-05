@@ -591,6 +591,8 @@ export default function DetailView() {
   const dailyMaLines = useMemo(() => {
     return maSettings.daily.map((setting) => ({
       key: setting.key,
+      label: setting.label,
+      period: setting.period,
       color: setting.color,
       visible: setting.visible,
       lineWidth: setting.lineWidth,
@@ -601,6 +603,8 @@ export default function DetailView() {
   const weeklyMaLines = useMemo(() => {
     return maSettings.weekly.map((setting) => ({
       key: setting.key,
+      label: setting.label,
+      period: setting.period,
       color: setting.color,
       visible: setting.visible,
       lineWidth: setting.lineWidth,
@@ -611,6 +615,8 @@ export default function DetailView() {
   const monthlyMaLines = useMemo(() => {
     return maSettings.monthly.map((setting) => ({
       key: setting.key,
+      label: setting.label,
+      period: setting.period,
       color: setting.color,
       visible: setting.visible,
       lineWidth: setting.lineWidth,
@@ -832,25 +838,25 @@ export default function DetailView() {
     }
   };
 
-  const handleDailyCrosshair = (time: number | null) => {
-    weeklyChartRef.current?.setCrosshair(time);
-    monthlyChartRef.current?.setCrosshair(time);
+  const handleDailyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
+    weeklyChartRef.current?.setCrosshair(time, null);
+    monthlyChartRef.current?.setCrosshair(time, null);
     if (focusPanel === null || focusPanel === "daily") {
       scheduleHoverTime(time);
     }
   };
 
-  const handleWeeklyCrosshair = (time: number | null) => {
-    dailyChartRef.current?.setCrosshair(time);
-    monthlyChartRef.current?.setCrosshair(time);
+  const handleWeeklyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
+    dailyChartRef.current?.setCrosshair(time, null);
+    monthlyChartRef.current?.setCrosshair(time, null);
     if (focusPanel === "weekly") {
       scheduleHoverTime(time);
     }
   };
 
-  const handleMonthlyCrosshair = (time: number | null) => {
-    dailyChartRef.current?.setCrosshair(time);
-    weeklyChartRef.current?.setCrosshair(time);
+  const handleMonthlyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
+    dailyChartRef.current?.setCrosshair(time, null);
+    weeklyChartRef.current?.setCrosshair(time, null);
     if (focusPanel === "monthly") {
       scheduleHoverTime(time);
     }
@@ -901,6 +907,14 @@ export default function DetailView() {
           </button>
         </div>
         <div className="detail-controls">
+          <button
+            className="indicator-button"
+            onClick={() => {
+              if (code) navigate(`/practice/${code}`);
+            }}
+          >
+            練習
+          </button>
           <div className="segmented detail-range">
             {RANGE_PRESETS.map((preset) => (
               <button

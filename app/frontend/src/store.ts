@@ -1,5 +1,6 @@
 ﻿import { create } from "zustand";
-import { api } from "./api";
+import { api, setApiErrorReporter } from "./api";
+import type { ApiErrorInfo } from "./apiErrors";
 
 export type Ticker = {
   code: string;
@@ -139,8 +140,10 @@ type StoreState = {
   barsLoading: LoadingMap;
   barsStatus: StatusMap;
   loadingList: boolean;
+  lastApiError: ApiErrorInfo | null;
   maSettings: MaSettings;
   settings: Settings;
+  setLastApiError: (info: ApiErrorInfo | null) => void;
   loadList: () => Promise<void>;
   loadFavorites: () => Promise<void>;
   replaceFavorites: (codes: string[]) => void;
@@ -456,6 +459,7 @@ export const useStore = create<StoreState>((set, get) => ({
   barsLoading: { monthly: {}, weekly: {}, daily: {} },
   barsStatus: { monthly: {}, weekly: {}, daily: {} },
   loadingList: false,
+  lastApiError: null,
   maSettings: {
     daily: loadSettings("daily"),
     weekly: loadSettings("weekly"),
@@ -470,6 +474,7 @@ export const useStore = create<StoreState>((set, get) => ({
     sortKey: getInitialSortKey(),
     sortDir: getInitialSortDir()
   },
+  setLastApiError: (info) => set({ lastApiError: info }),
   loadFavorites: async () => {
     if (get().favoritesLoading) return;
     set({ favoritesLoading: true });
@@ -968,3 +973,7 @@ export const useStore = create<StoreState>((set, get) => ({
     }));
   }
 }));
+
+setApiErrorReporter((info) => {
+  useStore.getState().setLastApiError(info);
+});

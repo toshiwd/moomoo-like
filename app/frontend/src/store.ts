@@ -135,6 +135,7 @@ type StoreState = {
   favorites: string[];
   favoritesLoaded: boolean;
   favoritesLoading: boolean;
+  keepList: string[];
   barsCache: BarsCache;
   boxesCache: BoxesCache;
   barsLoading: LoadingMap;
@@ -148,6 +149,10 @@ type StoreState = {
   loadFavorites: () => Promise<void>;
   replaceFavorites: (codes: string[]) => void;
   setFavoriteLocal: (code: string, isFavorite: boolean) => void;
+  addKeep: (code: string) => void;
+  removeKeep: (code: string) => void;
+  toggleKeep: (code: string) => void;
+  clearKeep: () => void;
   loadBarsBatch: (
     timeframe: GridTimeframe,
     codes: string[],
@@ -201,6 +206,7 @@ const MIN_BATCH_LIMIT = 60;
 const MAX_BATCH_LIMIT = 2000;
 const WEEKLY_DAILY_FACTOR = 7;
 const BATCH_TTL_MS = 60_000;
+const KEEP_STORAGE_KEY = "keepList";
 const inFlightBatchRequests = new Map<
   string,
   { promise: Promise<void>; controller: AbortController }
@@ -449,11 +455,30 @@ const getInitialSortDir = (): SortDir => {
   return saved === "asc" ? "asc" : "desc";
 };
 
+const loadKeepList = (): string[] => {
+  if (typeof window === "undefined") return [];
+  const raw = window.localStorage.getItem(KEEP_STORAGE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item) => typeof item === "string" && item.trim());
+  } catch {
+    return [];
+  }
+};
+
+const persistKeepList = (list: string[]) => {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(KEEP_STORAGE_KEY, JSON.stringify(list));
+};
+
 export const useStore = create<StoreState>((set, get) => ({
   tickers: [],
   favorites: [],
   favoritesLoaded: false,
   favoritesLoading: false,
+  keepList: loadKeepList(),
   barsCache: { monthly: {}, weekly: {}, daily: {} },
   boxesCache: { monthly: {}, weekly: {}, daily: {} },
   barsLoading: { monthly: {}, weekly: {}, daily: {} },
@@ -509,6 +534,40 @@ export const useStore = create<StoreState>((set, get) => ({
         };
       }
       return state;
+    }),
+  addKeep: (code) =>
+    set((state) => {
+      const normalized = code?.trim();
+      if (!normalized) return state;
+      if (state.keepList.includes(normalized)) return state;
+      const next = [...state.keepList, normalized];
+      persistKeepList(next);
+      return { keepList: next };
+    }),
+  removeKeep: (code) =>
+    set((state) => {
+      const normalized = code?.trim();
+      if (!normalized) return state;
+      const next = state.keepList.filter((item) => item !== normalized);
+      persistKeepList(next);
+      return { keepList: next };
+    }),
+  toggleKeep: (code) =>
+    set((state) => {
+      const normalized = code?.trim();
+      if (!normalized) return state;
+      const exists = state.keepList.includes(normalized);
+      const next = exists
+        ? state.keepList.filter((item) => item !== normalized)
+        : [...state.keepList, normalized];
+      persistKeepList(next);
+      return { keepList: next };
+    }),
+  clearKeep: () =>
+    set((state) => {
+      if (!state.keepList.length) return state;
+      persistKeepList([]);
+      return { keepList: [] };
     }),
   loadList: async () => {
     if (get().loadingList) return;

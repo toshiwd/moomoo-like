@@ -258,7 +258,7 @@ const RankChartCard = memo(function RankChartCard({
               onToggleFavorite(item.code, isFavorite);
             }}
           >
-            ?
+            {isFavorite ? "♥" : "♡"}
           </button>
         </div>
       </div>

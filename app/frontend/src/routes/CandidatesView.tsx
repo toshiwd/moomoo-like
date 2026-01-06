@@ -1,56 +1,51 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api } from "../api";
 import { useBackendReadyState } from "../backendReady";
 import ChartListCard from "../components/ChartListCard";
 import TopNav from "../components/TopNav";
 import Toast from "../components/Toast";
 import { useStore } from "../store";
 
-type FavoriteItem = {
+type CandidateItem = {
   code: string;
   name?: string;
 };
 
-type FavoritesResponse = {
-  items?: FavoriteItem[];
-  errors?: string[];
-};
-
-export default function FavoritesView() {
+export default function CandidatesView() {
   const navigate = useNavigate();
   const { ready: backendReady } = useBackendReadyState();
-  const setFavoriteLocal = useStore((state) => state.setFavoriteLocal);
-  const replaceFavorites = useStore((state) => state.replaceFavorites);
+  const keepList = useStore((state) => state.keepList);
+  const removeKeep = useStore((state) => state.removeKeep);
+  const tickers = useStore((state) => state.tickers);
+  const loadList = useStore((state) => state.loadList);
+  const loadingList = useStore((state) => state.loadingList);
   const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const barsCache = useStore((state) => state.barsCache);
   const barsStatus = useStore((state) => state.barsStatus);
   const maSettings = useStore((state) => state.maSettings);
 
-  const [items, setItems] = useState<FavoriteItem[]>([]);
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const timeframe = "monthly" as const;
 
   useEffect(() => {
     if (!backendReady) return;
-    setLoading(true);
-    api
-      .get("/favorites")
-      .then((res) => {
-        const payload = res.data as FavoritesResponse;
-        const list = Array.isArray(payload.items) ? payload.items : [];
-        setItems(list);
-        replaceFavorites(list.map((item) => item.code));
-      })
-      .catch(() => {
-        setItems([]);
-        replaceFavorites([]);
-        setToastMessage("お気に入りの取得に失敗しました。");
-      })
-      .finally(() => setLoading(false));
-  }, [replaceFavorites, backendReady]);
+    if (tickers.length) return;
+    loadList().catch(() => setToastMessage("候補の読み込みに失敗しました。"));
+  }, [backendReady, loadList, tickers.length]);
+
+  const tickerMap = useMemo(() => {
+    return new Map(tickers.map((ticker) => [ticker.code, ticker.name]));
+  }, [tickers]);
+
+  const items = useMemo<CandidateItem[]>(
+    () =>
+      keepList.map((code) => ({
+        code,
+        name: tickerMap.get(code)
+      })),
+    [keepList, tickerMap]
+  );
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -67,28 +62,15 @@ export default function FavoritesView() {
   useEffect(() => {
     if (!backendReady) return;
     if (!filteredCodes.length) return;
-    ensureBarsForVisible(timeframe, filteredCodes, "favorites");
-  }, [backendReady, filteredCodes, ensureBarsForVisible, timeframe]);
-
-  const handleRemoveFavorite = async (code: string) => {
-    const prevItems = items;
-    setItems((current) => current.filter((item) => item.code !== code));
-    setFavoriteLocal(code, false);
-    try {
-      await api.delete(`/favorites/${encodeURIComponent(code)}`);
-    } catch {
-      setItems(prevItems);
-      setFavoriteLocal(code, true);
-      setToastMessage("お気に入りの更新に失敗しました。");
-    }
-  };
+    ensureBarsForVisible(timeframe, filteredCodes, "candidates");
+  }, [backendReady, ensureBarsForVisible, filteredCodes, timeframe]);
 
   return (
     <div className="app-shell">
       <header className="top-bar">
         <div className="top-bar-heading">
-          <div className="title">お気に入り</div>
-          <div className="subtitle">登録済みの銘柄一覧</div>
+          <div className="title">候補</div>
+          <div className="subtitle">候補に入れた銘柄一覧</div>
           <TopNav />
         </div>
         <div className="top-bar-controls">
@@ -110,9 +92,9 @@ export default function FavoritesView() {
         </div>
       </header>
       <div className="rank-shell">
-        {loading && <div className="rank-status">読み込み中...</div>}
-        {!loading && backendReady && filtered.length === 0 && (
-          <div className="rank-status">お気に入りがありません。</div>
+        {loadingList && <div className="rank-status">読み込み中...</div>}
+        {!loadingList && backendReady && filtered.length === 0 && (
+          <div className="rank-status">候補がありません。</div>
         )}
         <div className="rank-grid">
           {filtered.map((item) => {
@@ -128,10 +110,10 @@ export default function FavoritesView() {
                 maSettings={maSettings[timeframe]}
                 onOpenDetail={(code) => navigate(`/detail/${code}`)}
                 action={{
-                  label: "♥",
-                  ariaLabel: "お気に入り解除",
-                  className: "favorite-toggle active",
-                  onClick: () => handleRemoveFavorite(item.code)
+                  label: "候",
+                  ariaLabel: "候補から外す",
+                  className: "candidate-toggle active",
+                  onClick: () => removeKeep(item.code)
                 }}
               />
             );
@@ -142,4 +124,3 @@ export default function FavoritesView() {
     </div>
   );
 }
-

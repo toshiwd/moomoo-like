@@ -1,5 +1,9 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FixedSizeGrid as Grid, GridOnItemsRenderedProps } from "react-window";
+import {
+  FixedSizeGrid as Grid,
+  type FixedSizeGrid,
+  type GridOnItemsRenderedProps
+} from "react-window";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useBackendReadyState } from "../backendReady";
@@ -17,6 +21,7 @@ import {
 
 const TILE_HEIGHT = 220;
 const GRID_GAP = 12;
+const KEEP_LIMIT = 24;
 type Timeframe = "monthly" | "weekly" | "daily";
 type SortOption = { key: SortKey; label: string };
 type SortSection = { title: string; options: SortOption[] };
@@ -63,6 +68,10 @@ export default function GridView() {
   const search = useStore((state) => state.settings.search);
   const gridScrollTop = useStore((state) => state.settings.gridScrollTop);
   const gridTimeframe = useStore((state) => state.settings.gridTimeframe);
+  const keepList = useStore((state) => state.keepList);
+  const addKeep = useStore((state) => state.addKeep);
+  const removeKeep = useStore((state) => state.removeKeep);
+  const clearKeep = useStore((state) => state.clearKeep);
   const setColumns = useStore((state) => state.setColumns);
   const setSearch = useStore((state) => state.setSearch);
   const setGridScrollTop = useStore((state) => state.setGridScrollTop);
@@ -89,7 +98,7 @@ export default function GridView() {
   const [updateLogLines, setUpdateLogLines] = useState<string[]>([]);
   const [showUpdateLog, setShowUpdateLog] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [selectedCodes, setSelectedCodes] = useState<string[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
   const [consultVisible, setConsultVisible] = useState(false);
   const [consultExpanded, setConsultExpanded] = useState(false);
   const [consultTab, setConsultTab] = useState<"selection" | "position">("selection");
@@ -97,12 +106,12 @@ export default function GridView() {
   const [consultSort, setConsultSort] = useState<ConsultationSort>("score");
   const [consultBusy, setConsultBusy] = useState(false);
   const [consultMeta, setConsultMeta] = useState<{ omitted: number }>({ omitted: 0 });
-  const [watchMenuCode, setWatchMenuCode] = useState<string | null>(null);
   const [undoInfo, setUndoInfo] = useState<{ code: string; trashToken?: string | null } | null>(
     null
   );
   const sortRef = useRef<HTMLDivElement | null>(null);
   const displayRef = useRef<HTMLDivElement | null>(null);
+  const gridRef = useRef<FixedSizeGrid | null>(null);
   const prevUpdateRunningRef = useRef(false);
   const lastVisibleCodesRef = useRef<string[]>([]);
   const lastVisibleRangeRef = useRef<{ start: number; stop: number } | null>(null);
@@ -133,47 +142,17 @@ export default function GridView() {
   }, [backendReady]);
 
   useEffect(() => {
-    if (!sortOpen && !displayOpen && !watchMenuCode) return;
+    if (!sortOpen && !displayOpen) return;
     const handleClick = (event: MouseEvent) => {
       const target = event.target as HTMLElement;
       if (sortRef.current && sortRef.current.contains(target)) return;
       if (displayRef.current && displayRef.current.contains(target)) return;
-      if (watchMenuCode && target.closest(".tile-menu")) return;
       setSortOpen(false);
       setDisplayOpen(false);
-      setWatchMenuCode(null);
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [sortOpen, displayOpen, watchMenuCode]);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target) {
-        const tag = target.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable) {
-          return;
-        }
-      }
-      if (event.key === "Escape") {
-        setSortOpen(false);
-        setDisplayOpen(false);
-        setWatchMenuCode(null);
-        if (consultVisible) {
-          setConsultVisible(false);
-        }
-      } else if (event.key === "1") {
-        setGridTimeframe("monthly");
-      } else if (event.key === "2") {
-        setGridTimeframe("weekly");
-      } else if (event.key === "3") {
-        setGridTimeframe("daily");
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [setGridTimeframe, consultVisible]);
+  }, [sortOpen, displayOpen]);
 
   useEffect(() => {
     return () => {
@@ -292,7 +271,7 @@ export default function GridView() {
   const scoredTickers = useMemo(() => {
     return filtered.map((ticker, index) => {
       const payload = barsCache[gridTimeframe][ticker.code];
-      const metrics = payload?.bars?.length ? computeSignalMetrics(payload.bars) : null;
+      const metrics = payload?.bars?.length ? computeSignalMetrics(payload.bars, 4) : null;
       return { ticker, metrics, index };
     });
   }, [filtered, barsCache, gridTimeframe]);
@@ -444,13 +423,47 @@ export default function GridView() {
     return items;
   }, [scoredTickers, sortKey, sortDir, collator]);
 
+  useEffect(() => {
+    if (sortedTickers.length === 0) {
+      setActiveIndex(0);
+      return;
+    }
+    setActiveIndex((prev) => Math.min(Math.max(0, prev), sortedTickers.length - 1));
+  }, [sortedTickers.length]);
+
+  useEffect(() => {
+    if (!sortedTickers.length || columns <= 0) return;
+    const rowIndex = Math.floor(activeIndex / columns);
+    const columnIndex = activeIndex % columns;
+    gridRef.current?.scrollToItem({ rowIndex, columnIndex, align: "smart" });
+  }, [activeIndex, sortedTickers.length, columns]);
+
   const tickerMap = useMemo(() => {
     const map = new Map<string, typeof tickers[number]>();
     tickers.forEach((ticker) => map.set(ticker.code, ticker));
     return map;
   }, [tickers]);
 
-  const selectedSet = useMemo(() => new Set(selectedCodes), [selectedCodes]);
+  const keepSet = useMemo(() => new Set(keepList), [keepList]);
+  const activeItem = sortedTickers[activeIndex] ?? null;
+  const activeCode = activeItem?.ticker.code ?? null;
+  const moveActive = useCallback(
+    (delta: number) => {
+      if (!sortedTickers.length) return;
+      setActiveIndex((prev) =>
+        Math.min(Math.max(0, prev + delta), Math.max(0, sortedTickers.length - 1))
+      );
+    },
+    [sortedTickers.length]
+  );
+  const activateByCode = useCallback(
+    (code: string) => {
+      if (!code) return;
+      const index = sortedTickers.findIndex((item) => item.ticker.code === code);
+      if (index >= 0) setActiveIndex(index);
+    },
+    [sortedTickers]
+  );
 
   const gridHeight = Math.max(200, size.height);
   const gridWidth = Math.max(0, size.width);
@@ -469,8 +482,10 @@ export default function GridView() {
     const rowsPerViewport = Math.max(1, Math.floor(gridHeight / (TILE_HEIGHT + GRID_GAP)));
     const prefetchStop = visibleRowStopIndex + rowsPerViewport;
     const start = visibleRowStartIndex * columns + visibleColumnStartIndex;
-    const stop = Math.min(sortedTickers.length - 1, prefetchStop * columns + visibleColumnStopIndex);
-
+    const stop = Math.min(
+      sortedTickers.length - 1,
+      prefetchStop * columns + visibleColumnStopIndex
+    );
     if (start > stop) return;
     const codes: string[] = [];
     for (let index = start; index <= stop; index += 1) {
@@ -502,7 +517,15 @@ export default function GridView() {
   }, [backendReady, sortedTickers, gridTimeframe, ensureBarsForVisible]);
 
   const itemKey = useCallback(
-    ({ columnIndex, rowIndex, data }: { columnIndex: number; rowIndex: number; data: typeof sortedTickers }) => {
+    ({
+      columnIndex,
+      rowIndex,
+      data
+    }: {
+      columnIndex: number;
+      rowIndex: number;
+      data: typeof sortedTickers;
+    }) => {
       const index = rowIndex * columns + columnIndex;
       const item = data[index];
       return item ? item.ticker.code : `${rowIndex}-${columnIndex}`;
@@ -549,8 +572,8 @@ export default function GridView() {
         }
         undoTimerRef.current = window.setTimeout(() => {
           setUndoInfo(null);
-        }, 8000);
-        setToastMessage(`${code} を削除しました。`);
+        }, 5000);
+        setToastMessage(`${code} を除外しました。`);
       } catch (error) {
         const message = error instanceof Error ? error.message : "ウォッチリスト削除に失敗しました。";
         setToastMessage(message);
@@ -558,6 +581,117 @@ export default function GridView() {
     },
     [loadList]
   );
+
+  const handleToggleKeep = useCallback(
+    (code: string) => {
+      if (!code) return;
+      if (keepList.includes(code)) {
+        removeKeep(code);
+        return;
+      }
+      if (keepList.length >= KEEP_LIMIT) {
+        setToastMessage(`候補箱は最大${KEEP_LIMIT}件までです。`);
+        return;
+      }
+      addKeep(code);
+    },
+    [keepList, addKeep, removeKeep]
+  );
+
+  const handleExclude = useCallback(
+    (code: string) => {
+      if (!code) return;
+      handleRemoveWatchlist(code, false);
+    },
+    [handleRemoveWatchlist]
+  );
+
+  const handleKeepNavigate = useCallback(
+    (code: string) => {
+      if (!code) return;
+      const index = sortedTickers.findIndex((item) => item.ticker.code === code);
+      if (index >= 0) {
+        setActiveIndex(index);
+        return;
+      }
+      navigate(`/detail/${code}`);
+    },
+    [sortedTickers, navigate]
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable) {
+          return;
+        }
+      }
+      const key = event.key.toLowerCase();
+      if (event.key === "Escape") {
+        setSortOpen(false);
+        setDisplayOpen(false);
+        if (consultVisible) {
+          setConsultVisible(false);
+        }
+        return;
+      }
+      if (key === "arrowdown" || key === "j") {
+        event.preventDefault();
+        moveActive(columns);
+        return;
+      }
+      if (key === "arrowup" || key === "k") {
+        event.preventDefault();
+        moveActive(-columns);
+        return;
+      }
+      if (key === "arrowleft" || key === "h") {
+        event.preventDefault();
+        moveActive(-1);
+        return;
+      }
+      if (key === "arrowright" || key === "l") {
+        event.preventDefault();
+        moveActive(1);
+        return;
+      }
+      if (key === "enter" && activeCode) {
+        event.preventDefault();
+        handleOpenDetail(activeCode);
+        return;
+      }
+      if (key === "s" && activeCode) {
+        event.preventDefault();
+        handleToggleKeep(activeCode);
+        return;
+      }
+      if (key === "e" && activeCode) {
+        event.preventDefault();
+        handleExclude(activeCode);
+        return;
+      }
+      if (event.key === "1") {
+        setGridTimeframe("monthly");
+      } else if (event.key === "2") {
+        setGridTimeframe("weekly");
+      } else if (event.key === "3") {
+        setGridTimeframe("daily");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    setGridTimeframe,
+    consultVisible,
+    columns,
+    moveActive,
+    activeCode,
+    handleOpenDetail,
+    handleToggleKeep,
+    handleExclude
+  ]);
 
   const handleUndoRemove = useCallback(async () => {
     if (!undoInfo) return;
@@ -582,13 +716,6 @@ export default function GridView() {
     setColumns(3);
     setShowBoxes(true);
   }, [setColumns, setShowBoxes]);
-
-  const toggleSelect = useCallback((code: string) => {
-    setSelectedCodes((prev) => {
-      if (prev.includes(code)) return prev.filter((item) => item !== code);
-      return [...prev, code];
-    });
-  }, []);
 
   const updateSetting = (frame: Timeframe, index: number, patch: Partial<MaSetting>) => {
     updateMaSetting(frame, index, patch);
@@ -756,15 +883,15 @@ export default function GridView() {
   }, [backendReady]);
 
   const buildConsultation = useCallback(async () => {
-    if (!selectedCodes.length) return;
+    if (!keepList.length) return;
     setConsultBusy(true);
     try {
       try {
-        await ensureBarsForVisible(consultTimeframe, selectedCodes, "consult-pack");
+        await ensureBarsForVisible(consultTimeframe, keepList, "consult-pack");
       } catch {
         // Use available cache even if fetch fails.
       }
-      const items = selectedCodes.map((code) => {
+      const items = keepList.map((code) => {
         const ticker = tickerMap.get(code);
         const payload = barsCache[consultTimeframe][code];
         const boxes = boxesCache[consultTimeframe][code] ?? [];
@@ -802,7 +929,7 @@ export default function GridView() {
       setConsultBusy(false);
     }
   }, [
-    selectedCodes,
+    keepList,
     ensureBarsForVisible,
     consultTimeframe,
     barsCache,
@@ -826,10 +953,10 @@ export default function GridView() {
 
   const selectedChips = useMemo(() => {
     const limit = 6;
-    const visible = selectedCodes.slice(0, limit);
-    const extra = Math.max(0, selectedCodes.length - visible.length);
+    const visible = keepList.slice(0, limit);
+    const extra = Math.max(0, keepList.length - visible.length);
     return { visible, extra };
-  }, [selectedCodes]);
+  }, [keepList]);
 
   const handleUpdateTxt = useCallback(async () => {
     if (isUpdatingTxt || !backendReady) return;
@@ -1169,6 +1296,45 @@ export default function GridView() {
           </pre>
         </div>
       )}
+      <div className="keep-bar">
+        <div className="keep-bar-header">
+          <div className="keep-bar-title">候補箱</div>
+          <div className="keep-bar-meta">
+            {keepList.length}/{KEEP_LIMIT}
+          </div>
+          <div className="keep-bar-hint">S:候補 / E:除外 / J,K:上下 / ←→:横</div>
+          {keepList.length > 0 && (
+            <button type="button" className="keep-bar-clear" onClick={clearKeep}>
+              クリア
+            </button>
+          )}
+        </div>
+        {keepList.length > 0 ? (
+          <div className="keep-bar-chips">
+            {keepList.map((code) => (
+              <div className="keep-chip" key={code}>
+                <button
+                  type="button"
+                  className="keep-chip-main"
+                  onClick={() => handleKeepNavigate(code)}
+                >
+                  {code}
+                </button>
+                <button
+                  type="button"
+                  className="keep-chip-remove"
+                  onClick={() => removeKeep(code)}
+                  aria-label={`${code} を候補箱から外す`}
+                >
+                  x
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="keep-bar-empty">Sキーまたは + で候補に追加</div>
+        )}
+      </div>
       <div className={`grid-shell ${consultPaddingClass}`} ref={ref}>
         {showSkeleton && (
           <div className="grid-skeleton">
@@ -1185,6 +1351,7 @@ export default function GridView() {
           <div className="grid-inner">
             <Grid
               key={gridTimeframe}
+              ref={gridRef}
               columnCount={columns}
               columnWidth={columnWidth}
               height={innerHeight}
@@ -1198,9 +1365,9 @@ export default function GridView() {
               initialScrollTop={gridScrollTop}
               onScroll={({ scrollTop }) => setGridScrollTop(scrollTop)}
             >
-              {({ columnIndex, rowIndex, style }) => {
+              {({ columnIndex, rowIndex, style, data }) => {
                 const index = rowIndex * columns + columnIndex;
-                const item = sortedTickers[index];
+                const item = data[index];
                 if (!item) return null;
                 const cellStyle = {
                   ...style,
@@ -1213,16 +1380,12 @@ export default function GridView() {
                       ticker={item.ticker}
                       timeframe={gridTimeframe}
                       signals={item.metrics?.signals ?? []}
-                      trendStrength={item.metrics?.trendStrength ?? null}
-                      exhaustionRisk={item.metrics?.exhaustionRisk ?? null}
+                      active={activeCode === item.ticker.code}
+                      kept={keepSet.has(item.ticker.code)}
+                      onActivate={activateByCode}
                       onOpenDetail={handleOpenDetail}
-                      selected={selectedSet.has(item.ticker.code)}
-                      onToggleSelect={toggleSelect}
-                      menuOpen={watchMenuCode === item.ticker.code}
-                      onToggleMenu={(code) =>
-                        setWatchMenuCode((prev) => (prev === code ? null : code))
-                      }
-                      onRemoveWatchlist={handleRemoveWatchlist}
+                      onToggleKeep={handleToggleKeep}
+                      onExclude={handleExclude}
                     />
                   </div>
                 );
@@ -1237,7 +1400,7 @@ export default function GridView() {
             consultVisible ? (consultExpanded ? "offset-expanded" : "offset-mini") : ""
           }`}
         >
-          <span>{undoInfo.code} を削除しました</span>
+          <span>{undoInfo.code} を除外しました</span>
           <button type="button" onClick={handleUndoRemove}>
             元に戻す
           </button>
@@ -1260,7 +1423,7 @@ export default function GridView() {
         {!consultExpanded && (
           <div className="consult-mini">
             <div className="consult-mini-left">
-              <div className="consult-mini-count">選択 {selectedCodes.length}件</div>
+              <div className="consult-mini-count">候補 {keepList.length}件</div>
               <div className="consult-chips">
                 {selectedChips.visible.map((code) => (
                   <span key={code} className="consult-chip">
@@ -1277,7 +1440,7 @@ export default function GridView() {
                 type="button"
                 className="consult-primary"
                 onClick={buildConsultation}
-                disabled={!selectedCodes.length || consultBusy}
+                disabled={!keepList.length || consultBusy}
               >
                 {consultBusy ? "作成中..." : "相談作成"}
               </button>
@@ -1314,7 +1477,7 @@ export default function GridView() {
                   type="button"
                   className="consult-primary"
                   onClick={buildConsultation}
-                  disabled={!selectedCodes.length || consultBusy}
+                  disabled={!keepList.length || consultBusy}
                 >
                   {consultBusy ? "作成中..." : "相談作成"}
                 </button>
@@ -1329,7 +1492,7 @@ export default function GridView() {
             <div className="consult-expanded-body">
               <div className="consult-expanded-meta-row">
                 <div className="consult-expanded-meta">
-                  選択 {selectedCodes.length}件
+                  候補 {keepList.length}件
                   {consultMeta.omitted
                     ? ` / 表示外 ${consultMeta.omitted}件`
                     : " / 最大10件まで表示"}

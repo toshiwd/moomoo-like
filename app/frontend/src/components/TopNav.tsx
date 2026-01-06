@@ -22,6 +22,12 @@ export default function TopNav() {
       >
         お気に入り
       </NavLink>
+      <NavLink
+        to="/candidates"
+        className={({ isActive }) => (isActive ? "top-nav-link active" : "top-nav-link")}
+      >
+        候補
+      </NavLink>
     </nav>
   );
 }

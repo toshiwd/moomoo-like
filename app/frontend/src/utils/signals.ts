@@ -115,7 +115,7 @@ const buildSignals = (counts: Record<number, MaCountState>, maxSignals: number) 
     if (count <= 0) return;
 
     if (count >= period) {
-      const label = `${period}${side === "up" ? "上" : "下"}${period}`;
+      const label = `${period}${side === "up" ? "上" : "下"}:${count}`;
       signals.push({
         label,
         kind: "achieved",
@@ -125,7 +125,7 @@ const buildSignals = (counts: Record<number, MaCountState>, maxSignals: number) 
     }
 
     if (count >= threshold) {
-      const label = `${period}${side === "up" ? "上" : "下"}${threshold}+`;
+      const label = `${period}${side === "up" ? "上" : "下"}:${count}`;
       signals.push({
         label,
         kind: "warning",
@@ -196,7 +196,7 @@ export const computeSignalMetrics = (bars: number[][], maxSignals = 5): SignalMe
 
       const ma = sum / period;
       if (!Number.isFinite(ma)) return;
-      const side = close > ma ? "up" : close < ma ? "down" : "flat";
+      const side = close >= ma ? "up" : "down";
       updateCounts(counts[period], side);
     });
   }

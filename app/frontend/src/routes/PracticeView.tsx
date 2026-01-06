@@ -728,6 +728,9 @@ export default function PracticeView() {
   const sessionChangeRef = useRef(0);
   const bottomRowRef = useRef<HTMLDivElement | null>(null);
   const resizingRef = useRef(false);
+  const hoverRafRef = useRef<number | null>(null);
+  const hoverTimePendingRef = useRef<number | null>(null);
+  const hoverTimeRef = useRef<number | null>(null);
 
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
@@ -754,10 +757,7 @@ export default function PracticeView() {
   const [dailyData, setDailyData] = useState<number[][]>([]);
   const [dailyErrors, setDailyErrors] = useState<string[]>([]);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [hover, setHover] = useState<{ time: number | null; source: Timeframe | null }>({
-    time: null,
-    source: null
-  });
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [weeklyRatio, setWeeklyRatio] = useState(DEFAULT_WEEKLY_RATIO);
   const [lotSize, setLotSize] = useState(DEFAULT_LOT_SIZE);
   const [rangeMonths, setRangeMonths] = useState(DEFAULT_RANGE_MONTHS);
@@ -1331,6 +1331,27 @@ export default function PracticeView() {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (hoverRafRef.current !== null) {
+        window.cancelAnimationFrame(hoverRafRef.current);
+        hoverRafRef.current = null;
+      }
+    };
+  }, []);
+
+  const scheduleHoverTime = (time: number | null) => {
+    hoverTimePendingRef.current = time;
+    if (hoverRafRef.current !== null) return;
+    hoverRafRef.current = window.requestAnimationFrame(() => {
+      hoverRafRef.current = null;
+      const next = hoverTimePendingRef.current ?? null;
+      if (hoverTimeRef.current === next) return;
+      hoverTimeRef.current = next;
+      setHoverTime(next);
+    });
+  };
+
   const startResize = () => (event: ReactMouseEvent | ReactTouchEvent) => {
     event.preventDefault();
     resizingRef.current = true;
@@ -1342,20 +1363,20 @@ export default function PracticeView() {
     return null;
   };
 
-  const handleDailyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
-    setHover({ time, source: time ? "daily" : null });
+  const handleDailyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
+    scheduleHoverTime(time);
     weeklyChartRef.current?.setCrosshair(time, null);
     monthlyChartRef.current?.setCrosshair(time, null);
   };
 
-  const handleWeeklyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
-    setHover({ time, source: time ? "weekly" : null });
+  const handleWeeklyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
+    scheduleHoverTime(time);
     dailyChartRef.current?.setCrosshair(time, null);
     monthlyChartRef.current?.setCrosshair(time, null);
   };
 
-  const handleMonthlyCrosshair = (time: number | null, point?: { x: number; y: number } | null) => {
-    setHover({ time, source: time ? "monthly" : null });
+  const handleMonthlyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
+    scheduleHoverTime(time);
     dailyChartRef.current?.setCrosshair(time, null);
     weeklyChartRef.current?.setCrosshair(time, null);
   };
@@ -1863,7 +1884,7 @@ export default function PracticeView() {
     dailyChartRef.current?.setCrosshair(time);
     weeklyChartRef.current?.setCrosshair(time);
     monthlyChartRef.current?.setCrosshair(time);
-    setHover({ time, source: "daily" });
+    scheduleHoverTime(time);
   };
 
   const dailyEmptyMessage = dailyCandles.length === 0 ? dailyErrors[0] ?? "No data" : null;
@@ -2031,12 +2052,12 @@ export default function PracticeView() {
                     boxes={[]}
                     showBoxes={false}
                     cursorTime={cursorCandle?.time ?? null}
-                    positionOverlay={{
+                      positionOverlay={{
                       dailyPositions,
                       tradeMarkers,
                       showOverlay: true,
                       showPnL: false,
-                      hoverTime: hover.time ?? cursorCandle?.time ?? null,
+                      hoverTime: hoverTime ?? cursorCandle?.time ?? null,
                       showMarkers: true,
                       markerSuffix: lotSize !== DEFAULT_LOT_SIZE ? `x${lotSize}` : undefined
                     }}

@@ -2054,6 +2054,17 @@ body {
   gap: 2px;
 }
 
+.position-overlay-ma-counts {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.position-overlay-ma-title {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
 .position-overlay-ma-row {
   display: flex;
   align-items: baseline;

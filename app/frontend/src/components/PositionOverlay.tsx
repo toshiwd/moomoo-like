@@ -129,6 +129,12 @@ const findClosestIndex = (bars: PositionOverlayProps["bars"], time: number | nul
   return Math.abs(time - lower.time) <= Math.abs(upper.time - time) ? lowerIndex : upperIndex;
 };
 
+const resolveMaLabel = (entry: {
+  key: string;
+  label?: string;
+  period?: number;
+}) => entry.label ?? (entry.period ? `MA${entry.period}` : entry.key.toUpperCase());
+
 const resolveBrokerMeta = (value: string | undefined) => {
   const raw = (value ?? "").toString().trim();
   const lower = raw.toLowerCase();
@@ -182,7 +188,12 @@ export default function PositionOverlay({
     () => new Map(volume.map((item) => [item.time, item.value])),
     [volume]
   );
-  const activeIndex = useMemo(() => findClosestIndex(bars, hoverTime), [bars, hoverTime]);
+  const activeIndex = useMemo(() => {
+    if (!bars.length) return null;
+    if (hoverTime == null) return bars.length - 1;
+    const idx = findClosestIndex(bars, hoverTime);
+    return idx ?? bars.length - 1;
+  }, [bars, hoverTime]);
 
   const positionsByTime = useMemo(() => {
     const map = new Map<number, DailyPosition[]>();
@@ -259,7 +270,7 @@ export default function PositionOverlay({
       .filter((line) => line.visible)
       .map((line) => {
         const value = findClosestValue(line.data, activeBar.time);
-        const label = line.label ?? (line.period ? `MA${line.period}` : line.key.toUpperCase());
+        const label = resolveMaLabel(line);
         return {
           key: line.key,
           label,
@@ -268,6 +279,59 @@ export default function PositionOverlay({
         };
       });
   }, [maLines, activeBar]);
+  const maCounts = useMemo(() => {
+    if (!bars.length || !maLines.length) return [];
+    return maLines
+      .filter((line) => line.visible)
+      .map((line) => {
+        const valueMap = new Map<number, number>();
+        line.data.forEach((point) => {
+          if (point && Number.isFinite(point.value)) {
+            valueMap.set(point.time, point.value);
+          }
+        });
+        const upCounts: Array<number | null> = new Array(bars.length).fill(null);
+        const downCounts: Array<number | null> = new Array(bars.length).fill(null);
+        let up = 0;
+        let down = 0;
+        bars.forEach((bar, index) => {
+          const maValue = valueMap.get(bar.time);
+          if (maValue == null || !Number.isFinite(maValue)) {
+            up = 0;
+            down = 0;
+            upCounts[index] = null;
+            downCounts[index] = null;
+            return;
+          }
+          if (bar.close >= maValue) {
+            up += 1;
+            down = 0;
+          } else {
+            down += 1;
+            up = 0;
+          }
+          upCounts[index] = up;
+          downCounts[index] = down;
+        });
+        return {
+          key: line.key,
+          label: resolveMaLabel(line),
+          color: line.color,
+          upCounts,
+          downCounts
+        };
+      });
+  }, [bars, maLines]);
+  const activeMaCounts = useMemo(() => {
+    if (activeIndex == null) return [];
+    return maCounts.map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      color: entry.color,
+      up: entry.upCounts[activeIndex],
+      down: entry.downCounts[activeIndex]
+    }));
+  }, [maCounts, activeIndex]);
   const activePositions = useMemo(() => {
     if (activePositionTime == null) return [];
     const positions = positionsByTime.get(activePositionTime) ?? [];
@@ -502,6 +566,21 @@ export default function PositionOverlay({
                 </span>
                 <span className="position-overlay-value">
                   {entry.value == null ? "--" : formatNumber(entry.value)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        {activeMaCounts.length > 0 && (
+          <div className="position-overlay-ma position-overlay-ma-counts">
+            <div className="position-overlay-ma-title">本数</div>
+            {activeMaCounts.map((entry) => (
+              <div className="position-overlay-ma-row" key={`ma-count-${entry.key}`}>
+                <span className="position-overlay-label" style={{ color: entry.color ?? "#94a3b8" }}>
+                  {entry.label}
+                </span>
+                <span className="position-overlay-value">
+                  上 {entry.up ?? "--"} / 下 {entry.down ?? "--"}
                 </span>
               </div>
             ))}

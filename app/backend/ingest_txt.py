@@ -27,6 +27,17 @@ CODE_PATTERN = re.compile(os.getenv("CODE_PATTERN", CODE_PATTERN_DEFAULT))
 STRICT_CODE_VALIDATION = os.getenv("CODE_STRICT", "0") == "1"
 USE_CODE_TXT = os.getenv("USE_CODE_TXT", "0") == "1"
 
+TRADE_FLAG_CONFIG = {
+    "BOX_MONTHS_MIN": 4,
+    "BOX_RANGE_PCT": 0.20,
+    "HITEI_BODY_RATIO": 0.5,
+    "GAP_PCT": 0.01,
+    "SIGNAL_ZONE_PCT": 0.03,
+    "HIGARA_SWING_WINDOW": 20,
+    "HIGARA_TARGET_DAYS": [7, 9, 17, 26],
+    "HIGARA_DAY_RANGE": 1
+}
+
 
 def find_code_txt_path(data_dir: str) -> str | None:
     code_path = os.path.abspath(os.getenv("PAN_CODE_TXT_PATH") or DEFAULT_PAN_CODE_PATH)
@@ -120,6 +131,202 @@ def _compute_volume_ratio(volumes: list[float], period: int = 20) -> float | Non
     if avg <= 0:
         return None
     return volumes[-1] / avg
+
+
+def _compute_monthly_box_info(monthly_df: pd.DataFrame, config: dict) -> dict:
+    bars: list[dict] = []
+    if monthly_df.empty:
+        return {
+            "status": None,
+            "duration": None,
+            "upper": None,
+            "lower": None,
+            "ma20_trend": None
+        }
+    monthly_sorted = monthly_df.sort_values("month")
+    for row in monthly_sorted[["month", "h", "l", "c"]].itertuples(index=False):
+        month_value, high, low, close = row
+        high_v = _safe_float(high)
+        low_v = _safe_float(low)
+        close_v = _safe_float(close)
+        if month_value is None or high_v is None or low_v is None or close_v is None:
+            continue
+        bars.append(
+            {
+                "time": int(month_value),
+                "high": high_v,
+                "low": low_v,
+                "close": close_v
+            }
+        )
+    if len(bars) < config["BOX_MONTHS_MIN"]:
+        last_close = bars[-1]["close"] if bars else None
+        ma20 = None
+        ma20_trend = None
+        if bars:
+            ma20_series = _build_ma_series([item["close"] for item in bars], 20)
+            ma20 = ma20_series[-1] if ma20_series else None
+        if last_close is not None and ma20 is not None:
+            ma20_trend = 1 if last_close >= ma20 else -1
+        return {
+            "status": None,
+            "duration": None,
+            "upper": None,
+            "lower": None,
+            "ma20_trend": ma20_trend
+        }
+
+    bars.sort(key=lambda item: item["time"])
+    closes = [item["close"] for item in bars]
+    ma20_series = _build_ma_series(closes, 20)
+    ma20 = ma20_series[-1] if ma20_series else None
+    last_close = closes[-1] if closes else None
+    ma20_trend = None
+    if last_close is not None and ma20 is not None:
+        ma20_trend = 1 if last_close >= ma20 else -1
+
+    box_status = None
+    box_duration = None
+    box_upper = None
+    box_lower = None
+    min_months = config["BOX_MONTHS_MIN"]
+    max_range_pct = config["BOX_RANGE_PCT"]
+    for length in range(len(bars), min_months - 1, -1):
+        window = bars[-length:]
+        upper = max(item["high"] for item in window)
+        lower = min(item["low"] for item in window)
+        base = max(lower, 1e-9)
+        range_pct = (upper - lower) / base
+        if range_pct > max_range_pct:
+            continue
+        box_duration = length
+        box_upper = upper
+        box_lower = lower
+        pre = bars[:-length]
+        trend = None
+        if len(pre) >= 2:
+            if pre[-1]["close"] > pre[0]["close"]:
+                trend = "up"
+            elif pre[-1]["close"] < pre[0]["close"]:
+                trend = "down"
+        if trend == "up" and ma20_trend == 1:
+            box_status = "Ceiling_Box"
+        elif trend == "down" and last_close is not None and box_lower is not None:
+            if last_close <= box_lower * (1 + config["SIGNAL_ZONE_PCT"]):
+                box_status = "Bottom_Box"
+        else:
+            box_status = "None"
+        break
+
+    if box_duration is None:
+        if ma20_trend == 1:
+            box_status = "Trend_Up"
+        else:
+            box_status = None
+
+    return {
+        "status": box_status,
+        "duration": box_duration,
+        "upper": box_upper,
+        "lower": box_lower,
+        "ma20_trend": ma20_trend
+    }
+
+
+def _compute_daily_signal_flags(
+    daily_df: pd.DataFrame,
+    box_upper: float | None,
+    box_lower: float | None,
+    config: dict
+) -> tuple[dict, int | None, int | None]:
+    if daily_df.empty:
+        return {}, None, None
+    daily_sorted = daily_df.sort_values("date")
+    closes = daily_sorted["c"].astype(float).tolist()
+    last_close = closes[-1] if closes else None
+
+    window = config["HIGARA_SWING_WINDOW"]
+    series = pd.Series(closes)
+    rolling_high = series.rolling(window=window, min_periods=1).max()
+    rolling_low = series.rolling(window=window, min_periods=1).min()
+    peak_mask = series == rolling_high
+    bottom_mask = series == rolling_low
+    last_peak_index = int(peak_mask[peak_mask].index.max()) if peak_mask.any() else None
+    last_bottom_index = int(bottom_mask[bottom_mask].index.max()) if bottom_mask.any() else None
+    days_since_peak = None
+    if last_peak_index is not None:
+        days_since_peak = len(series) - 1 - last_peak_index
+    days_since_bottom = None
+    if last_bottom_index is not None:
+        days_since_bottom = len(series) - 1 - last_bottom_index
+
+    targets = config["HIGARA_TARGET_DAYS"]
+    tol = config["HIGARA_DAY_RANGE"]
+    def _hit(days: int | None) -> bool:
+        if days is None:
+            return False
+        return any(abs(days - target) <= tol for target in targets)
+
+    near_upper = False
+    near_lower = False
+    if last_close is not None:
+        if box_upper is not None:
+            near_upper = abs(last_close - box_upper) / box_upper <= config["SIGNAL_ZONE_PCT"]
+        if box_lower is not None:
+            near_lower = abs(last_close - box_lower) / box_lower <= config["SIGNAL_ZONE_PCT"]
+    in_zone = near_upper or near_lower
+
+    hitei = False
+    tsutsumi = False
+    gap = False
+    if len(daily_sorted) >= 2:
+        prev = daily_sorted.iloc[-2]
+        curr = daily_sorted.iloc[-1]
+        prev_open = float(prev["o"])
+        prev_close = float(prev["c"])
+        curr_open = float(curr["o"])
+        curr_close = float(curr["c"])
+        prev_body = abs(prev_close - prev_open)
+        curr_body = abs(curr_close - curr_open)
+        prev_bull = prev_close > prev_open
+        prev_bear = prev_close < prev_open
+        curr_bull = curr_close > curr_open
+        curr_bear = curr_close < curr_open
+
+        if prev_body > 0:
+            hitei_ratio = curr_body / prev_body
+            hitei = prev_bull and curr_bear and hitei_ratio >= config["HITEI_BODY_RATIO"]
+
+        body_min_prev = min(prev_open, prev_close)
+        body_max_prev = max(prev_open, prev_close)
+        body_min_curr = min(curr_open, curr_close)
+        body_max_curr = max(curr_open, curr_close)
+        tsutsumi = (
+            prev_bear
+            and curr_bull
+            and body_min_curr <= body_min_prev
+            and body_max_curr >= body_max_prev
+        )
+
+        if prev_close > 0:
+            gap = abs(curr_open - prev_close) / prev_close >= config["GAP_PCT"]
+
+    if not in_zone:
+        hitei = False
+        tsutsumi = False
+
+    flags = {
+        "hitei": bool(hitei),
+        "tsutsumi": bool(tsutsumi),
+        "gap": bool(gap),
+        "box_near_upper": bool(near_upper),
+        "box_near_lower": bool(near_lower),
+        "higara_peak_hit": _hit(days_since_peak),
+        "higara_bottom_hit": _hit(days_since_bottom),
+        "higara_peak_days": days_since_peak,
+        "higara_bottom_days": days_since_bottom
+    }
+    return flags, days_since_peak, days_since_bottom
 
 
 def _detect_body_box(monthly_rows: list[tuple]) -> dict | None:
@@ -569,6 +776,29 @@ def build_stock_meta(
         stage, score, score_status, missing_reasons, score_breakdown = compute_stage_score(
             group, monthly_group
         )
+        box_info = _compute_monthly_box_info(monthly_group, TRADE_FLAG_CONFIG)
+        signal_flags, days_since_peak, days_since_bottom = _compute_daily_signal_flags(
+            group,
+            box_info.get("upper"),
+            box_info.get("lower"),
+            TRADE_FLAG_CONFIG
+        )
+        latest_close = None
+        if not group.empty:
+            latest_close = _safe_float(group.sort_values("date")["c"].iloc[-1])
+        if score_breakdown is not None:
+            score_breakdown = {
+                **score_breakdown,
+                "trade_flags": {
+                    "monthly_box_status": box_info.get("status"),
+                    "box_duration": box_info.get("duration"),
+                    "hitei": signal_flags.get("hitei"),
+                    "tsutsumi": signal_flags.get("tsutsumi"),
+                    "gap": signal_flags.get("gap"),
+                    "higara_peak_hit": signal_flags.get("higara_peak_hit"),
+                    "higara_bottom_hit": signal_flags.get("higara_bottom_hit")
+                }
+            }
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
         if score_status == "OK":
             score_ok_count += 1
@@ -586,6 +816,15 @@ def build_stock_meta(
                 "score_status": score_status,
                 "missing_reasons_json": json.dumps(missing_reasons, ensure_ascii=False),
                 "score_breakdown_json": json.dumps(score_breakdown, ensure_ascii=False),
+                "latest_close": latest_close,
+                "monthly_box_status": box_info.get("status"),
+                "box_duration": box_info.get("duration"),
+                "box_upper": box_info.get("upper"),
+                "box_lower": box_info.get("lower"),
+                "ma20_monthly_trend": box_info.get("ma20_trend"),
+                "days_since_peak": days_since_peak,
+                "days_since_bottom": days_since_bottom,
+                "signal_flags": json.dumps(signal_flags, ensure_ascii=False),
                 "updated_at": now
             }
         )
@@ -755,7 +994,48 @@ def ingest() -> None:
 
         conn.register("meta_df", meta)
         conn.execute(
-            "INSERT INTO stock_meta SELECT code, name, stage, score, reason, score_status, missing_reasons_json, score_breakdown_json, updated_at FROM meta_df"
+            """
+            INSERT INTO stock_meta (
+                code,
+                name,
+                stage,
+                score,
+                reason,
+                score_status,
+                missing_reasons_json,
+                score_breakdown_json,
+                latest_close,
+                monthly_box_status,
+                box_duration,
+                box_upper,
+                box_lower,
+                ma20_monthly_trend,
+                days_since_peak,
+                days_since_bottom,
+                signal_flags,
+                updated_at
+            )
+            SELECT
+                code,
+                name,
+                stage,
+                score,
+                reason,
+                score_status,
+                missing_reasons_json,
+                score_breakdown_json,
+                latest_close,
+                monthly_box_status,
+                box_duration,
+                box_upper,
+                box_lower,
+                ma20_monthly_trend,
+                days_since_peak,
+                days_since_bottom,
+                signal_flags,
+                updated_at
+            FROM meta_df
+            """
         )
 
         conn.execute("INSERT INTO tickers SELECT code, name FROM meta_df")

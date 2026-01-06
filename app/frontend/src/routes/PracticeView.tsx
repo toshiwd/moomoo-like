@@ -1952,7 +1952,7 @@ export default function PracticeView() {
                 onClick={() => togglePanel(panelCollapsed ? false : true)}
                 aria-label={panelCollapsed ? "パネルを開く" : "パネルを閉じる"}
               >
-                {panelCollapsed ? "⇐ パネル" : "⇒ パネル"}
+                {panelCollapsed ? "← パネル" : "→ パネル"}
               </button>
             </div>
           </div>
@@ -2131,7 +2131,7 @@ export default function PracticeView() {
                 onClick={() => togglePanel(true)}
                 aria-label="パネルを閉じる"
               >
-                ⇐
+                →
               </button>
               </div>
               {!panelCollapsed && (

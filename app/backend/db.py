@@ -81,6 +81,15 @@ def init_schema() -> None:
                 score_status TEXT,
                 missing_reasons_json TEXT,
                 score_breakdown_json TEXT,
+                latest_close REAL,
+                monthly_box_status TEXT,
+                box_duration INTEGER,
+                box_upper REAL,
+                box_lower REAL,
+                ma20_monthly_trend INTEGER,
+                days_since_peak INTEGER,
+                days_since_bottom INTEGER,
+                signal_flags TEXT,
                 updated_at TIMESTAMP
             );
             """
@@ -88,3 +97,12 @@ def init_schema() -> None:
         conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS score_status TEXT;")
         conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS missing_reasons_json TEXT;")
         conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS score_breakdown_json TEXT;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS latest_close REAL;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS monthly_box_status TEXT;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS box_duration INTEGER;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS box_upper REAL;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS box_lower REAL;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS ma20_monthly_trend INTEGER;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS days_since_peak INTEGER;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS days_since_bottom INTEGER;")
+        conn.execute("ALTER TABLE stock_meta ADD COLUMN IF NOT EXISTS signal_flags TEXT;")

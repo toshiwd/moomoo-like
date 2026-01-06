@@ -7,6 +7,7 @@ import DetailChart from "../components/DetailChart";
 import Toast from "../components/Toast";
 import TopNav from "../components/TopNav";
 import { MaSetting, useStore } from "../store";
+import { computeSignalMetrics } from "../utils/signals";
 import {
   buildConsultationPack,
   ConsultationSort,
@@ -113,6 +114,20 @@ const computeMA = (candles: Candle[], period: number) => {
   return data;
 };
 
+const getRangeStartTime = (candles: Candle[], rangeMonths?: number | null) => {
+  if (!rangeMonths || rangeMonths <= 0) return null;
+  if (!candles.length) return null;
+  const lastTime = candles[candles.length - 1]?.time;
+  if (!Number.isFinite(lastTime)) return null;
+  const anchor = new Date(lastTime * 1000);
+  if (Number.isNaN(anchor.getTime())) return null;
+  const start = new Date(
+    Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), anchor.getUTCDate())
+  );
+  start.setUTCMonth(start.getUTCMonth() - rangeMonths);
+  return Math.floor(start.getTime() / 1000);
+};
+
 const buildCandles = (series: number[][]) => {
   const rows: Candle[] = [];
   for (const row of series) {
@@ -152,6 +167,10 @@ const useInView = (rootMargin = "220px") => {
 type RankChartCardProps = {
   item: RankItem;
   index: number;
+  series: number[][];
+  status?: "idle" | "loading" | "success" | "empty" | "error";
+  maSettings: MaSetting[];
+  rangeMonths?: number | null;
   onToggleFavorite: (code: string, isFavorite: boolean) => void;
   onOpenDetail: (code: string) => void;
   selected: boolean;
@@ -161,6 +180,10 @@ type RankChartCardProps = {
 const RankChartCard = memo(function RankChartCard({
   item,
   index,
+  series,
+  status,
+  maSettings,
+  rangeMonths,
   onToggleFavorite,
   onOpenDetail,
   selected,
@@ -172,26 +195,45 @@ const RankChartCard = memo(function RankChartCard({
   const hoverPendingRef = useRef<number | null>(null);
   const hoverValueRef = useRef<number | null>(null);
 
-  const candles = useMemo(() => buildCandles(item.series ?? []), [item.series]);
+  const candlesAll = useMemo(() => buildCandles(series ?? []), [series]);
+  const rangeStart = useMemo(
+    () => getRangeStartTime(candlesAll, rangeMonths),
+    [candlesAll, rangeMonths]
+  );
+  const candles = useMemo(() => {
+    if (rangeStart == null) return candlesAll;
+    return candlesAll.filter((bar) => bar.time >= rangeStart);
+  }, [candlesAll, rangeStart]);
   const volume = useMemo<VolumePoint[]>(() => [], []);
+  const resolvedMaSettings = maSettings.length ? maSettings : RANK_MA_SETTINGS;
   const maLines = useMemo(
     () =>
-      RANK_MA_SETTINGS.map((setting) => ({
+      resolvedMaSettings.map((setting) => ({
         key: setting.key,
         label: setting.label,
         period: setting.period,
         color: setting.color,
         visible: setting.visible,
         lineWidth: setting.lineWidth,
-        data: computeMA(candles, setting.period)
+        data: computeMA(candlesAll, setting.period)
       })),
-    [candles]
+    [candlesAll, resolvedMaSettings]
   );
-
+  const rangedMaLines = useMemo(() => {
+    if (rangeStart == null) return maLines;
+    return maLines.map((line) => ({
+      ...line,
+      data: line.data.filter((point) => point.time >= rangeStart)
+    }));
+  }, [maLines, rangeStart]);
   const barsForInfo = useMemo(
     () => candles.map((bar) => ({ time: bar.time, close: bar.close })),
     [candles]
   );
+  const maSignals = useMemo(() => {
+    if (!series?.length) return [];
+    return computeSignalMetrics(series, 4).signals;
+  }, [series]);
 
   const scheduleHoverTime = useCallback((time: number | null, _point?: { x: number; y: number } | null) => {
     hoverPendingRef.current = time;
@@ -216,7 +258,12 @@ const RankChartCard = memo(function RankChartCard({
   );
 
   const scoreText = Number.isFinite(item.total_score ?? NaN) ? item.total_score?.toFixed(1) : "--";
-  const badges = item.badges ?? [];
+  const loadingLabel =
+    status === "error"
+      ? "読み込み失敗"
+      : status === "empty"
+      ? "データなし"
+      : "読み込み中...";
   const isFavorite = Boolean(item.is_favorite);
   return (
     <div
@@ -262,24 +309,29 @@ const RankChartCard = memo(function RankChartCard({
           </button>
         </div>
       </div>
-      {badges.length > 0 && (
-        <div className="rank-badges">
-          {badges.slice(0, 6).map((badge) => (
-            <span className="signal-chip" key={`${item.code}-${badge}`}>
-              {badge}
-            </span>
-          ))}
+      {maSignals.length > 0 && (
+        <div className="tile-signal-row">
+          <div className="signal-chips">
+            {maSignals.slice(0, 4).map((signal) => (
+              <span
+                className={`signal-chip ${signal.kind === "warning" ? "warning" : "achieved"}`}
+                key={`${item.code}-${signal.label}`}
+              >
+                {signal.label}
+              </span>
+            ))}
+          </div>
         </div>
       )}
       <div className="tile-chart">
         {!inView && <div className="rank-chart-placeholder" />}
-        {inView && candles.length === 0 && <div className="tile-loading">No data</div>}
+        {inView && candles.length === 0 && <div className="tile-loading">{loadingLabel}</div>}
         {inView && candles.length > 0 && (
           <>
             <DetailChart
               candles={candles}
               volume={volume}
-              maLines={maLines}
+              maLines={rangedMaLines}
               showVolume={false}
               boxes={[]}
               showBoxes={false}
@@ -300,9 +352,13 @@ export default function RankingView() {
   const setFavoriteLocal = useStore((state) => state.setFavoriteLocal);
   const ensureBarsForVisible = useStore((state) => state.ensureBarsForVisible);
   const barsCache = useStore((state) => state.barsCache);
+  const barsStatus = useStore((state) => state.barsStatus);
   const boxesCache = useStore((state) => state.boxesCache);
+  const maSettings = useStore((state) => state.maSettings);
 
   const [dir, setDir] = useState<"up" | "down">("up");
+  const [timeframe, setTimeframe] = useState<"monthly" | "weekly" | "daily">("weekly");
+  const [rangeMonths, setRangeMonths] = useState(12);
   const [items, setItems] = useState<RankItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -345,6 +401,16 @@ export default function RankingView() {
   }, [backendReady, dir]);
 
   useEffect(() => {
+    if (!backendReady) return;
+    if (!items.length) return;
+    ensureBarsForVisible(
+      timeframe,
+      items.map((item) => item.code),
+      "ranking"
+    );
+  }, [backendReady, ensureBarsForVisible, items, timeframe]);
+
+  useEffect(() => {
     if (!items.length) {
       setSelectedCodes([]);
       return;
@@ -363,6 +429,12 @@ export default function RankingView() {
   }, [consultVisible]);
 
   const selectedSet = useMemo(() => new Set(selectedCodes), [selectedCodes]);
+  const rangeOptions = [
+    { label: "3M", months: 3 },
+    { label: "6M", months: 6 },
+    { label: "1Y", months: 12 },
+    { label: "2Y", months: 24 }
+  ];
 
   const toggleSelect = useCallback((code: string) => {
     setSelectedCodes((prev) => {
@@ -485,6 +557,28 @@ export default function RankingView() {
         </div>
         <div className="top-bar-controls">
           <div className="top-bar-left">
+            <div className="segmented timeframe-segment">
+              {(["monthly", "weekly", "daily"] as const).map((value) => (
+                <button
+                  key={value}
+                  className={timeframe === value ? "active" : ""}
+                  onClick={() => setTimeframe(value)}
+                >
+                  {value === "monthly" ? "月足" : value === "weekly" ? "週足" : "日足"}
+                </button>
+              ))}
+            </div>
+            <div className="segmented segmented-compact range-segment">
+              {rangeOptions.map((option) => (
+                <button
+                  key={option.label}
+                  className={rangeMonths === option.months ? "active" : ""}
+                  onClick={() => setRangeMonths(option.months)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
             <div className="segmented">
               <button
                 className={dir === "up" ? "active" : ""}
@@ -533,17 +627,33 @@ export default function RankingView() {
               <div className="rank-status">ランキングがありません。</div>
             )}
             <div className="rank-grid">
-              {items.map((item, index) => (
-                <RankChartCard
-                  key={item.code}
-                  item={item}
-                  index={index}
-                  onToggleFavorite={handleToggleFavorite}
-                  onOpenDetail={(code) => navigate(`/detail/${code}`)}
-                  selected={selectedSet.has(item.code)}
-                  onToggleSelect={toggleSelect}
-                />
-              ))}
+              {items.map((item, index) => {
+                const payload = barsCache[timeframe][item.code] ?? null;
+                const status = barsStatus[timeframe][item.code];
+                const series =
+                  payload && payload.bars?.length ? payload.bars : item.series ?? [];
+                const timeframeMa =
+                  timeframe === "daily"
+                    ? maSettings.daily
+                    : timeframe === "weekly"
+                    ? maSettings.weekly
+                    : maSettings.monthly;
+                return (
+                  <RankChartCard
+                    key={item.code}
+                    item={item}
+                    index={index}
+                    series={series}
+                    status={status}
+                    maSettings={timeframeMa ?? []}
+                    rangeMonths={rangeMonths}
+                    onToggleFavorite={handleToggleFavorite}
+                    onOpenDetail={(code) => navigate(`/detail/${code}`)}
+                    selected={selectedSet.has(item.code)}
+                    onToggleSelect={toggleSelect}
+                  />
+                );
+              })}
             </div>
           </>
         )}

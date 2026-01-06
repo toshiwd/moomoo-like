@@ -19,7 +19,6 @@ import {
   ConsultationTimeframe
 } from "../utils/consultation";
 
-const TILE_HEIGHT = 220;
 const GRID_GAP = 12;
 const KEEP_LIMIT = 24;
 type Timeframe = "monthly" | "weekly" | "daily";
@@ -65,6 +64,7 @@ export default function GridView() {
   const barsCache = useStore((state) => state.barsCache);
   const boxesCache = useStore((state) => state.boxesCache);
   const columns = useStore((state) => state.settings.columns);
+  const rows = useStore((state) => state.settings.rows);
   const search = useStore((state) => state.settings.search);
   const gridScrollTop = useStore((state) => state.settings.gridScrollTop);
   const gridTimeframe = useStore((state) => state.settings.gridTimeframe);
@@ -73,6 +73,7 @@ export default function GridView() {
   const removeKeep = useStore((state) => state.removeKeep);
   const clearKeep = useStore((state) => state.clearKeep);
   const setColumns = useStore((state) => state.setColumns);
+  const setRows = useStore((state) => state.setRows);
   const setSearch = useStore((state) => state.setSearch);
   const setGridScrollTop = useStore((state) => state.setGridScrollTop);
   const setGridTimeframe = useStore((state) => state.setGridTimeframe);
@@ -467,6 +468,7 @@ export default function GridView() {
 
   const gridHeight = Math.max(200, size.height);
   const gridWidth = Math.max(0, size.width);
+  const rowHeight = Math.max(1, Math.floor(gridHeight / Math.max(1, rows)));
   const innerHeight = Math.max(0, gridHeight);
   const rowCount = Math.ceil(sortedTickers.length / columns);
   const columnWidth = gridWidth > 0 ? gridWidth / columns : 300;
@@ -479,7 +481,7 @@ export default function GridView() {
     visibleColumnStopIndex
   }: GridOnItemsRenderedProps) => {
     if (!backendReady) return;
-    const rowsPerViewport = Math.max(1, Math.floor(gridHeight / (TILE_HEIGHT + GRID_GAP)));
+    const rowsPerViewport = Math.max(1, Math.floor(gridHeight / rowHeight));
     const prefetchStop = visibleRowStopIndex + rowsPerViewport;
     const start = visibleRowStartIndex * columns + visibleColumnStartIndex;
     const stop = Math.min(
@@ -714,8 +716,9 @@ export default function GridView() {
 
   const resetDisplay = useCallback(() => {
     setColumns(3);
+    setRows(3);
     setShowBoxes(true);
-  }, [setColumns, setShowBoxes]);
+  }, [setColumns, setRows, setShowBoxes]);
 
   const updateSetting = (frame: Timeframe, index: number, patch: Partial<MaSetting>) => {
     updateMaSetting(frame, index, patch);
@@ -1177,13 +1180,27 @@ export default function GridView() {
                   <div className="popover-section">
                     <div className="popover-title">列数</div>
                     <div className="segmented">
-                      {[2, 3, 4].map((count) => (
+                      {[1, 2, 3, 4].map((count) => (
                         <button
                           key={count}
                           className={columns === count ? "active" : ""}
-                          onClick={() => setColumns(count as 2 | 3 | 4)}
+                          onClick={() => setColumns(count as 1 | 2 | 3 | 4)}
                         >
                           {count}列
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="popover-section">
+                    <div className="popover-title">行数</div>
+                    <div className="segmented">
+                      {[1, 2, 3, 4, 5, 6].map((count) => (
+                        <button
+                          key={count}
+                          className={rows === count ? "active" : ""}
+                          onClick={() => setRows(count as 1 | 2 | 3 | 4 | 5 | 6)}
+                        >
+                          {count}行
                         </button>
                       ))}
                     </div>
@@ -1356,7 +1373,7 @@ export default function GridView() {
               columnWidth={columnWidth}
               height={innerHeight}
               rowCount={rowCount}
-              rowHeight={TILE_HEIGHT + GRID_GAP}
+              rowHeight={rowHeight}
               width={gridWidth}
               overscanRowCount={2}
               itemData={sortedTickers}

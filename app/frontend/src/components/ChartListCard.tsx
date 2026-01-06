@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BarsPayload, MaSetting } from "../store";
+import type { SignalChip } from "../utils/signals";
 import ChartInfoPanel from "./ChartInfoPanel";
 import DetailChart from "./DetailChart";
 
@@ -29,7 +30,9 @@ type ChartListCardProps = {
   payload?: BarsPayload | null;
   status?: "idle" | "loading" | "success" | "empty" | "error";
   maSettings: MaSetting[];
+  rangeMonths?: number | null;
   onOpenDetail: (code: string) => void;
+  signals?: SignalChip[];
   action?: ActionConfig | null;
 };
 
@@ -129,13 +132,29 @@ const computeMA = (candles: Candle[], period: number) => {
   return data;
 };
 
+const getRangeStartTime = (candles: Candle[], rangeMonths?: number | null) => {
+  if (!rangeMonths || rangeMonths <= 0) return null;
+  if (!candles.length) return null;
+  const lastTime = candles[candles.length - 1]?.time;
+  if (!Number.isFinite(lastTime)) return null;
+  const anchor = new Date(lastTime * 1000);
+  if (Number.isNaN(anchor.getTime())) return null;
+  const start = new Date(
+    Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), anchor.getUTCDate())
+  );
+  start.setUTCMonth(start.getUTCMonth() - rangeMonths);
+  return Math.floor(start.getTime() / 1000);
+};
+
 const ChartListCard = memo(function ChartListCard({
   code,
   name,
   payload,
   status,
   maSettings,
+  rangeMonths,
   onOpenDetail,
+  signals,
   action
 }: ChartListCardProps) {
   const [hoverTime, setHoverTime] = useState<number | null>(null);
@@ -143,8 +162,20 @@ const ChartListCard = memo(function ChartListCard({
   const hoverPendingRef = useRef<number | null>(null);
   const hoverValueRef = useRef<number | null>(null);
 
-  const candles = useMemo(() => buildCandles(payload?.bars ?? []), [payload]);
-  const volume = useMemo(() => buildVolume(payload?.bars ?? []), [payload]);
+  const candlesAll = useMemo(() => buildCandles(payload?.bars ?? []), [payload]);
+  const volumeAll = useMemo(() => buildVolume(payload?.bars ?? []), [payload]);
+  const rangeStart = useMemo(
+    () => getRangeStartTime(candlesAll, rangeMonths),
+    [candlesAll, rangeMonths]
+  );
+  const candles = useMemo(() => {
+    if (rangeStart == null) return candlesAll;
+    return candlesAll.filter((bar) => bar.time >= rangeStart);
+  }, [candlesAll, rangeStart]);
+  const volume = useMemo(() => {
+    if (rangeStart == null) return volumeAll;
+    return volumeAll.filter((bar) => bar.time >= rangeStart);
+  }, [volumeAll, rangeStart]);
   const maLines = useMemo(
     () =>
       maSettings.map((setting) => ({
@@ -154,10 +185,17 @@ const ChartListCard = memo(function ChartListCard({
         color: setting.color,
         visible: setting.visible,
         lineWidth: setting.lineWidth,
-        data: computeMA(candles, setting.period)
+        data: computeMA(candlesAll, setting.period)
       })),
-    [candles, maSettings]
+    [candlesAll, maSettings]
   );
+  const rangedMaLines = useMemo(() => {
+    if (rangeStart == null) return maLines;
+    return maLines.map((line) => ({
+      ...line,
+      data: line.data.filter((point) => point.time >= rangeStart)
+    }));
+  }, [maLines, rangeStart]);
   const barsForInfo = useMemo(
     () => candles.map((bar) => ({ time: bar.time, close: bar.close })),
     [candles]
@@ -189,10 +227,10 @@ const ChartListCard = memo(function ChartListCard({
   const showLoading = !payload || !payload.bars?.length;
   const loadingLabel =
     status === "error"
-      ? "“Ç‚İ‚İ¸”s"
+      ? "èª­ã¿è¾¼ã¿å¤±æ•—"
       : status === "empty"
-      ? "ƒf[ƒ^‚È‚µ"
-      : "“Ç‚İ‚İ’†...";
+      ? "ãƒ‡ãƒ¼ã‚¿ãªã—"
+      : "èª­ã¿è¾¼ã¿ä¸­...";
 
   return (
     <div className="tile rank-tile" role="button" tabIndex={0} onClick={handleOpen}>
@@ -219,6 +257,20 @@ const ChartListCard = memo(function ChartListCard({
           )}
         </div>
       </div>
+      {signals?.length ? (
+        <div className="tile-signal-row">
+          <div className="signal-chips">
+            {signals.slice(0, 4).map((signal) => (
+              <span
+                key={`${code}-${signal.label}`}
+                className={`signal-chip ${signal.kind === "warning" ? "warning" : "achieved"}`}
+              >
+                {signal.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
       <div className="tile-chart">
         {showLoading && <div className="tile-loading">{loadingLabel}</div>}
         {!showLoading && (
@@ -226,7 +278,7 @@ const ChartListCard = memo(function ChartListCard({
             <DetailChart
               candles={candles}
               volume={volume}
-              maLines={maLines}
+              maLines={rangedMaLines}
               showVolume={false}
               boxes={[]}
               showBoxes={false}

@@ -121,7 +121,8 @@ type StatusMap = {
 };
 
 type Settings = {
-  columns: 2 | 3 | 4;
+  columns: 1 | 2 | 3 | 4;
+  rows: 1 | 2 | 3 | 4 | 5 | 6;
   search: string;
   gridScrollTop: number;
   gridTimeframe: GridTimeframe;
@@ -166,6 +167,7 @@ type StoreState = {
     reason?: string
   ) => Promise<void>;
   setColumns: (columns: Settings["columns"]) => void;
+  setRows: (rows: Settings["rows"]) => void;
   setSearch: (search: string) => void;
   setGridScrollTop: (value: number) => void;
   setGridTimeframe: (value: Settings["gridTimeframe"]) => void;
@@ -207,6 +209,8 @@ const MAX_BATCH_LIMIT = 2000;
 const WEEKLY_DAILY_FACTOR = 7;
 const BATCH_TTL_MS = 60_000;
 const KEEP_STORAGE_KEY = "keepList";
+const GRID_COLS_KEY = "gridCols";
+const GRID_ROWS_KEY = "gridRows";
 const inFlightBatchRequests = new Map<
   string,
   { promise: Promise<void>; controller: AbortController }
@@ -422,6 +426,24 @@ const getInitialTimeframe = (): Settings["gridTimeframe"] => {
   return saved === "daily" || saved === "weekly" ? (saved as Settings["gridTimeframe"]) : "monthly";
 };
 
+const getInitialColumns = (): Settings["columns"] => {
+  if (typeof window === "undefined") return 3;
+  const saved = Number(window.localStorage.getItem(GRID_COLS_KEY));
+  if (saved >= 1 && saved <= 4) {
+    return saved as Settings["columns"];
+  }
+  return 3;
+};
+
+const getInitialRows = (): Settings["rows"] => {
+  if (typeof window === "undefined") return 3;
+  const saved = Number(window.localStorage.getItem(GRID_ROWS_KEY));
+  if (saved >= 1 && saved <= 6) {
+    return saved as Settings["rows"];
+  }
+  return 3;
+};
+
 const getInitialSortKey = (): SortKey => {
   if (typeof window === "undefined") return "chg1D";
   const saved = window.localStorage.getItem("sortKey");
@@ -491,7 +513,8 @@ export const useStore = create<StoreState>((set, get) => ({
     monthly: loadSettings("monthly")
   },
   settings: {
-    columns: 3,
+    columns: getInitialColumns(),
+    rows: getInitialRows(),
     search: "",
     gridScrollTop: 0,
     gridTimeframe: getInitialTimeframe(),
@@ -956,7 +979,16 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
   setColumns: (columns) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(GRID_COLS_KEY, String(columns));
+    }
     set((state) => ({ settings: { ...state.settings, columns } }));
+  },
+  setRows: (rows) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(GRID_ROWS_KEY, String(rows));
+    }
+    set((state) => ({ settings: { ...state.settings, rows } }));
   },
   setSearch: (search) => {
     set((state) => ({ settings: { ...state.settings, search } }));

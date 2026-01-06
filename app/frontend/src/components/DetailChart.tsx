@@ -117,6 +117,28 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
     return null;
   };
 
+  const formatChartDate = (value: any) => {
+    if (!value) return "";
+    if (typeof value === "number") {
+      const date = new Date(value * 1000);
+      if (Number.isNaN(date.getTime())) return "";
+      const yy = String(date.getUTCFullYear() % 100).padStart(2, "0");
+      const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(date.getUTCDate()).padStart(2, "0");
+      return `${yy}/${mm}/${dd}`;
+    }
+    if (typeof value === "object") {
+      const data = value as { year?: number; month?: number; day?: number };
+      if (data.year && data.month && data.day) {
+        const yy = String(data.year % 100).padStart(2, "0");
+        const mm = String(data.month).padStart(2, "0");
+        const dd = String(data.day).padStart(2, "0");
+        return `${yy}/${mm}/${dd}`;
+      }
+    }
+    return "";
+  };
+
   const findNearestCandle = (time: number) => {
     const items = candlesRef.current;
     if (!items.length) return null;
@@ -427,6 +449,10 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           background: { color: "#0f1628" },
           textColor: "#cbd5f5"
         },
+        localization: {
+          locale: "ja-JP",
+          timeFormatter: formatChartDate
+        },
         grid: {
           vertLines: { color: "rgba(255,255,255,0.06)" },
           horzLines: { color: "rgba(255,255,255,0.06)" }
@@ -439,7 +465,10 @@ const DetailChart = forwardRef<DetailChartHandle, DetailChartProps>(function Det
           borderVisible: false,
           scaleMargins: { top: 0.08, bottom: 0.25 }
         },
-        timeScale: { borderVisible: false }
+        timeScale: {
+          borderVisible: false,
+          tickMarkFormatter: formatChartDate
+        }
       });
 
       const candleSeries = chart.addCandlestickSeries({

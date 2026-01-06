@@ -1250,9 +1250,9 @@ body {
 }
 
 .tile.is-selected {
-  border-color: rgba(56, 189, 248, 0.8);
-  background: rgba(14, 116, 144, 0.18);
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.4);
+  border-color: rgba(148, 163, 184, 0.4);
+  background: rgba(56, 189, 248, 0.08);
+  box-shadow: inset 3px 0 0 rgba(56, 189, 248, 0.5);
 }
 
 .tile-id {

@@ -731,6 +731,8 @@ export default function PracticeView() {
   const hoverRafRef = useRef<number | null>(null);
   const hoverTimePendingRef = useRef<number | null>(null);
   const hoverTimeRef = useRef<number | null>(null);
+  const crosshairSyncRef = useRef<{ source: Timeframe; time: number | null } | null>(null);
+  const crosshairSyncRafRef = useRef<number | null>(null);
 
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
@@ -1337,6 +1339,10 @@ export default function PracticeView() {
         window.cancelAnimationFrame(hoverRafRef.current);
         hoverRafRef.current = null;
       }
+      if (crosshairSyncRafRef.current !== null) {
+        window.cancelAnimationFrame(crosshairSyncRafRef.current);
+        crosshairSyncRafRef.current = null;
+      }
     };
   }, []);
 
@@ -1352,6 +1358,34 @@ export default function PracticeView() {
     });
   };
 
+  const syncCrosshair = (source: Timeframe, time: number | null) => {
+    const lock = crosshairSyncRef.current;
+    if (lock && lock.source !== source) {
+      return;
+    }
+    crosshairSyncRef.current = { source, time };
+    scheduleHoverTime(time);
+    if (source !== "daily") {
+      dailyChartRef.current?.setCrosshair(time, null);
+    }
+    if (source !== "weekly") {
+      weeklyChartRef.current?.setCrosshair(time, null);
+    }
+    if (source !== "monthly") {
+      monthlyChartRef.current?.setCrosshair(time, null);
+    }
+    if (crosshairSyncRafRef.current !== null) {
+      window.cancelAnimationFrame(crosshairSyncRafRef.current);
+    }
+    crosshairSyncRafRef.current = window.requestAnimationFrame(() => {
+      crosshairSyncRafRef.current = null;
+      const latest = crosshairSyncRef.current;
+      if (latest && latest.source === source && latest.time === time) {
+        crosshairSyncRef.current = null;
+      }
+    });
+  };
+
   const startResize = () => (event: ReactMouseEvent | ReactTouchEvent) => {
     event.preventDefault();
     resizingRef.current = true;
@@ -1364,21 +1398,15 @@ export default function PracticeView() {
   };
 
   const handleDailyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
-    scheduleHoverTime(time);
-    weeklyChartRef.current?.setCrosshair(time, null);
-    monthlyChartRef.current?.setCrosshair(time, null);
+    syncCrosshair("daily", time);
   };
 
   const handleWeeklyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
-    scheduleHoverTime(time);
-    dailyChartRef.current?.setCrosshair(time, null);
-    monthlyChartRef.current?.setCrosshair(time, null);
+    syncCrosshair("weekly", time);
   };
 
   const handleMonthlyCrosshair = (time: number | null, _point?: { x: number; y: number } | null) => {
-    scheduleHoverTime(time);
-    dailyChartRef.current?.setCrosshair(time, null);
-    weeklyChartRef.current?.setCrosshair(time, null);
+    syncCrosshair("monthly", time);
   };
 
   const pushTrade = (trade: PracticeTrade) => {
@@ -1541,7 +1569,7 @@ export default function PracticeView() {
           setSessionNotes("");
           setCursorTime(null);
           setMaxUnlockedTime(null);
-          setHover({ time: null, source: null });
+          scheduleHoverTime(null);
         }
         refreshSessions();
       });
@@ -1881,10 +1909,7 @@ export default function PracticeView() {
   };
 
   const handleJumpToTrade = (time: number) => {
-    dailyChartRef.current?.setCrosshair(time);
-    weeklyChartRef.current?.setCrosshair(time);
-    monthlyChartRef.current?.setCrosshair(time);
-    scheduleHoverTime(time);
+    syncCrosshair("daily", time);
   };
 
   const dailyEmptyMessage = dailyCandles.length === 0 ? dailyErrors[0] ?? "No data" : null;
@@ -2051,7 +2076,7 @@ export default function PracticeView() {
                     showVolume={dailyVolume.length > 0}
                     boxes={[]}
                     showBoxes={false}
-                    cursorTime={cursorCandle?.time ?? null}
+                    cursorTime={hoverTime == null ? cursorCandle?.time ?? null : null}
                       positionOverlay={{
                       dailyPositions,
                       tradeMarkers,
@@ -2102,7 +2127,7 @@ export default function PracticeView() {
                       showVolume={false}
                       boxes={[]}
                       showBoxes={false}
-                      cursorTime={weeklyCursorTime}
+                      cursorTime={hoverTime == null ? weeklyCursorTime : null}
                       partialTimes={weeklyPartialTimes}
                       onCrosshairMove={handleWeeklyCrosshair}
                     />
@@ -2127,7 +2152,7 @@ export default function PracticeView() {
                       showVolume={false}
                       boxes={[]}
                       showBoxes={false}
-                      cursorTime={monthlyCursorTime}
+                      cursorTime={hoverTime == null ? monthlyCursorTime : null}
                       partialTimes={monthlyPartialTimes}
                       onCrosshairMove={handleMonthlyCrosshair}
                     />

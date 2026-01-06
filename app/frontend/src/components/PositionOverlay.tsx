@@ -60,9 +60,10 @@ const formatLots = (value: number) => {
 const formatDate = (time: number) => {
   const date = new Date(time * 1000);
   const year = date.getUTCFullYear();
+  const yy = String(year % 100).padStart(2, "0");
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
   const day = String(date.getUTCDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  return `${yy}/${month}/${day}`;
 };
 
 const findClosestTime = (times: number[], time: number | null) => {

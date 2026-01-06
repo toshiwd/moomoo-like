@@ -5,6 +5,7 @@ import ChartListCard from "../components/ChartListCard";
 import TopNav from "../components/TopNav";
 import Toast from "../components/Toast";
 import { useStore } from "../store";
+import { computeSignalMetrics } from "../utils/signals";
 
 type CandidateItem = {
   code: string;
@@ -26,7 +27,8 @@ export default function CandidatesView() {
 
   const [search, setSearch] = useState("");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const timeframe = "monthly" as const;
+  const [timeframe, setTimeframe] = useState<"monthly" | "weekly" | "daily">("monthly");
+  const [rangeMonths, setRangeMonths] = useState(12);
 
   useEffect(() => {
     if (!backendReady) return;
@@ -58,6 +60,25 @@ export default function CandidatesView() {
   }, [items, search]);
 
   const filteredCodes = useMemo(() => filtered.map((item) => item.code), [filtered]);
+  const signalMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof computeSignalMetrics>["signals"]>();
+    filtered.forEach((item) => {
+      const payload = barsCache[timeframe][item.code];
+      if (!payload?.bars?.length) return;
+      const signals = computeSignalMetrics(payload.bars, 4).signals;
+      if (signals.length) {
+        map.set(item.code, signals);
+      }
+    });
+    return map;
+  }, [filtered, barsCache, timeframe]);
+
+  const rangeOptions = [
+    { label: "3M", months: 3 },
+    { label: "6M", months: 6 },
+    { label: "1Y", months: 12 },
+    { label: "2Y", months: 24 }
+  ];
 
   useEffect(() => {
     if (!backendReady) return;
@@ -75,6 +96,28 @@ export default function CandidatesView() {
         </div>
         <div className="top-bar-controls">
           <div className="top-bar-left">
+            <div className="segmented timeframe-segment">
+              {(["monthly", "weekly", "daily"] as const).map((value) => (
+                <button
+                  key={value}
+                  className={timeframe === value ? "active" : ""}
+                  onClick={() => setTimeframe(value)}
+                >
+                  {value === "monthly" ? "月足" : value === "weekly" ? "週足" : "日足"}
+                </button>
+              ))}
+            </div>
+            <div className="segmented segmented-compact range-segment">
+              {rangeOptions.map((option) => (
+                <button
+                  key={option.label}
+                  className={rangeMonths === option.months ? "active" : ""}
+                  onClick={() => setRangeMonths(option.months)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
             <div className="search-field">
               <input
                 className="search-input"
@@ -108,6 +151,8 @@ export default function CandidatesView() {
                 payload={payload}
                 status={status}
                 maSettings={maSettings[timeframe]}
+                rangeMonths={rangeMonths}
+                signals={signalMap.get(item.code) ?? []}
                 onOpenDetail={(code) => navigate(`/detail/${code}`)}
                 action={{
                   label: "候",

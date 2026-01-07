@@ -7,14 +7,25 @@ param(
 try {
   $ErrorActionPreference = 'Stop'
 
-  $root = Split-Path -Parent $PSScriptRoot
+  $scriptDir = $PSScriptRoot
+  if (-not $scriptDir) {
+    $scriptPath = if ($PSCommandPath) { $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { $MyInvocation.MyCommand.Path } else { $null }
+    if (-not $scriptPath) { throw 'Cannot determine script path.' }
+    $scriptDir = Split-Path -Parent $scriptPath
+  }
+
+  $scriptDir = (Resolve-Path -LiteralPath $scriptDir).Path
+  $root = Split-Path -Parent $scriptDir
+  if (-not $root) { throw 'Cannot determine repo root.' }
   $frontend = Join-Path $root 'app\frontend'
   Set-Location $frontend
 
   $lockFile = 'package-lock.json'
-  if (-not (Test-Path $lockFile)) { throw 'package-lock.json が見つかりません。' }
+  if (-not (Test-Path $lockFile)) { throw 'package-lock.json not found.' }
 
-  $stateDir = Join-Path $env:APPDATA 'meemee-screener\state'
+  $appDataRoot = if ($env:APPDATA) { $env:APPDATA } elseif ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $root }
+  if (-not $appDataRoot) { throw 'APPDATA/LOCALAPPDATA not set.' }
+  $stateDir = Join-Path $appDataRoot 'meemee-screener\state'
   New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
   $hashName = if ($Mode -eq 'user') { 'user_package_lock.sha256' } else { 'admin_package_lock.sha256' }
@@ -26,18 +37,18 @@ try {
   $tag = if ($Mode -eq 'user') { '[Frontend/User]' } else { '[Frontend/Admin]' }
 
   if ((-not $nodeModulesExists) -or ($curHash -ne $oldHash)) {
-    Write-Host "$tag 依存関係を更新します（npm ci）"
+    Write-Host "$tag Installing frontend dependencies (npm ci)..."
     npm ci
     Set-Content -Path $hashFile -Value $curHash -NoNewline
   } else {
-    Write-Host "$tag 依存関係は変更なし（npm ci スキップ）"
+    Write-Host "$tag Dependencies unchanged. Skipping npm ci."
   }
 
   npm run dev
 } catch {
   $label = if ($Mode -eq 'user') { 'Frontend (User)' } else { 'Frontend (Admin)' }
-  Write-Host "--- $label 起動に失敗 ---" -ForegroundColor Red
+  Write-Host "--- $label failed ---" -ForegroundColor Red
   Write-Host $_
-  Read-Host 'Enterで閉じる'
+  Read-Host 'Press Enter to exit'
   exit 1
 }

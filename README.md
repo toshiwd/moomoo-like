@@ -1,13 +1,13 @@
-﻿# moomoo-like
+﻿# Mee Mee
 
-High-performance stock screener prototype inspired by MOOMOO Desktop.
+Mee Mee (official name: MeeMee Screener) is a high-performance stock screener prototype inspired by MOOMOO Desktop.
 
 ## Windows PowerShell quick start
 
 ### Backend
 
 ```powershell
-cd C:\work\moomoo-like\app\backend
+cd C:\work\meemee-screener\app\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -18,7 +18,7 @@ uvicorn main:app --reload --port 8000
 ### Frontend
 
 ```powershell
-cd C:\work\moomoo-like\app\frontend
+cd C:\work\meemee-screener\app\frontend
 npm install
 npm run dev
 ```

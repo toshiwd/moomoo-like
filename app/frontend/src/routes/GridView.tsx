@@ -1065,8 +1065,8 @@ export default function GridView() {
       <header className="top-bar">
         <div className="top-bar-row top-bar-row-nav">
           <div className="app-brand">
-            <div className="title">Moomoo-like Screener</div>
-            <div className="subtitle">Fast grid with canvas sparklines</div>
+            <div className="title">MeeMee Screener</div>
+            <div className="subtitle">Mee Mee - Fast grid with canvas sparklines</div>
           </div>
           <TopNav />
         </div>

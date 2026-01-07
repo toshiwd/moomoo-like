@@ -17,7 +17,7 @@ try {
 
   . .\.venv\Scripts\Activate.ps1
 
-  $stateDir = Join-Path $env:APPDATA 'moomoo-like\state'
+  $stateDir = Join-Path $env:APPDATA 'meemee-screener\state'
   New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
   $reqFile = 'requirements.txt'

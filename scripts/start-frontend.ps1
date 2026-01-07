@@ -14,7 +14,7 @@ try {
   $lockFile = 'package-lock.json'
   if (-not (Test-Path $lockFile)) { throw 'package-lock.json が見つかりません。' }
 
-  $stateDir = Join-Path $env:APPDATA 'moomoo-like\state'
+  $stateDir = Join-Path $env:APPDATA 'meemee-screener\state'
   New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
   $hashName = if ($Mode -eq 'user') { 'user_package_lock.sha256' } else { 'admin_package_lock.sha256' }

@@ -1,11 +1,12 @@
 ﻿import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import type { CSSProperties } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useBackendReadyState } from "../backendReady";
 import ChartInfoPanel from "../components/ChartInfoPanel";
 import DetailChart from "../components/DetailChart";
 import Toast from "../components/Toast";
-import TopNav from "../components/TopNav";
+import UnifiedListHeader from "../components/UnifiedListHeader";
 import { MaSetting, useStore } from "../store";
 import { computeSignalMetrics } from "../utils/signals";
 import {
@@ -13,6 +14,7 @@ import {
   ConsultationSort,
   ConsultationTimeframe
 } from "../utils/consultation";
+import { downloadChartScreenshots } from "../utils/chartScreenshot";
 
 type RankItem = {
   code: string;
@@ -48,6 +50,7 @@ const RANK_MA_SETTINGS: MaSetting[] = [
   { key: "ma4", label: "MA4", period: 100, visible: true, color: "#a855f7", lineWidth: 1 },
   { key: "ma5", label: "MA5", period: 200, visible: true, color: "#f59e0b", lineWidth: 1 }
 ];
+const SCREENSHOT_LIMIT = 10;
 
 const normalizeDateParts = (year: number, month: number, day: number) => {
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
@@ -347,6 +350,7 @@ const RankChartCard = memo(function RankChartCard({
 
 
 export default function RankingView() {
+  const location = useLocation();
   const navigate = useNavigate();
   const { ready: backendReady } = useBackendReadyState();
   const setFavoriteLocal = useStore((state) => state.setFavoriteLocal);
@@ -355,11 +359,20 @@ export default function RankingView() {
   const barsStatus = useStore((state) => state.barsStatus);
   const boxesCache = useStore((state) => state.boxesCache);
   const maSettings = useStore((state) => state.maSettings);
+  const listTimeframe = useStore((state) => state.settings.listTimeframe);
+  const listRangeMonths = useStore((state) => state.settings.listRangeMonths);
+  const listColumns = useStore((state) => state.settings.listColumns);
+  const listRows = useStore((state) => state.settings.listRows);
+  const setListTimeframe = useStore((state) => state.setListTimeframe);
+  const setListRangeMonths = useStore((state) => state.setListRangeMonths);
+  const setListColumns = useStore((state) => state.setListColumns);
+  const setListRows = useStore((state) => state.setListRows);
 
   const [dir, setDir] = useState<"up" | "down">("up");
-  const [timeframe, setTimeframe] = useState<"monthly" | "weekly" | "daily">("weekly");
-  const [rangeMonths, setRangeMonths] = useState(12);
   const [items, setItems] = useState<RankItem[]>([]);
+  const [search, setSearch] = useState("");
+  const [filterSignalsOnly, setFilterSignalsOnly] = useState(false);
+  const [filterDataOnly, setFilterDataOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -370,6 +383,7 @@ export default function RankingView() {
   const [consultText, setConsultText] = useState("");
   const [consultSort, setConsultSort] = useState<ConsultationSort>("score");
   const [consultBusy, setConsultBusy] = useState(false);
+  const [screenshotBusy, setScreenshotBusy] = useState(false);
   const [consultMeta, setConsultMeta] = useState<{ omitted: number }>({ omitted: 0 });
   const consultTimeframe: ConsultationTimeframe = "monthly";
   const consultBarsCount = 60;
@@ -378,6 +392,84 @@ export default function RankingView() {
       ? "consult-padding-expanded"
       : "consult-padding-mini"
     : "";
+
+  const listStyles = useMemo(
+    () =>
+      ({
+        "--list-cols": listColumns,
+        "--list-rows": listRows
+      } as CSSProperties),
+    [listColumns, listRows]
+  );
+  const listMaSettings =
+    listTimeframe === "daily"
+      ? maSettings.daily
+      : listTimeframe === "weekly"
+      ? maSettings.weekly
+      : maSettings.monthly;
+
+  const sortOptions = useMemo(
+    () => [
+      { value: "up", label: "上昇Top50" },
+      { value: "down", label: "下落Top50" }
+    ],
+    []
+  );
+
+  const filterItems = useMemo(
+    () => [
+      {
+        key: "signals",
+        label: "\u30b7\u30b0\u30ca\u30eb\u3042\u308a",
+        checked: filterSignalsOnly,
+        onToggle: () => setFilterSignalsOnly((prev) => !prev)
+      },
+      {
+        key: "data",
+        label: "\u30c7\u30fc\u30bf\u53d6\u5f97\u6e08\u307f",
+        checked: filterDataOnly,
+        onToggle: () => setFilterDataOnly((prev) => !prev)
+      }
+    ],
+    [filterSignalsOnly, filterDataOnly]
+  );
+
+  const searchResults = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    if (!term) return items;
+    return items.filter((item) => {
+      const codeMatch = item.code.toLowerCase().includes(term);
+      const nameMatch = (item.name ?? "").toLowerCase().includes(term);
+      return codeMatch || nameMatch;
+    });
+  }, [items, search]);
+
+  const signalMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof computeSignalMetrics>["signals"]>();
+    searchResults.forEach((item) => {
+      const payload = barsCache[listTimeframe][item.code] ?? null;
+      const series = payload && payload.bars?.length ? payload.bars : item.series ?? [];
+      if (!series.length) return;
+      const signals = computeSignalMetrics(series, 4).signals;
+      if (signals.length) {
+        map.set(item.code, signals);
+      }
+    });
+    return map;
+  }, [searchResults, barsCache, listTimeframe]);
+
+  const filteredItems = useMemo(() => {
+    if (!filterSignalsOnly && !filterDataOnly) return searchResults;
+    return searchResults.filter((item) => {
+      const payload = barsCache[listTimeframe][item.code] ?? null;
+      const series = payload && payload.bars?.length ? payload.bars : item.series ?? [];
+      const hasData = series.length > 0;
+      if (filterDataOnly && !hasData) return false;
+      if (filterSignalsOnly && !signalMap.has(item.code)) return false;
+      return true;
+    });
+  }, [searchResults, filterSignalsOnly, filterDataOnly, barsCache, listTimeframe, signalMap]);
+  const listCodes = useMemo(() => filteredItems.map((item) => item.code), [filteredItems]);
 
   useEffect(() => {
     if (!backendReady) return;
@@ -402,13 +494,13 @@ export default function RankingView() {
 
   useEffect(() => {
     if (!backendReady) return;
-    if (!items.length) return;
+    if (!searchResults.length) return;
     ensureBarsForVisible(
-      timeframe,
-      items.map((item) => item.code),
+      listTimeframe,
+      searchResults.map((item) => item.code),
       "ranking"
     );
-  }, [backendReady, ensureBarsForVisible, items, timeframe]);
+  }, [backendReady, ensureBarsForVisible, searchResults, listTimeframe]);
 
   useEffect(() => {
     if (!items.length) {
@@ -429,12 +521,6 @@ export default function RankingView() {
   }, [consultVisible]);
 
   const selectedSet = useMemo(() => new Set(selectedCodes), [selectedCodes]);
-  const rangeOptions = [
-    { label: "3M", months: 3 },
-    { label: "6M", months: 6 },
-    { label: "1Y", months: 12 },
-    { label: "2Y", months: 24 }
-  ];
 
   const toggleSelect = useCallback((code: string) => {
     setSelectedCodes((prev) => {
@@ -442,6 +528,19 @@ export default function RankingView() {
       return [...prev, code];
     });
   }, []);
+
+  const handleOpenDetail = useCallback(
+    (code: string) => {
+      try {
+        sessionStorage.setItem("detailListBack", location.pathname);
+        sessionStorage.setItem("detailListCodes", JSON.stringify(listCodes));
+      } catch {
+        // ignore storage failures
+      }
+      navigate(`/detail/${code}`, { state: { from: location.pathname } });
+    },
+    [navigate, location.pathname, listCodes]
+  );
 
   const handleToggleFavorite = useCallback(
     async (code: string, isFavorite: boolean) => {
@@ -525,6 +624,48 @@ export default function RankingView() {
     consultSort
   ]);
 
+  const handleCreateScreenshots = useCallback(async () => {
+    if (!selectedCodes.length) {
+      setToastMessage("スクショ対象がありません。");
+      return;
+    }
+    const targets = selectedCodes.slice(0, SCREENSHOT_LIMIT);
+    const omitted = Math.max(0, selectedCodes.length - targets.length);
+    setScreenshotBusy(true);
+    try {
+      try {
+        await ensureBarsForVisible(listTimeframe, targets, "chart-screenshot");
+      } catch {
+        // Use available cache even if fetch fails.
+      }
+      const itemsForShots = targets.map((code) => ({
+        code,
+        payload: barsCache[listTimeframe][code] ?? null,
+        boxes: [],
+        maSettings: listMaSettings ?? []
+      }));
+      const result = downloadChartScreenshots(itemsForShots, {
+        rangeMonths: listRangeMonths,
+        timeframeLabel: listTimeframe
+      });
+      if (!result.created) {
+        setToastMessage("スクショを作成できませんでした。");
+        return;
+      }
+      const omittedLabel = omitted ? ` (残り${omitted}件は省略)` : "";
+      setToastMessage(`スクショを${result.created}件作成しました。${omittedLabel}`);
+    } finally {
+      setScreenshotBusy(false);
+    }
+  }, [
+    selectedCodes,
+    ensureBarsForVisible,
+    listTimeframe,
+    barsCache,
+    listMaSettings,
+    listRangeMonths
+  ]);
+
   const handleCopyConsult = useCallback(async () => {
     if (!consultText) {
       setToastMessage("相談パックがまだありません。");
@@ -546,69 +687,42 @@ export default function RankingView() {
   }, [selectedCodes]);
 
   const showSkeleton = backendReady && loading && items.length === 0;
+  const emptyLabel =
+    !loading && backendReady && filteredItems.length === 0 && !errorMessage
+      ? search.trim() || filterSignalsOnly || filterDataOnly
+        ? "該当する銘柄がありません。"
+        : "ランキングがありません。"
+      : null;
+  const isSingleDensity = listColumns === 1 && listRows === 1;
 
   return (
-    <div className="app-shell">
-      <header className="top-bar">
-        <div className="top-bar-heading">
-          <div className="title">ランキング</div>
-          <div className="subtitle">上昇/下落 Top50 を切替</div>
-          <TopNav />
-        </div>
-        <div className="top-bar-controls">
-          <div className="top-bar-left">
-            <div className="segmented timeframe-segment">
-              {(["monthly", "weekly", "daily"] as const).map((value) => (
-                <button
-                  key={value}
-                  className={timeframe === value ? "active" : ""}
-                  onClick={() => setTimeframe(value)}
-                >
-                  {value === "monthly" ? "月足" : value === "weekly" ? "週足" : "日足"}
-                </button>
-              ))}
-            </div>
-            <div className="segmented segmented-compact range-segment">
-              {rangeOptions.map((option) => (
-                <button
-                  key={option.label}
-                  className={rangeMonths === option.months ? "active" : ""}
-                  onClick={() => setRangeMonths(option.months)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-            <div className="segmented">
-              <button
-                className={dir === "up" ? "active" : ""}
-                onClick={() => setDir("up")}
-              >
-                上昇Top50
-              </button>
-              <button
-                className={dir === "down" ? "active" : ""}
-                onClick={() => setDir("down")}
-              >
-                下落Top50
-              </button>
-            </div>
-          </div>
-          <div className="top-bar-right">
-            <button
-              type="button"
-              className="consult-trigger"
-              onClick={() => {
-                setConsultVisible(true);
-                setConsultExpanded(false);
-              }}
-            >
-              相談
-            </button>
-          </div>
-        </div>
-      </header>
-      <div className={`rank-shell ${consultPaddingClass}`}>
+    <div className="app-shell list-view">
+      <UnifiedListHeader
+        timeframe={listTimeframe}
+        onTimeframeChange={setListTimeframe}
+        rangeMonths={listRangeMonths}
+        onRangeChange={setListRangeMonths}
+        search={search}
+        onSearchChange={setSearch}
+        sortValue={dir}
+        sortOptions={sortOptions}
+        onSortChange={(value) => setDir(value as "up" | "down")}
+        columns={listColumns}
+        rows={listRows}
+        onColumnsChange={setListColumns}
+        onRowsChange={setListRows}
+        filterItems={filterItems}
+        helpLabel="相談"
+        onHelpClick={() => {
+          setConsultVisible(true);
+          setConsultExpanded(false);
+          setConsultTab("selection");
+        }}
+      />
+      <div
+        className={`rank-shell list-shell${isSingleDensity ? " is-single" : ""} ${consultPaddingClass}`}
+        style={listStyles}
+      >
         {showSkeleton && (
           <div className="rank-skeleton">
             {Array.from({ length: 4 }).map((_, index) => (
@@ -623,21 +737,13 @@ export default function RankingView() {
         {!showSkeleton && (
           <>
             {errorMessage && <div className="rank-status">{errorMessage}</div>}
-            {!loading && backendReady && items.length === 0 && !errorMessage && (
-              <div className="rank-status">ランキングがありません。</div>
-            )}
+            {emptyLabel && <div className="rank-status">{emptyLabel}</div>}
             <div className="rank-grid">
-              {items.map((item, index) => {
-                const payload = barsCache[timeframe][item.code] ?? null;
-                const status = barsStatus[timeframe][item.code];
+              {filteredItems.map((item, index) => {
+                const payload = barsCache[listTimeframe][item.code] ?? null;
+                const status = barsStatus[listTimeframe][item.code];
                 const series =
                   payload && payload.bars?.length ? payload.bars : item.series ?? [];
-                const timeframeMa =
-                  timeframe === "daily"
-                    ? maSettings.daily
-                    : timeframe === "weekly"
-                    ? maSettings.weekly
-                    : maSettings.monthly;
                 return (
                   <RankChartCard
                     key={item.code}
@@ -645,10 +751,10 @@ export default function RankingView() {
                     index={index}
                     series={series}
                     status={status}
-                    maSettings={timeframeMa ?? []}
-                    rangeMonths={rangeMonths}
+                    maSettings={listMaSettings ?? []}
+                    rangeMonths={listRangeMonths}
                     onToggleFavorite={handleToggleFavorite}
-                    onOpenDetail={(code) => navigate(`/detail/${code}`)}
+                    onOpenDetail={handleOpenDetail}
                     selected={selectedSet.has(item.code)}
                     onToggleSelect={toggleSelect}
                   />
@@ -696,6 +802,13 @@ export default function RankingView() {
               >
                 {consultBusy ? "作成中..." : "相談作成"}
               </button>
+              <button
+                type="button"
+                onClick={handleCreateScreenshots}
+                disabled={!selectedCodes.length || screenshotBusy}
+              >
+                {screenshotBusy ? "作成中..." : "スクショ作成"}
+              </button>
               <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
                 コピー
               </button>
@@ -732,6 +845,13 @@ export default function RankingView() {
                   disabled={!selectedCodes.length || consultBusy}
                 >
                   {consultBusy ? "作成中..." : "相談作成"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCreateScreenshots}
+                  disabled={!selectedCodes.length || screenshotBusy}
+                >
+                  {screenshotBusy ? "作成中..." : "スクショ作成"}
                 </button>
                 <button type="button" onClick={handleCopyConsult} disabled={!consultText}>
                   コピー

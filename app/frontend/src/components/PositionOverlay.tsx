@@ -398,13 +398,15 @@ export default function PositionOverlay({
       .map((entry) => {
         const avgLongPrice = entry.longLots > 0 ? entry.longCost / entry.longLots : 0;
         const avgShortPrice = entry.shortLots > 0 ? entry.shortCost / entry.shortLots : 0;
-        const posText = `${formatLots(entry.shortLots)}-${formatLots(entry.longLots)}`;
+        const longText = formatLots(entry.longLots);
+        const shortText = formatLots(entry.shortLots);
         return {
           time: entry.time,
           date: entry.date,
           shortLots: entry.shortLots,
           longLots: entry.longLots,
-          posText,
+          longText,
+          shortText,
           avgLongPrice,
           avgShortPrice,
           realizedPnL: entry.realizedPnL,
@@ -442,18 +444,26 @@ export default function PositionOverlay({
       }
     });
 
-    const changes: { time: number; text: string; brokerKey: string }[] = [];
+    const changes: {
+      time: number;
+      longText: string;
+      shortText: string;
+      brokerKey: string;
+    }[] = [];
     groups.forEach((group) => {
       const sorted = [...group.entries].sort((a, b) => a.time - b.time);
-      let prevText = "";
+      let prevKey = "";
       sorted.forEach((pos) => {
-        if (pos.posText === "0-0") {
-          prevText = pos.posText;
+        const longText = formatLots(pos.longLots);
+        const shortText = formatLots(pos.shortLots);
+        const nextKey = `${longText}:${shortText}`;
+        if (nextKey === "0:0") {
+          prevKey = nextKey;
           return;
         }
-        if (pos.posText !== prevText) {
-          changes.push({ time: pos.time, text: pos.posText, brokerKey: group.brokerKey });
-          prevText = pos.posText;
+        if (nextKey !== prevKey) {
+          changes.push({ time: pos.time, longText, shortText, brokerKey: group.brokerKey });
+          prevKey = nextKey;
         }
       });
     });
@@ -474,36 +484,59 @@ export default function PositionOverlay({
       if (rangeTo != null && entry.time > rangeTo) return false;
       return true;
     });
-    const byTime = new Map<number, { text: string; brokerKey: string }[]>();
+    const byTime = new Map<
+      number,
+      { longText: string; shortText: string; brokerKey: string }[]
+    >();
     limited.forEach((entry) => {
       const list = byTime.get(entry.time) ?? [];
-      list.push({ text: entry.text, brokerKey: entry.brokerKey });
+      list.push({
+        longText: entry.longText,
+        shortText: entry.shortText,
+        brokerKey: entry.brokerKey
+      });
       byTime.set(entry.time, list);
     });
 
-    const suffix = markerSuffix ? ` ${markerSuffix}` : "";
-    const output: { key: string; text: string; brokerKey: string; x: number; y: number }[] = [];
+    const suffix = markerSuffix ? markerSuffix : null;
+    const output: {
+      key: string;
+      longText: string;
+      shortText: string;
+      brokerKey: string;
+      x: number;
+      y: number;
+      suffix: string | null;
+    }[] = [];
     const placed: { x: number; y: number }[] = [];
     byTime.forEach((list, time) => {
       const bar = barsByTime.get(time);
       if (!bar) return;
-      const x = timeScale.timeToCoordinate(time as any);
+      const baseX = timeScale.timeToCoordinate(time as any);
       const yBase = candleSeries.priceToCoordinate(bar.high) ?? candleSeries.priceToCoordinate(bar.close);
-      if (x == null || yBase == null) return;
+      if (baseX == null || yBase == null) return;
       list.sort((a, b) => compareBrokerKey(a.brokerKey, b.brokerKey));
+      const hasCollision = (nextX: number, nextY: number) =>
+        placed.some((item) => Math.abs(item.x - nextX) < 12 && Math.abs(item.y - nextY) < 10);
       list.forEach((entry, index) => {
-        const y = yBase - 8 - index * 12;
-        const collision = placed.some(
-          (item) => Math.abs(item.x - x) < 12 && Math.abs(item.y - y) < 10
-        );
-        if (collision) return;
+        const offsetX = (index - (list.length - 1) / 2) * 14;
+        let x = baseX + offsetX;
+        let y = yBase - 8 - index * 12;
+        let attempts = 0;
+        while (hasCollision(x, y) && attempts < 4) {
+          y -= 10;
+          attempts += 1;
+        }
+        if (hasCollision(x, y)) return;
         placed.push({ x, y });
         output.push({
           key: `${time}-${entry.brokerKey}`,
-          text: `${entry.text}${suffix}`,
+          longText: entry.longText,
+          shortText: entry.shortText,
           brokerKey: entry.brokerKey,
           x,
-          y
+          y,
+          suffix
         });
       });
     });
@@ -532,7 +565,14 @@ export default function PositionOverlay({
               className={`position-marker-label broker-${entry.brokerKey}`}
               style={{ left: `${entry.x}px`, top: `${entry.y}px` }}
             >
-              {entry.text}
+              <span className="position-fraction position-fraction-compact">
+                <span className="position-fraction-top">{entry.longText}</span>
+                <span className="position-fraction-divider" />
+                <span className="position-fraction-bottom">{entry.shortText}</span>
+              </span>
+              {entry.suffix && (
+                <span className="position-marker-suffix">{entry.suffix}</span>
+              )}
             </div>
           ))}
         </div>
@@ -599,9 +639,13 @@ export default function PositionOverlay({
                 >
                   <div className="position-overlay-row">
                     <span className="position-overlay-label">建玉</span>
-                    <span className="position-overlay-value">
+                    <span className="position-overlay-value position-overlay-value-fraction">
                       <span className="broker-badge">{brokerLabel}</span>
-                      {position.posText} (売-買)
+                      <span className="position-fraction">
+                        <span className="position-fraction-top">{position.longText}</span>
+                        <span className="position-fraction-divider" />
+                        <span className="position-fraction-bottom">{position.shortText}</span>
+                      </span>
                     </span>
                   </div>
                   {showPnL && (

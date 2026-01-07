@@ -126,6 +126,10 @@ type Settings = {
   search: string;
   gridScrollTop: number;
   gridTimeframe: GridTimeframe;
+  listTimeframe: GridTimeframe;
+  listRangeMonths: 3 | 6 | 12 | 24;
+  listColumns: 1 | 2 | 3 | 4;
+  listRows: 1 | 2 | 3 | 4 | 5 | 6;
   showBoxes: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
@@ -168,6 +172,10 @@ type StoreState = {
   ) => Promise<void>;
   setColumns: (columns: Settings["columns"]) => void;
   setRows: (rows: Settings["rows"]) => void;
+  setListTimeframe: (value: Settings["listTimeframe"]) => void;
+  setListRangeMonths: (value: Settings["listRangeMonths"]) => void;
+  setListColumns: (value: Settings["listColumns"]) => void;
+  setListRows: (value: Settings["listRows"]) => void;
   setSearch: (search: string) => void;
   setGridScrollTop: (value: number) => void;
   setGridTimeframe: (value: Settings["gridTimeframe"]) => void;
@@ -211,6 +219,10 @@ const BATCH_TTL_MS = 60_000;
 const KEEP_STORAGE_KEY = "keepList";
 const GRID_COLS_KEY = "gridCols";
 const GRID_ROWS_KEY = "gridRows";
+const LIST_TIMEFRAME_KEY = "listTimeframe";
+const LIST_RANGE_KEY = "listRangeMonths";
+const LIST_COLS_KEY = "listCols";
+const LIST_ROWS_KEY = "listRows";
 const inFlightBatchRequests = new Map<
   string,
   { promise: Promise<void>; controller: AbortController }
@@ -426,6 +438,14 @@ const getInitialTimeframe = (): Settings["gridTimeframe"] => {
   return saved === "daily" || saved === "weekly" ? (saved as Settings["gridTimeframe"]) : "monthly";
 };
 
+const getInitialListTimeframe = (): Settings["listTimeframe"] => {
+  if (typeof window === "undefined") return "daily";
+  const saved = window.localStorage.getItem(LIST_TIMEFRAME_KEY);
+  return saved === "monthly" || saved === "weekly" || saved === "daily"
+    ? (saved as Settings["listTimeframe"])
+    : "daily";
+};
+
 const getInitialColumns = (): Settings["columns"] => {
   if (typeof window === "undefined") return 3;
   const saved = Number(window.localStorage.getItem(GRID_COLS_KEY));
@@ -442,6 +462,32 @@ const getInitialRows = (): Settings["rows"] => {
     return saved as Settings["rows"];
   }
   return 3;
+};
+
+const getInitialListColumns = (): Settings["listColumns"] => {
+  if (typeof window === "undefined") return 3;
+  const saved = Number(window.localStorage.getItem(LIST_COLS_KEY));
+  if (saved >= 1 && saved <= 4) {
+    return saved as Settings["listColumns"];
+  }
+  return 3;
+};
+
+const getInitialListRows = (): Settings["listRows"] => {
+  if (typeof window === "undefined") return 3;
+  const saved = Number(window.localStorage.getItem(LIST_ROWS_KEY));
+  if (saved >= 1 && saved <= 6) {
+    return saved as Settings["listRows"];
+  }
+  return 3;
+};
+
+const getInitialListRangeMonths = (): Settings["listRangeMonths"] => {
+  if (typeof window === "undefined") return 6;
+  const saved = Number(window.localStorage.getItem(LIST_RANGE_KEY));
+  return saved === 3 || saved === 6 || saved === 12 || saved === 24
+    ? (saved as Settings["listRangeMonths"])
+    : 6;
 };
 
 const getInitialSortKey = (): SortKey => {
@@ -518,6 +564,10 @@ export const useStore = create<StoreState>((set, get) => ({
     search: "",
     gridScrollTop: 0,
     gridTimeframe: getInitialTimeframe(),
+    listTimeframe: getInitialListTimeframe(),
+    listRangeMonths: getInitialListRangeMonths(),
+    listColumns: getInitialListColumns(),
+    listRows: getInitialListRows(),
     showBoxes: true,
     sortKey: getInitialSortKey(),
     sortDir: getInitialSortDir()
@@ -989,6 +1039,30 @@ export const useStore = create<StoreState>((set, get) => ({
       window.localStorage.setItem(GRID_ROWS_KEY, String(rows));
     }
     set((state) => ({ settings: { ...state.settings, rows } }));
+  },
+  setListTimeframe: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LIST_TIMEFRAME_KEY, value);
+    }
+    set((state) => ({ settings: { ...state.settings, listTimeframe: value } }));
+  },
+  setListRangeMonths: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LIST_RANGE_KEY, String(value));
+    }
+    set((state) => ({ settings: { ...state.settings, listRangeMonths: value } }));
+  },
+  setListColumns: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LIST_COLS_KEY, String(value));
+    }
+    set((state) => ({ settings: { ...state.settings, listColumns: value } }));
+  },
+  setListRows: (value) => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LIST_ROWS_KEY, String(value));
+    }
+    set((state) => ({ settings: { ...state.settings, listRows: value } }));
   },
   setSearch: (search) => {
     set((state) => ({ settings: { ...state.settings, search } }));

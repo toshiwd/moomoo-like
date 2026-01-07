@@ -71,7 +71,7 @@ function buildMaMap(bars: number[][], period: number) {
   return map;
 }
 
-function drawChart(
+export function drawChart(
   canvas: HTMLCanvasElement,
   payload: BarsPayload,
   boxes: Box[],

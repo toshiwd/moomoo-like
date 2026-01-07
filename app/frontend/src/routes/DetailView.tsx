@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, TouchEvent as ReactTouchEvent } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useBackendReadyState } from "../backendReady";
 import DetailChart, { DetailChartHandle } from "../components/DetailChart";
@@ -265,6 +265,7 @@ const countInRange = (candles: Candle[], months: number | null) => {
 
 export default function DetailView() {
   const { code } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
   const { ready: backendReady } = useBackendReadyState();
   const dailyChartRef = useRef<DetailChartHandle | null>(null);
@@ -869,13 +870,68 @@ export default function DetailView() {
   const monthlyRatio = 1 - weeklyRatio;
   const focusTitle =
     focusPanel === "daily" ? "Daily (Focused)" : focusPanel === "weekly" ? "Weekly (Focused)" : "Monthly (Focused)";
+  const listBackPath = useMemo(() => {
+    const state = location.state as { from?: string } | null;
+    const from = state?.from;
+    let stored: string | null = null;
+    if (typeof window !== "undefined") {
+      try {
+        stored = window.sessionStorage.getItem("detailListBack");
+      } catch {
+        stored = null;
+      }
+    }
+    const candidate = from ?? stored;
+    if (
+      candidate === "/" ||
+      candidate === "/ranking" ||
+      candidate === "/favorites" ||
+      candidate === "/candidates"
+    ) {
+      return candidate;
+    }
+    return "/";
+  }, [location.state]);
+  const listCodes = useMemo(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const stored = window.sessionStorage.getItem("detailListCodes");
+      if (!stored) return [];
+      const parsed = JSON.parse(stored);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((item) => typeof item === "string");
+    } catch {
+      return [];
+    }
+  }, [code]);
+  const nextCode = useMemo(() => {
+    if (!code) return null;
+    const index = listCodes.indexOf(code);
+    if (index < 0) return null;
+    return listCodes[index + 1] ?? null;
+  }, [listCodes, code]);
 
   return (
     <div className={`detail-shell ${focusPanel ? "detail-shell-focus" : ""}`}>
       <div className="detail-header">
-        <button className="back" onClick={() => navigate(-1)}>
-          Back
-        </button>
+        <div className="detail-header-nav">
+          <button className="back" onClick={() => navigate(listBackPath)}>
+            {"\u4e00\u89a7\u306b\u623b\u308b"}
+          </button>
+          <button className="back back-secondary" onClick={() => navigate(-1)}>
+            {"\u524d\u306e\u753b\u9762\u306b\u623b\u308b"}
+          </button>
+          <button
+            className="back back-secondary"
+            onClick={() => {
+              if (!nextCode) return;
+              navigate(`/detail/${nextCode}`, { state: { from: listBackPath } });
+            }}
+            disabled={!nextCode}
+          >
+            {"\u6b21\u306e\u9298\u67c4\u3078"}
+          </button>
+        </div>
         <div className="detail-title">
           <div>
             <div className="detail-title-main">

@@ -4,7 +4,7 @@ import {
   type FixedSizeGrid,
   type GridOnItemsRenderedProps
 } from "react-window";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api";
 import { useBackendReadyState } from "../backendReady";
 import type { MaSetting, SortDir, SortKey } from "../store";
@@ -53,6 +53,7 @@ type HealthStatus = {
 };
 
 export default function GridView() {
+  const location = useLocation();
   const navigate = useNavigate();
   const { ref, size } = useResizeObserver();
   const { ready: backendReady } = useBackendReadyState();
@@ -423,6 +424,10 @@ export default function GridView() {
     items.sort(compare);
     return items;
   }, [scoredTickers, sortKey, sortDir, collator]);
+  const sortedCodes = useMemo(
+    () => sortedTickers.map((item) => item.ticker.code),
+    [sortedTickers]
+  );
 
   useEffect(() => {
     if (sortedTickers.length === 0) {
@@ -537,9 +542,15 @@ export default function GridView() {
 
   const handleOpenDetail = useCallback(
     (code: string) => {
-      navigate(`/detail/${code}`);
+      try {
+        sessionStorage.setItem("detailListBack", location.pathname);
+        sessionStorage.setItem("detailListCodes", JSON.stringify(sortedCodes));
+      } catch {
+        // ignore storage failures
+      }
+      navigate(`/detail/${code}`, { state: { from: location.pathname } });
     },
-    [navigate]
+    [navigate, location.pathname, sortedCodes]
   );
 
   const handleAddWatchlist = useCallback(
@@ -616,9 +627,15 @@ export default function GridView() {
         setActiveIndex(index);
         return;
       }
-      navigate(`/detail/${code}`);
+      try {
+        sessionStorage.setItem("detailListBack", location.pathname);
+        sessionStorage.setItem("detailListCodes", JSON.stringify(keepList));
+      } catch {
+        // ignore storage failures
+      }
+      navigate(`/detail/${code}`, { state: { from: location.pathname } });
     },
-    [sortedTickers, navigate]
+    [sortedTickers, navigate, location.pathname, keepList]
   );
 
   useEffect(() => {

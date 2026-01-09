@@ -55,8 +55,16 @@ try {
 
     $lastIngestUtc = [DateTime]::MinValue
     if (Test-Path $ingestStampFile) {
-      $raw = (Get-Content $ingestStampFile -ErrorAction SilentlyContinue).Trim()
-      if ($raw) { $lastIngestUtc = [DateTime]::Parse($raw).ToUniversalTime() }
+      $raw = (Get-Content $ingestStampFile -Raw -ErrorAction SilentlyContinue).Trim()
+      if ($raw) {
+        try {
+          # Use Parse with RoundtripKind for ISO 8601 dates, which is more robust than TryParse across PS versions.
+          $parsed = [DateTime]::Parse($raw, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+          $lastIngestUtc = $parsed.ToUniversalTime()
+        } catch {
+          Write-Host "[Backend/User] WARN: last_ingest_utc.txt contains invalid timestamp ('$raw'), forcing ingest."
+        }
+      }
     }
 
     $needIngest = $true
@@ -82,11 +90,11 @@ try {
       Write-Host '[Backend/User] TXT not updated. Skipping ingest.'
     }
 
-    python -m uvicorn main:app --host 127.0.0.1 --port 8000
+    python -c "import uvicorn; uvicorn.run('main:app', host='127.0.0.1', port=8000, log_level='info', lifespan='off')"
   } else {
     Write-Host '[Backend/Admin] Running ingest_txt.py...'
     python ingest_txt.py
-    python -m uvicorn main:app --reload --port 8000
+    python -c "import uvicorn; uvicorn.run('main:app', host='127.0.0.1', port=8000, log_level='info', reload=True, lifespan='off')"
   }
 } catch {
   $label = if ($Mode -eq 'user') { 'Backend (User)' } else { 'Backend (Admin)' }

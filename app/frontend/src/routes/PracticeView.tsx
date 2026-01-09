@@ -8,6 +8,66 @@ import Toast from "../components/Toast";
 import { useStore } from "../store";
 import { computeSignalMetrics } from "../utils/signals";
 
+const PositionDonutChart = ({
+  buy,
+  sell,
+  size = 80,
+  strokeWidth = 10
+}: {
+  buy: number;
+  sell: number;
+  size?: number;
+  strokeWidth?: number;
+}) => {
+  const gross = buy + sell;
+  const r = size / 2 - strokeWidth / 2;
+  const circumference = 2 * Math.PI * r;
+  const sellPercent = gross > 0 ? sell / gross : 0;
+  const sellDash = circumference * sellPercent;
+  const buyDash = circumference * (1 - sellPercent);
+
+  if (gross === 0) {
+    return (
+      <div className="practice-hud-donut-zero">
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            strokeWidth={1}
+            stroke="var(--color-fg-4)"
+            fill="none"
+          />
+        </svg>
+        <span>0-0</span>
+      </div>
+    );
+  }
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="practice-hud-donut">
+      <circle
+        className="donut-segment-buy"
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        strokeWidth={strokeWidth}
+        strokeDasharray={`${buyDash} ${circumference}`}
+        strokeDashoffset={0}
+      />
+      <circle
+        className="donut-segment-sell"
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        strokeWidth={strokeWidth}
+        strokeDasharray={`${sellDash} ${circumference}`}
+        strokeDashoffset={-buyDash}
+      />
+    </svg>
+  );
+};
+
 type Timeframe = "daily" | "weekly" | "monthly";
 
 type Candle = {
@@ -123,7 +183,6 @@ const LIMIT_STEP = {
 
 const DAILY_ROW_RATIO = 12 / 16;
 
-const QUANTITIES = [1, 2, 3, 5];
 const DEFAULT_LOT_SIZE = 100;
 const DEFAULT_RANGE_MONTHS = 6;
 const EXPORT_MA_PERIODS = [7, 20, 60, 100, 200];
@@ -733,6 +792,7 @@ export default function PracticeView() {
   const hoverTimeRef = useRef<number | null>(null);
   const crosshairSyncRef = useRef<{ source: Timeframe; time: number | null } | null>(null);
   const crosshairSyncRafRef = useRef<number | null>(null);
+  const startDateInputRef = useRef<HTMLInputElement | null>(null);
 
   const tickers = useStore((state) => state.tickers);
   const loadList = useStore((state) => state.loadList);
@@ -781,7 +841,7 @@ export default function PracticeView() {
     }
   }, [backendReady, tickers.length, loadingList, loadList]);
 
-  const refreshSessions = () => {
+  const refreshSessions = (selectId?: string | null) => {
     if (!backendReady || !code) return;
     setSessionsLoading(true);
     api
@@ -790,32 +850,19 @@ export default function PracticeView() {
         const payload = res.data as { sessions?: PracticeSession[] };
         const items = Array.isArray(payload.sessions) ? payload.sessions : [];
         setSessions(items);
-        if (!items.length && !sessionId) {
-          const nextId = createSessionId();
-          const payload = {
-            session_id: nextId,
-            code,
-            start_date: null,
-            end_date: null,
-            cursor_time: null,
-            max_unlocked_time: null,
-            lot_size: DEFAULT_LOT_SIZE,
-            range_months: DEFAULT_RANGE_MONTHS,
-            trades: [],
-            notes: "",
-            ui_state: { panelCollapsed: true, notesCollapsed: true, tradeLogCollapsed: true }
-          };
-          api.post("/practice/session", payload).finally(() => {
-            setSessionId(nextId);
-            refreshSessions();
-          });
+
+        if (selectId) {
+          setSessionId(selectId);
           return;
         }
+
         if (!sessionId || !items.some((item) => item.session_id === sessionId)) {
           const stored = sessionStorageKey ? localStorage.getItem(sessionStorageKey) : null;
           const fallback = items.find((item) => item.session_id === stored) ?? items[0] ?? null;
           if (fallback) {
             setSessionId(fallback.session_id);
+          } else {
+            setSessionId(null);
           }
         }
       })
@@ -832,13 +879,28 @@ export default function PracticeView() {
   }, [sessionStorageKey, sessionId]);
 
   useEffect(() => {
-    if (!backendReady || !sessionId) return;
+    if (!backendReady || !sessionId) {
+      if (!sessionId) {
+        setTrades([]);
+        setStartDate(null);
+        setEndDate(null);
+        setStartDateDraft("");
+        setSessionNotes("");
+        setCursorTime(null);
+        setMaxUnlockedTime(null);
+      }
+      return;
+    }
     api
       .get("/practice/session", { params: { session_id: sessionId } })
       .then((res) => {
         const payload = res.data as { session?: PracticeSession | null };
         const session = payload.session;
-        if (!session) return;
+        if (!session) {
+          setToastMessage("セッションの読み込みに失敗しました。");
+          setSessionId(null);
+          return;
+        }
         if (code && session.code !== code) return;
         const sessionTrades = Array.isArray(session.trades) ? session.trades : [];
         const sessionStart = session.start_date ?? null;
@@ -868,12 +930,8 @@ export default function PracticeView() {
         sessionChangeRef.current += 1;
       })
       .catch(() => {
-        setTrades([]);
-        setStartDate(null);
-        setEndDate(null);
-        setStartDateDraft("");
-        setSessionNotes("");
-        setTradeLogCollapsed(true);
+        setToastMessage("セッションの読み込みに失敗しました。");
+        setSessionId(null);
       });
   }, [backendReady, sessionId, code]);
 
@@ -1186,17 +1244,17 @@ export default function PracticeView() {
   const headerMetaLabel =
     cursorCandle && progressIndex != null ? `${headerDateLabel} (${headerDayLabel})` : headerDateLabel;
   const guideText = useMemo(() => {
-    if (sessions.length === 0) return "まず「新規」で練習を作成してください";
-    if (!sessionId) return "セッションを選択してください";
+    if (sessionsLoading) return "セッションを読み込んでいます...";
+    if (!sessionId) return "「新規」で練習を開始するか、「管理」から過去の練習を読み込んでください。";
     if (!startDate) return "開始日を選んで「開始日を確定」を押してください";
     if (isLocked) return "過去日を表示中です。最新日に戻ると操作できます";
     return "建玉を操作して「翌日」で進めます（→キーでも可）";
-  }, [sessions.length, sessionId, startDate, isLocked]);
+  }, [sessionsLoading, sessionId, startDate, isLocked]);
   const sessionBadgeLabel = sessionId ? (endDate ? "完了" : "進行中") : "未作成";
   const sessionBadgeClass = sessionId ? (endDate ? "is-ended" : "is-active") : "is-empty";
   const sessionRangeLabel = sessionId
     ? `開始 ${startDate ?? "--"} / 終了 ${endDate ?? "--"}`
-    : "セッション未作成";
+    : "セッション未選択";
   const canUndo =
     !isLocked &&
     cursorTime != null &&
@@ -1239,9 +1297,11 @@ export default function PracticeView() {
   const togglePanel = (force?: boolean) => {
     setPanelCollapsed((prev) => {
       const next = typeof force === "boolean" ? force : !prev;
-      persistSession({
-        uiState: { panelCollapsed: next, notesCollapsed, tradeLogCollapsed }
-      });
+      if (sessionId) {
+        persistSession({
+          uiState: { panelCollapsed: next, notesCollapsed, tradeLogCollapsed }
+        });
+      }
       return next;
     });
   };
@@ -1287,16 +1347,26 @@ export default function PracticeView() {
         return;
       }
       if (event.key === "Escape") {
+        setSessionManagerOpen(false);
         togglePanel(true);
         return;
       }
       if (event.key.toLowerCase() === "m") {
         toggleNotes();
       }
+      if (event.key.toLowerCase() === "h") {
+        toggleTradeLog();
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [handleStep, notesCollapsed, panelCollapsed]);
+
+  useEffect(() => {
+    if (!panelCollapsed && !startDate && startDateInputRef.current) {
+      startDateInputRef.current.focus();
+    }
+  }, [panelCollapsed, startDate]);
 
   useEffect(() => {
     const handleMove = (event: MouseEvent | TouchEvent) => {
@@ -1409,8 +1479,10 @@ export default function PracticeView() {
     syncCrosshair("monthly", time);
   };
 
-  const pushTrade = (trade: PracticeTrade) => {
-    const nextTrades = [...trades, trade];
+  const pushTrade = (trade: PracticeTrade | PracticeTrade[]) => {
+    const newTrades = Array.isArray(trade) ? trade : [trade];
+    if (newTrades.length === 0) return;
+    const nextTrades = [...trades, ...newTrades];
     setTrades(nextTrades);
     persistSession({ trades: nextTrades });
   };
@@ -1441,10 +1513,10 @@ export default function PracticeView() {
     const available = book === "long" ? positionSummary.longLots : positionSummary.shortLots;
     const finalQty = action === "close" ? Math.min(qty, available) : qty;
     if (action === "close" && finalQty <= 0) {
-      setToastMessage("減玉できる建玉がありません");
+      if (delta !== 0) setToastMessage("減玉できる建玉がありません");
       return;
     }
-    const trade: PracticeTrade = {
+    const newTrade: PracticeTrade = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       time: candle.time,
       side: actualSide,
@@ -1455,7 +1527,7 @@ export default function PracticeView() {
       lotSize,
       note: tradeNote.trim() ? tradeNote.trim() : undefined
     };
-    pushTrade(trade);
+    pushTrade(newTrade);
   };
 
   const handleUndo = () => {
@@ -1465,6 +1537,54 @@ export default function PracticeView() {
     const next = trades.slice(0, -1);
     setTrades(next);
     persistSession({ trades: next });
+  };
+
+  const handleCloseAllPositions = () => {
+    if (isLocked || !cursorCandle) {
+      setToastMessage("この操作は現在実行できません。");
+      return;
+    }
+    const { longLots, shortLots } = positionSummary;
+    if (longLots === 0 && shortLots === 0) {
+      setToastMessage("決済できる建玉がありません。");
+      return;
+    }
+    if (typeof window !== "undefined") {
+      const ok = window.confirm("全ての建玉を決済しますか？（この操作は取り消せません）");
+      if (!ok) return;
+    }
+
+    const tradesToPush: PracticeTrade[] = [];
+    if (longLots > 0) {
+      tradesToPush.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}-close-long`,
+        time: cursorCandle.time,
+        side: "sell",
+        action: "close",
+        book: "long",
+        quantity: longLots,
+        price: cursorCandle.close,
+        lotSize,
+        note: "全決済"
+      });
+    }
+    if (shortLots > 0) {
+      tradesToPush.push({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}-close-short`,
+        time: cursorCandle.time,
+        side: "buy",
+        action: "close",
+        book: "short",
+        quantity: shortLots,
+        price: cursorCandle.close,
+        lotSize,
+        note: "全決済"
+      });
+    }
+    if (tradesToPush.length > 0) {
+      pushTrade(tradesToPush);
+      setToastMessage("全決済を実行しました。");
+    }
   };
 
   const handleResetDay = () => {
@@ -1501,49 +1621,34 @@ export default function PracticeView() {
     }
   }, [editingTradeId, trades, cursorTime, isLocked]);
 
-  const handleCreateSession = () => {
-    if (!code) return;
-    const nextId = createSessionId();
-    const lastEndDate = sessions.find((item) => item.end_date)?.end_date ?? null;
-    const nextStart = (() => {
-      if (lastEndDate) {
-        const endTime = parseDateString(lastEndDate);
-        if (endTime != null) {
-          return formatDate(getNextBusinessDay(endTime));
-        }
-        return lastEndDate;
-      }
-      return cursorCandle ? formatDate(cursorCandle.time) : null;
-    })();
-    const payload = {
-      session_id: nextId,
-      code,
-      start_date: nextStart,
-      end_date: null,
-      cursor_time: null,
-      max_unlocked_time: null,
-      lot_size: DEFAULT_LOT_SIZE,
-      range_months: DEFAULT_RANGE_MONTHS,
-      trades: [],
-      notes: "",
-      ui_state: { panelCollapsed: true, notesCollapsed: true, tradeLogCollapsed: true }
-    };
-    api.post("/practice/session", payload).finally(() => {
-      setSessionId(nextId);
-      refreshSessions();
-    });
+  const handleInitiateNewSession = () => {
+    setSessionId(null);
+    setStartDate(null);
+    setEndDate(null);
+    setStartDateDraft("");
+    setTrades([]);
+    setSessionNotes("");
+    setCursorTime(null);
+    setMaxUnlockedTime(null);
+    setPanelCollapsed(false);
   };
 
   const handleSelectSession = (nextId: string) => {
     if (nextId === sessionId) return;
     setSessionId(nextId);
+    setSessionManagerOpen(false);
   };
 
   const handleEndSession = () => {
-    if (!cursorCandle) return;
+    if (!cursorCandle || !sessionId || endDate) return;
+    if (typeof window !== "undefined") {
+      const ok = window.confirm("現在の練習を終了しますか？");
+      if (!ok) return;
+    }
     const date = formatDate(cursorCandle.time);
     setEndDate(date);
     persistSession({ endDate: date });
+    setToastMessage("練習を終了しました。");
   };
 
 
@@ -1562,16 +1667,9 @@ export default function PracticeView() {
         }
         if (id === sessionId) {
           setSessionId(null);
-          setStartDate(null);
-          setEndDate(null);
-          setStartDateDraft("");
-          setTrades([]);
-          setSessionNotes("");
-          setCursorTime(null);
-          setMaxUnlockedTime(null);
-          scheduleHoverTime(null);
         }
         refreshSessions();
+        setToastMessage("セッションを削除しました。");
       });
   };
 
@@ -1849,6 +1947,7 @@ export default function PracticeView() {
   };
 
   const handleApplyStartDate = () => {
+    if (!code) return;
     const date = startDateDraft || (cursorCandle ? formatDate(cursorCandle.time) : "");
     if (!date) {
       setToastMessage("開始日を選択してください。");
@@ -1868,29 +1967,93 @@ export default function PracticeView() {
       setToastMessage("指定日が日足データにありません。");
       return;
     }
-    let nextTrades = trades;
-    if (trades.length > 0 && date !== startDate) {
-      const ok =
-        typeof window === "undefined"
-          ? false
-          : window.confirm("開始日を変更し、既存の建玉をクリアしますか？");
-      if (!ok) return;
-      nextTrades = [];
-      setTrades([]);
+
+    const apply = (targetSessionId: string, isNew: boolean) => {
+      let nextTrades = trades;
+      if (!isNew && trades.length > 0 && date !== startDate) {
+        const ok =
+          typeof window === "undefined"
+            ? false
+            : window.confirm("開始日を変更し、既存の建玉をクリアしますか？");
+        if (!ok) return;
+        nextTrades = [];
+        setTrades([]);
+      }
+      const resolved = dailyBars[idx]?.time;
+      if (resolved != null) {
+        setCursorTime(resolved);
+        setMaxUnlockedTime(resolved);
+      }
+      setStartDate(date);
+      setStartDateDraft(date);
+
+      const payload = {
+        session_id: targetSessionId,
+        code,
+        start_date: date,
+        cursor_time: resolved ?? null,
+        max_unlocked_time: resolved ?? null,
+        trades: nextTrades,
+        lot_size: lotSize,
+        range_months: rangeMonths,
+        notes: sessionNotes,
+        ui_state: { panelCollapsed: true, notesCollapsed, tradeLogCollapsed }
+      };
+      api
+        .post("/practice/session", payload)
+        .then(() => {
+          setToastMessage(isNew ? "練習を開始しました。" : "開始日を更新しました。");
+          togglePanel(true);
+          if (isNew) {
+            refreshSessions(targetSessionId);
+          } else {
+            persistSession({
+              startDate: date,
+              cursorTime: resolved ?? null,
+              maxUnlockedTime: resolved ?? null,
+              trades: nextTrades
+            });
+          }
+        })
+        .catch(() => {
+          setToastMessage("セッションの開始/更新に失敗しました。");
+        });
+    };
+
+    if (sessionId) {
+      apply(sessionId, false);
+    } else {
+      const nextId = createSessionId();
+      setSessionId(nextId);
+      apply(nextId, true);
     }
-    const resolved = dailyBars[idx]?.time;
-    if (resolved != null) {
-      setCursorTime(resolved);
-      setMaxUnlockedTime(resolved);
+  };
+
+  const handleScreenshot = () => {
+    if (!code || !dailyData.length || !sessionId) {
+      setToastMessage("スクリーンショットを撮るためのデータがありません。");
+      return;
     }
-    setStartDate(date);
-    setStartDateDraft(date);
-    persistSession({
-      startDate: date,
-      cursorTime: resolved ?? null,
-      maxUnlockedTime: resolved ?? null,
-      trades: nextTrades
-    });
+    const date = cursorCandle ? formatDate(cursorCandle.time) : "nodate";
+    const stamp = `${date}_${sessionId.substring(0, 8)}`;
+
+    downloadChartScreenshots(
+      [
+        {
+          code,
+          payload: { bars: dailyData, timeframe: "daily" },
+          boxes: [],
+          maSettings: maSettings.daily
+        }
+      ],
+      {
+        rangeMonths: rangeMonths,
+        stamp: stamp,
+        timeframeLabel: "D",
+        showBoxes: false
+      }
+    );
+    setToastMessage("スクリーンショットを保存しました。");
   };
 
   const handleExport = () => {
@@ -1936,9 +2099,9 @@ export default function PracticeView() {
               <select
                 value={sessionId ?? ""}
                 onChange={(event) => handleSelectSession(event.target.value)}
-                disabled={sessionsLoading || sessions.length === 0}
+                disabled={sessionsLoading}
               >
-                {sessions.length === 0 && <option value="">セッションなし</option>}
+                {!sessionId && <option value="">セッションを選択...</option>}
                 {sessions.map((session) => (
                   <option key={session.session_id} value={session.session_id}>
                     {session.start_date ?? "開始未設定"}
@@ -1946,7 +2109,7 @@ export default function PracticeView() {
                   </option>
                 ))}
               </select>
-              <button className="indicator-button" onClick={handleCreateSession}>
+              <button className="indicator-button" onClick={handleInitiateNewSession}>
                 新規
               </button>
               <button
@@ -1954,6 +2117,13 @@ export default function PracticeView() {
                 onClick={() => setSessionManagerOpen((prev) => !prev)}
               >
                 管理
+              </button>
+              <button
+                className="indicator-button"
+                onClick={handleEndSession}
+                disabled={!sessionId || !!endDate}
+              >
+                練習終了
               </button>
             </div>
             <div className="practice-session-meta">
@@ -1990,6 +2160,9 @@ export default function PracticeView() {
           <div className="practice-header-group">
             <div className="practice-header-label">出力</div>
             <div className="practice-header-stack">
+              <button className="indicator-button" onClick={handleScreenshot}>
+                スクショ
+              </button>
               <button className="indicator-button" onClick={handleExport}>
                 出力
               </button>
@@ -2006,31 +2179,9 @@ export default function PracticeView() {
       </div>
       {sessionManagerOpen && (
         <div className="practice-session-list">
-          <div className="practice-session-settings">
-            <div className="practice-session-settings-title">セッション設定</div>
-            <div className="practice-session-settings-controls">
-              <span className="practice-session-settings-label">開始日</span>
-              <input
-                type="date"
-                value={startDateDraft}
-                onChange={(event) => setStartDateDraft(event.target.value)}
-                disabled={sessions.length === 0 || !sessionId}
-              />
-              <button
-                className="indicator-button"
-                onClick={handleApplyStartDate}
-                disabled={sessions.length === 0 || !sessionId}
-              >
-                開始日を確定
-              </button>
-              <button
-                className="indicator-button"
-                onClick={handleEndSession}
-                disabled={!cursorCandle || Boolean(endDate) || sessions.length === 0 || !sessionId}
-              >
-                練習終了
-              </button>
-            </div>
+          <div className="practice-session-list-header">
+            <span>過去のセッション</span>
+            <button onClick={() => setSessionManagerOpen(false)}>&times;</button>
           </div>
           {sessions.length === 0 ? (
             <div className="practice-session-empty">まだセッションがありません。</div>
@@ -2061,8 +2212,8 @@ export default function PracticeView() {
         </div>
       )}
 
-      <div className="practice-content">
-        <div className={`practice-main ${panelCollapsed ? "is-panel-collapsed" : ""}`}>
+      <div className={`practice-content-grid ${panelCollapsed ? "panel-collapsed" : ""}`}>
+        <div className="practice-left-column">
           <div className="practice-charts">
             <div className="detail-split practice-split">
               <div className="detail-row detail-row-top" style={{ flex: `${DAILY_ROW_RATIO} 1 0%` }}>
@@ -2077,7 +2228,7 @@ export default function PracticeView() {
                     boxes={[]}
                     showBoxes={false}
                     cursorTime={hoverTime == null ? cursorCandle?.time ?? null : null}
-                      positionOverlay={{
+                    positionOverlay={{
                       dailyPositions,
                       tradeMarkers,
                       showOverlay: true,
@@ -2101,7 +2252,8 @@ export default function PracticeView() {
                         : `ネット売り ${Math.abs(netLots)}`}
                     </div>
                     <div className="practice-hud-mini-row">
-                      実 {formatNumber(positionSummary.realizedPnL, 0)} / 評 {formatNumber(unrealizedPnL, 0)}
+                      実 {formatNumber(positionSummary.realizedPnL, 0)} / 評{" "}
+                      {formatNumber(unrealizedPnL, 0)}
                     </div>
                     <div className="practice-hud-mini-row">株数 {lotSize}</div>
                     {isLocked && <div className="practice-hud-mini-lock">過去日閲覧</div>}
@@ -2162,27 +2314,222 @@ export default function PracticeView() {
                   </div>
                 </div>
               </div>
+            </div>
+          </div>
+          <div className={`practice-log ${tradeLogCollapsed ? "is-collapsed" : ""}`}>
+            <div className="practice-log-header">
+              <div>
+                <div className="practice-log-title">建玉履歴</div>
+                <div className="practice-log-sub">
+                  {visibleTrades.length}件 | 実現損益 {formatNumber(positionSummary.realizedPnL, 0)}
+                </div>
+              </div>
+              <div className="practice-log-actions"></div>
+            </div>
+            {!tradeLogCollapsed && (
+              <>
+                <div className="practice-log-table">
+                  <div className="practice-log-row practice-log-head">
+                    <span>日付</span>
+                    <span>種別</span>
+                    <span>玉数</span>
+                    <span>約定</span>
+                    <span>建玉</span>
+                    <span>実現損益</span>
+                    <span>メモ</span>
+                    <span>操作</span>
+                  </div>
+                  {ledger.entries.length === 0 && (
+                    <div className="practice-log-empty">まだ履歴がありません。</div>
+                  )}
+                  {ledger.entries.map((entry) => {
+                    const trade = entry.trade;
+                    const label =
+                      trade.book === "long"
+                        ? trade.action === "open"
+                          ? "買い 新規"
+                          : "買い 決済"
+                        : trade.action === "open"
+                        ? "売り 新規"
+                        : "売り 決済";
+                    const canEdit = !isLocked && cursorTime != null && trade.time === cursorTime;
+                    const isEditing = canEdit && editingTradeId === trade.id;
+                    return (
+                      <div
+                        className="practice-log-row"
+                        key={trade.id}
+                        onClick={() => handleJumpToTrade(trade.time)}
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <span>{formatDate(trade.time)}</span>
+                        <span>{label}</span>
+                        {isEditing ? (
+                          <>
+                            <span>
+                              <input
+                                type="number"
+                                min={0}
+                                value={trade.quantity}
+                                onChange={(event) =>
+                                  handleEditTrade(trade.id, {
+                                    quantity: Number(event.target.value)
+                                  })
+                                }
+                              />
+                            </span>
+                            <span>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min={0}
+                                value={trade.price}
+                                onChange={(event) =>
+                                  handleEditTrade(trade.id, {
+                                    price: Number(event.target.value)
+                                  })
+                                }
+                              />
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <span>{trade.quantity}</span>
+                            <span>{formatNumber(trade.price, 2)}</span>
+                          </>
+                        )}
+                        <span>{entry.positionText}</span>
+                        <span className={entry.realizedDelta >= 0 ? "pnl-up" : "pnl-down"}>
+                          {entry.realizedDelta === 0 ? "--" : formatNumber(entry.realizedDelta, 0)}
+                        </span>
+                        {isEditing ? (
+                          <span>
+                            <input
+                              type="text"
+                              value={trade.note ?? ""}
+                              onChange={(event) =>
+                                handleEditTrade(trade.id, {
+                                  note: event.target.value
+                                })
+                              }
+                            />
+                          </span>
+                        ) : (
+                          <span>{trade.note ?? "--"}</span>
+                        )}
+                        <span className="practice-log-actions">
+                          {isEditing ? (
+                            <>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setEditingTradeId(null);
+                                }}
+                                disabled={!canEdit}
+                              >
+                                保存
+                              </button>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setEditingTradeId(null);
+                                }}
+                                disabled={!canEdit}
+                              >
+                                キャンセル
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  if (!canEdit) return;
+                                  setEditingTradeId(trade.id);
+                                }}
+                                disabled={!canEdit}
+                              >
+                                編集
+                              </button>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  if (!canEdit) return;
+                                  handleDeleteTrade(trade.id);
+                                }}
+                                disabled={!canEdit}
+                              >
+                                削除
+                              </button>
+                            </>
+                          )}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className={`practice-notes ${notesCollapsed ? "is-collapsed" : ""}`}>
+                  <div className="practice-notes-header">
+                    <div>メモ</div>
+                    <div className="practice-notes-actions">
+                      <button className="indicator-button" onClick={toggleNotes}>
+                        {notesCollapsed ? "メモを表示" : "メモを隠す"}
+                      </button>
+                      <button className="indicator-button" onClick={handleSaveNotes}>
+                        メモを保存
+                      </button>
+                    </div>
+                  </div>
+                  {!notesCollapsed && (
+                    <textarea
+                      value={sessionNotes}
+                      onChange={(event) => setSessionNotes(event.target.value)}
+                      placeholder="メモ（振り返り）"
+                    />
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="practice-panel">
+          <div className="practice-panel-header">
+            <div>
+              <div className="practice-panel-title">{startDate ? "建玉" : "新規練習"}</div>
+              <div className="practice-panel-sub">
+                {startDate
+                  ? `売${positionSummary.shortLots}-買${positionSummary.longLots}`
+                  : "開始日を設定"}
               </div>
             </div>
-            <div className={`practice-panel ${panelCollapsed ? "is-collapsed" : ""}`}>
-              <div className="practice-panel-header">
-                <div>
-                  <div className="practice-panel-title">建玉</div>
-                  <div className="practice-panel-sub">
-                    売{positionSummary.shortLots}-買{positionSummary.longLots}
+            <button
+              className="practice-panel-close"
+              onClick={() => togglePanel(true)}
+              aria-label="パネルを閉じる"
+            >
+              →
+            </button>
+          </div>
+          {!panelCollapsed && (
+            <div className="practice-panel-body">
+              <div className="practice-guide">{guideText}</div>
+              {!startDate ? (
+                <div className="practice-session-settings">
+                  <div className="practice-session-settings-title">練習の開始日</div>
+                  <div className="practice-session-settings-controls">
+                    <input
+                      ref={startDateInputRef}
+                      type="date"
+                      value={startDateDraft}
+                      onChange={(event) => setStartDateDraft(event.target.value)}
+                    />
+                    <button className="indicator-button" onClick={handleApplyStartDate}>
+                      開始日を確定
+                    </button>
                   </div>
                 </div>
-              <button
-                className="practice-panel-close"
-                onClick={() => togglePanel(true)}
-                aria-label="パネルを閉じる"
-              >
-                →
-              </button>
-              </div>
-              {!panelCollapsed && (
-                <div className="practice-panel-body">
-                  <div className="practice-guide">{guideText}</div>
+              ) : (
+                <>
                   <div className="practice-hud-net">
                     {netLots === 0
                       ? "ネット0"
@@ -2216,9 +2563,10 @@ export default function PracticeView() {
                     <input
                       type="number"
                       min={1}
-                    value={lotSize}
-                    onChange={(event) => {
-                      const next = Math.max(1, Number(event.target.value) || DEFAULT_LOT_SIZE);
+                      value={lotSize}
+                      onChange={(event) => {
+                        const next =
+                          Math.max(1, Number(event.target.value) || DEFAULT_LOT_SIZE);
                         setLotSize(next);
                         persistSession({ lotSize: next });
                       }}
@@ -2233,249 +2581,68 @@ export default function PracticeView() {
                       onChange={(event) => setTradeNote(event.target.value)}
                     />
                   </div>
-                  <div className="practice-hud-controls">
-                    <div>
-                      <div className="practice-hud-label">買い</div>
-                      <div className="practice-hud-buttons">
-                        {QUANTITIES.map((qty) => (
-                          <button
-                          key={`buy-plus-${qty}`}
-                          onClick={() => handleHudAction("buy", qty)}
-                          disabled={isLocked}
-                        >
-                          +{qty}
+                  <div className="practice-hud-controls v3">
+                    <div className="position-control-stack hud-sell-panel">
+                      <div className="hud-side-label">売り</div>
+                      <div className="control-row">
+                        <button onClick={() => handleHudAction("sell", 5)} disabled={isLocked}>
+                          ↑↑
                         </button>
-                      ))}
-                      {QUANTITIES.map((qty) => (
-                        <button
-                          key={`buy-minus-${qty}`}
-                          onClick={() => handleHudAction("buy", -qty)}
-                          disabled={isLocked}
-                        >
-                          -{qty}
+                        <button onClick={() => handleHudAction("sell", 1)} disabled={isLocked}>
+                          ↑
                         </button>
-                        ))}
+                      </div>
+                      <div className="quantity-display">{positionSummary.shortLots}</div>
+                      <div className="control-row">
+                        <button onClick={() => handleHudAction("sell", -1)} disabled={isLocked}>
+                          ↓
+                        </button>
+                        <button onClick={() => handleHudAction("sell", -5)} disabled={isLocked}>
+                          ↓↓
+                        </button>
                       </div>
                     </div>
-                    <div>
-                      <div className="practice-hud-label">売り</div>
-                      <div className="practice-hud-buttons">
-                        {QUANTITIES.map((qty) => (
-                          <button
-                          key={`sell-plus-${qty}`}
-                          onClick={() => handleHudAction("sell", qty)}
-                          disabled={isLocked}
-                        >
-                          +{qty}
+                    <PositionDonutChart
+                      sell={positionSummary.shortLots}
+                      buy={positionSummary.longLots}
+                    />
+                    <div className="position-control-stack hud-buy-panel">
+                      <div className="hud-side-label">買い</div>
+                      <div className="control-row">
+                        <button onClick={() => handleHudAction("buy", 5)} disabled={isLocked}>
+                          ↑↑
                         </button>
-                      ))}
-                      {QUANTITIES.map((qty) => (
-                        <button
-                          key={`sell-minus-${qty}`}
-                          onClick={() => handleHudAction("sell", -qty)}
-                          disabled={isLocked}
-                        >
-                          -{qty}
+                        <button onClick={() => handleHudAction("buy", 1)} disabled={isLocked}>
+                          ↑
                         </button>
-                      ))}
-                    </div>
+                      </div>
+                      <div className="quantity-display">{positionSummary.longLots}</div>
+                      <div className="control-row">
+                        <button onClick={() => handleHudAction("buy", -1)} disabled={isLocked}>
+                          ↓
+                        </button>
+                        <button onClick={() => handleHudAction("buy", -5)} disabled={isLocked}>
+                          ↓↓
+                        </button>
+                      </div>
                     </div>
                   </div>
                   <div className="practice-hud-actions">
                     <button onClick={handleUndo} disabled={!canUndo}>
                       取り消し
                     </button>
-                    <button onClick={handleResetDay} disabled={!canResetDay}>
-                      当日をリセット
-                    </button>
-                  </div>
-                </div>
-              )}
-          </div>
-        </div>
-
-        <div className={`practice-log ${tradeLogCollapsed ? "is-collapsed" : ""}`}>
-          <div className="practice-log-header">
-              <div>
-                <div className="practice-log-title">建玉履歴</div>
-                <div className="practice-log-sub">
-                  {visibleTrades.length}件 | 実現損益 {formatNumber(positionSummary.realizedPnL, 0)}
-                </div>
-              </div>
-              <div className="practice-log-actions">
-                <button className="indicator-button" onClick={toggleTradeLog}>
-                  {tradeLogCollapsed ? "履歴を表示" : "履歴を隠す"}
-                </button>
-                {!tradeLogCollapsed && (
-                <button
-                  className="indicator-button"
-                  onClick={() => setDailyLimit((prev) => prev + LIMIT_STEP.daily)}
-                  disabled={loadingDaily || !hasMoreDaily}
-                >
-                  {loadingDaily ? "日足を読み込み中..." : hasMoreDaily ? "日足を追加読み込み" : "日足はすべて読み込み済み"}
-                </button>
-                )}
-              </div>
-          </div>
-            {tradeLogCollapsed ? (
-              <div className="practice-log-collapsed">履歴を非表示にしています。</div>
-            ) : (
-            <>
-              <div className="practice-log-table">
-                <div className="practice-log-row practice-log-head">
-                  <span>日付</span>
-                  <span>種別</span>
-                  <span>玉数</span>
-                  <span>約定</span>
-                  <span>建玉</span>
-                  <span>実現損益</span>
-                  <span>メモ</span>
-                  <span>操作</span>
-                </div>
-                {ledger.entries.length === 0 && (
-                  <div className="practice-log-empty">まだ履歴がありません。</div>
-                )}
-                {ledger.entries.map((entry) => {
-                  const trade = entry.trade;
-                    const label =
-                      trade.book === "long"
-                        ? trade.action === "open"
-                          ? "買い 新規"
-                          : "買い 決済"
-                        : trade.action === "open"
-                        ? "売り 新規"
-                        : "売り 決済";
-                  const canEdit = !isLocked && cursorTime != null && trade.time === cursorTime;
-                  const isEditing = canEdit && editingTradeId === trade.id;
-                  return (
-                    <div
-                      className="practice-log-row"
-                      key={trade.id}
-                      onClick={() => handleJumpToTrade(trade.time)}
-                      role="button"
-                      tabIndex={0}
+                    <button
+                      onClick={handleCloseAllPositions}
+                      disabled={
+                        isLocked || (positionSummary.longLots === 0 && positionSummary.shortLots === 0)
+                      }
                     >
-                      <span>{formatDate(trade.time)}</span>
-                      <span>{label}</span>
-                      {isEditing ? (
-                        <>
-                          <span>
-                            <input
-                              type="number"
-                              min={0}
-                              value={trade.quantity}
-                              onChange={(event) =>
-                                handleEditTrade(trade.id, { quantity: Number(event.target.value) })
-                              }
-                            />
-                          </span>
-                          <span>
-                            <input
-                              type="number"
-                              step="0.1"
-                              min={0}
-                              value={trade.price}
-                              onChange={(event) =>
-                                handleEditTrade(trade.id, { price: Number(event.target.value) })
-                              }
-                            />
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <span>{trade.quantity}</span>
-                          <span>{formatNumber(trade.price, 2)}</span>
-                        </>
-                      )}
-                      <span>{entry.positionText}</span>
-                      <span className={entry.realizedDelta >= 0 ? "pnl-up" : "pnl-down"}>
-                        {entry.realizedDelta === 0 ? "--" : formatNumber(entry.realizedDelta, 0)}
-                      </span>
-                      {isEditing ? (
-                        <span>
-                          <input
-                            type="text"
-                            value={trade.note ?? ""}
-                            onChange={(event) =>
-                              handleEditTrade(trade.id, { note: event.target.value })
-                            }
-                          />
-                        </span>
-                      ) : (
-                        <span>{trade.note ?? "--"}</span>
-                      )}
-                      <span className="practice-log-actions">
-                        {isEditing ? (
-                          <>
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setEditingTradeId(null);
-                              }}
-                              disabled={!canEdit}
-                            >
-                              保存
-                            </button>
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                setEditingTradeId(null);
-                              }}
-                              disabled={!canEdit}
-                            >
-                              キャンセル
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                if (!canEdit) return;
-                                setEditingTradeId(trade.id);
-                              }}
-                              disabled={!canEdit}
-                            >
-                              編集
-                            </button>
-                            <button
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                if (!canEdit) return;
-                                handleDeleteTrade(trade.id);
-                              }}
-                              disabled={!canEdit}
-                            >
-                              削除
-                            </button>
-                          </>
-                        )}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-              <div className={`practice-notes ${notesCollapsed ? "is-collapsed" : ""}`}>
-                <div className="practice-notes-header">
-                  <div>メモ</div>
-                  <div className="practice-notes-actions">
-                    <button className="indicator-button" onClick={toggleNotes}>
-                      {notesCollapsed ? "メモを表示" : "メモを隠す"}
-                    </button>
-                    <button className="indicator-button" onClick={handleSaveNotes}>
-                      メモを保存
+                      全決済
                     </button>
                   </div>
-                </div>
-                {!notesCollapsed && (
-                  <textarea
-                    value={sessionNotes}
-                    onChange={(event) => setSessionNotes(event.target.value)}
-                    placeholder="メモ（振り返り）"
-                  />
-                )}
-              </div>
-            </>
+                </>
+              )}
+            </div>
           )}
         </div>
       </div>

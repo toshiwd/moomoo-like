@@ -3351,13 +3351,7 @@ def watchlist_undo_remove(payload: dict = Body(default=None)):
 
 
 def _list_tables(conn) -> set[str]:
-    rows = conn.execute(
-        """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'main'
-        """
-    ).fetchall()
+    rows = conn.execute("SELECT table_name FROM duckdb_tables()").fetchall()
     return {row[0] for row in rows}
 
 
